@@ -100,7 +100,7 @@ pub fn activate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modules::registry::ModuleRecord;
+    use crate::modules::registry::{IntegrityState, ModuleRecord};
     use std::time::SystemTime;
 
     fn record(module: &str, version: &str, runtime: &str) -> ModuleRecord {
@@ -114,6 +114,7 @@ mod tests {
             manifest_json: "{}".to_owned(),
             artifact_relpath: format!("{module}/{version}/pkg.zip"),
             artifact_size: 0,
+            integrity_state: IntegrityState::Ok,
             registered_at: SystemTime::now(),
         }
     }

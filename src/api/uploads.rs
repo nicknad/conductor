@@ -332,15 +332,12 @@ async fn process_upload(
     let mut format_version: u16 = SUPPORTED_SIGNATURE_FORMAT_VERSION;
     let mut package_bytes: Option<u64> = None;
 
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| {
-            UploadFailure::from_api(
-                RejectionStage::Multipart,
-                ApiError::BadRequest("invalid_multipart", e.to_string()),
-            )
-        })? {
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        UploadFailure::from_api(
+            RejectionStage::Multipart,
+            ApiError::BadRequest("invalid_multipart", e.to_string()),
+        )
+    })? {
         field_count += 1;
         if field_count > MAX_FORM_FIELDS {
             return Err(UploadFailure::from_api(

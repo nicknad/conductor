@@ -14,7 +14,9 @@
 //! the source of truth.
 
 use crate::control_plane::validate_package::ValidatedPackage;
-use crate::modules::registry::{ModuleRecord, ModuleRegistry, Registration, RegistryError};
+use crate::modules::registry::{
+    IntegrityState, ModuleRecord, ModuleRegistry, Registration, RegistryError,
+};
 use std::time::SystemTime;
 
 /// Records a validated artifact as a registered module version.
@@ -45,6 +47,7 @@ pub fn register(
         manifest_json: validated.manifest_json().to_owned(),
         artifact_relpath: artifact_relpath.to_owned(),
         artifact_size: validated.artifact_size(),
+        integrity_state: IntegrityState::Ok,
         registered_at: SystemTime::now(),
     })
 }

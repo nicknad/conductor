@@ -45,7 +45,41 @@ pub struct ModuleRecord {
     pub artifact_relpath: String,
     /// Size in bytes of the immutable artifact.
     pub artifact_size: u64,
+    /// Reconciliation state: whether the promoted artifact was last seen
+    /// intact on disk. New registrations are always `Ok`; reconciliation
+    /// moves rows to `Missing`/`Mismatch`.
+    pub integrity_state: IntegrityState,
     pub registered_at: SystemTime,
+}
+
+/// Reconciliation state of a registered version's promoted artifact.
+/// Stored as text in `module_versions.integrity_state`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum IntegrityState {
+    #[default]
+    Ok,
+    Missing,
+    Mismatch,
+}
+
+impl IntegrityState {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Missing => "missing",
+            Self::Mismatch => "mismatch",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "ok" => Some(Self::Ok),
+            "missing" => Some(Self::Missing),
+            "mismatch" => Some(Self::Mismatch),
+            _ => None,
+        }
+    }
 }
 
 /// Outcome of one registration attempt.
@@ -102,7 +136,7 @@ impl Default for ModuleRegistry {
 }
 
 const SELECT_VERSION: &str = "SELECT module_id, version, digest, signer_key_id, runtime, \
-     manifest_version, manifest_json, artifact_relpath, artifact_size, registered_at \
+     manifest_version, manifest_json, artifact_relpath, artifact_size, integrity_state, registered_at \
      FROM module_versions";
 
 impl ModuleRegistry {
@@ -201,6 +235,107 @@ impl ModuleRegistry {
         }
     }
 
+    /// Lists every registered version across all modules, ordered by
+    /// `(module_id, version)`. Reconciliation entry point: scan rows and
+    /// stat each artifact without SQL outside this module.
+    pub fn all_versions(&self) -> Result<Vec<ModuleRecord>, RegistryError> {
+        match &self.store {
+            Store::Memory(entries) => {
+                let entries = entries.lock().unwrap_or_else(|e| e.into_inner());
+                let mut records: Vec<ModuleRecord> = entries.values().cloned().collect();
+                records.sort_by(|a, b| (&a.module_id, &a.version).cmp(&(&b.module_id, &b.version)));
+                Ok(records)
+            }
+            Store::Sqlite(database) => database.with_connection(|conn| {
+                let mut statement = conn
+                    .prepare(&format!("{SELECT_VERSION} ORDER BY module_id, version"))
+                    .map_err(RegistryError::from)?;
+                let rows = statement
+                    .query_map([], row_to_record)
+                    .map_err(RegistryError::from)?;
+                let mut records = Vec::new();
+                for row in rows {
+                    records.push(row.map_err(RegistryError::from)?);
+                }
+                Ok(records)
+            }),
+        }
+    }
+
+    /// Lists every module id with at least one registered version, ordered
+    /// by module id.
+    pub fn list_modules(&self) -> Result<Vec<String>, RegistryError> {
+        match &self.store {
+            Store::Memory(entries) => {
+                let entries = entries.lock().unwrap_or_else(|e| e.into_inner());
+                let mut modules: Vec<String> = entries
+                    .values()
+                    .map(|record| record.module_id.clone())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                modules.sort();
+                Ok(modules)
+            }
+            Store::Sqlite(database) => database.with_connection(|conn| {
+                let mut statement = conn
+                    .prepare("SELECT DISTINCT module_id FROM module_versions ORDER BY module_id")
+                    .map_err(RegistryError::from)?;
+                let rows = statement
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(RegistryError::from)?;
+                let mut modules = Vec::new();
+                for row in rows {
+                    modules.push(row.map_err(RegistryError::from)?);
+                }
+                Ok(modules)
+            }),
+        }
+    }
+
+    /// Reads the reconciliation state of one registered version. `Ok(None)`
+    /// when the version is not registered; storage failures are errors.
+    pub fn get_integrity_state(
+        &self,
+        module_id: &str,
+        version: &str,
+    ) -> Result<Option<IntegrityState>, RegistryError> {
+        Ok(self
+            .get(module_id, version)?
+            .map(|record| record.integrity_state))
+    }
+
+    /// Marks the reconciliation state of one registered version. Returns
+    /// `false` when the version is not registered. One immediate
+    /// transaction on SQLite; one locked mutation in memory.
+    pub fn set_integrity_state(
+        &self,
+        module_id: &str,
+        version: &str,
+        state: IntegrityState,
+    ) -> Result<bool, RegistryError> {
+        match &self.store {
+            Store::Memory(entries) => {
+                let mut entries = entries.lock().unwrap_or_else(|e| e.into_inner());
+                match entries.get_mut(&(module_id.to_owned(), version.to_owned())) {
+                    Some(record) => {
+                        record.integrity_state = state;
+                        Ok(true)
+                    }
+                    None => Ok(false),
+                }
+            }
+            Store::Sqlite(database) => database.with_write_tx(|tx| {
+                let updated = tx.execute(
+                    "UPDATE module_versions SET integrity_state = ?1 \
+                     WHERE module_id = ?2 AND version = ?3",
+                    params![state.as_str(), module_id, version],
+                )?;
+                Ok(updated > 0)
+            }),
+        }
+    }
+
     /// Number of registered module versions.
     pub fn len(&self) -> Result<usize, RegistryError> {
         match &self.store {
@@ -283,7 +418,7 @@ fn record_sqlite(database: &Database, record: ModuleRecord) -> Result<Registrati
                         module_id, version, digest, signer_key_id, runtime,
                         manifest_version, manifest_json, artifact_relpath,
                         artifact_size, integrity_state, registered_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'ok', ?10)",
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![
                         record.module_id,
                         record.version,
@@ -294,6 +429,7 @@ fn record_sqlite(database: &Database, record: ModuleRecord) -> Result<Registrati
                         record.manifest_json,
                         record.artifact_relpath,
                         i64::try_from(record.artifact_size).unwrap_or(i64::MAX),
+                        record.integrity_state.as_str(),
                         to_millis(record.registered_at),
                     ],
                 )?;
@@ -314,6 +450,14 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModuleRecord> {
     // SQLite INTEGER is signed; sizes are stored as i64 and read back as
     // the u64 the registry deals in.
     let artifact_size: i64 = row.get(8)?;
+    let integrity_text: String = row.get(9)?;
+    let integrity_state = IntegrityState::from_str(&integrity_text).ok_or_else(|| {
+        rusqlite::Error::InvalidColumnType(
+            9,
+            "integrity_state".to_owned(),
+            rusqlite::types::Type::Text,
+        )
+    })?;
     Ok(ModuleRecord {
         module_id: row.get(0)?,
         version: row.get(1)?,
@@ -324,7 +468,8 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModuleRecord> {
         manifest_json: row.get(6)?,
         artifact_relpath: row.get(7)?,
         artifact_size: u64::try_from(artifact_size).unwrap_or(0),
-        registered_at: from_millis(row.get(9)?),
+        integrity_state,
+        registered_at: from_millis(row.get(10)?),
     })
 }
 
@@ -344,6 +489,7 @@ mod tests {
             manifest_json: format!("{{\"module_id\":\"{module}\",\"version\":\"{version}\"}}"),
             artifact_relpath: format!("{module}/{version}/pkg.zip"),
             artifact_size: 123,
+            integrity_state: IntegrityState::Ok,
             registered_at: SystemTime::now(),
         }
     }
@@ -377,11 +523,24 @@ mod tests {
         assert!(found.manifest_json.contains("reporting"));
         assert_eq!(found.artifact_relpath, "reporting/1.0.0/pkg.zip");
         assert_eq!(found.artifact_size, 123);
+        assert_eq!(found.integrity_state, IntegrityState::Ok);
         assert!(registry
             .get("reporting", "2.0.0")
             .expect("lookup")
             .is_none());
         assert!(registry.get("other", "1.0.0").expect("lookup").is_none());
+        assert_eq!(
+            registry
+                .get_integrity_state("reporting", "1.0.0")
+                .expect("state"),
+            Some(IntegrityState::Ok)
+        );
+        assert_eq!(
+            registry
+                .get_integrity_state("reporting", "9.9.9")
+                .expect("state"),
+            None
+        );
 
         let again = registry
             .record(record("reporting", "1.0.0", 7))
@@ -415,6 +574,56 @@ mod tests {
         assert_eq!(versions[0].version, "1.0.0");
         assert_eq!(versions[1].version, "1.1.0");
         assert!(registry.list_versions("missing").expect("list").is_empty());
+
+        // P1 reconciliation reads: full scan and module list, both ordered.
+        let all = registry.all_versions().expect("all");
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            all.iter()
+                .map(|r| (r.module_id.as_str(), r.version.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("billing", "1.0.0"),
+                ("reporting", "1.0.0"),
+                ("reporting", "1.1.0"),
+            ]
+        );
+        assert_eq!(
+            registry.list_modules().expect("modules"),
+            vec!["billing".to_owned(), "reporting".to_owned()]
+        );
+
+        // Integrity marking round-trips through get().
+        assert!(registry
+            .set_integrity_state("reporting", "1.0.0", IntegrityState::Missing)
+            .expect("mark"));
+        assert_eq!(
+            registry
+                .get_integrity_state("reporting", "1.0.0")
+                .expect("state"),
+            Some(IntegrityState::Missing)
+        );
+        assert_eq!(
+            registry
+                .get("reporting", "1.0.0")
+                .expect("lookup")
+                .expect("kept")
+                .integrity_state,
+            IntegrityState::Missing
+        );
+        // Idempotent re-registration preserves the stored state, not the
+        // caller's default.
+        let again = registry
+            .record(record("reporting", "1.0.0", 7))
+            .expect("idempotent");
+        assert!(again.already_registered);
+        assert_eq!(again.record.integrity_state, IntegrityState::Missing);
+        assert!(registry
+            .set_integrity_state("reporting", "1.0.0", IntegrityState::Mismatch)
+            .expect("mark"));
+        assert!(!registry
+            .set_integrity_state("reporting", "9.9.9", IntegrityState::Missing)
+            .expect("missing version marks nothing"));
     }
 
     #[test]
