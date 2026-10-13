@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use crate::application::validate_package::{PackageValidator, ValidatedPackage, ValidationError};
+use crate::control_plane::validate_package::{PackageValidator, ValidatedPackage, ValidationError};
 use crate::packages::archive::QuarantinedFile;
 use crate::packages::signature::PackageSignature;
 
@@ -45,7 +45,7 @@ pub fn run_upload_workflow(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::validate_package::PackageValidationBuilder;
+    use crate::control_plane::validate_package::PackageValidationBuilder;
     use crate::packages::policy::PackageValidationPolicy;
     use crate::packages::signature::{
         canonical_payload, ConfiguredTrustedKeys, SignatureAlgorithm, TrustedSigningKey,

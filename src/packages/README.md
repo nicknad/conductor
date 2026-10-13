@@ -4,7 +4,7 @@ Validates untrusted package archives before anything is staged, trusted, or
 executed. This module holds **no lifecycle state** and performs **no
 filesystem writes outside what callers direct** — it decides whether bytes
 are acceptable, never where they live (that is `storage`) or what happens
-next (that is `application`).
+next (that is `control_plane`).
 
 ## Layout
 
@@ -21,7 +21,7 @@ next (that is `application`).
 ## Wiring
 
 The pipeline is assembled by `PackageValidationBuilder` and run by
-`PackageValidator` in `application/validate_package.rs`: one concrete
+`PackageValidator` in `control_plane/validate_package.rs`: one concrete
 backend per stage (`ZipArchiveReader`, `Ed25519Verifier`,
 `ConfiguredTrustedKeys`, `Sha256DigestProvider`), with the policy
 (constructor) and trust store (setter) as the configurable inputs.

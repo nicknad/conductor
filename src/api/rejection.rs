@@ -13,7 +13,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::api::errors::ApiError;
-use crate::application::validate_package::ValidationError;
+use crate::control_plane::validate_package::ValidationError;
 use crate::audit::event::{RejectionEvent, RejectionStage};
 use crate::audit::recorder::RejectionRecorder;
 use crate::packages::artifact::ValidatedArtifact;

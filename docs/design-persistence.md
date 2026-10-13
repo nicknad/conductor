@@ -24,7 +24,7 @@ wiring.
 ## 2. Load-bearing invariants
 
 - The validation verdict is the only registrable input; persistence adds no
-  trust. (Unchanged from `src/application/register_package.rs`.)
+  trust. (Unchanged from `src/control_plane/register_package.rs`.)
 - Promote-then-register stays the order. Registration is **one DB transaction**.
   The DB is authority for *which digest a module version means*; artifacts remain
   content-addressed by digest and re-verified at use.

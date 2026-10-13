@@ -136,10 +136,10 @@ src/
   lib.rs                    Library root
   server.rs                 Host startup and TLS-only serving path
   api/                      HTTP interface (routes, uploads, errors)
-  application/              Use cases and workflow orchestration
+  control_plane/            Control plane: use cases, workflow orchestration, lifecycle
   packages/                 Package domain and validation
   storage/                  Filesystem persistence
-  modules/                  Installed module registry/lifecycle
+  modules/                  Installed module registry
   executions/               Worker-process execution (spawn, IPC, limits)
   config.rs                 Host configuration
 tests/

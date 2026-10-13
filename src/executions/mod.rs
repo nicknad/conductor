@@ -32,7 +32,7 @@
 //! boundary.
 //!
 //! Only execution is this module's business: which registered version is
-//! active and who may run it is decided by `application::activate_module`
+//! active and who may run it is decided by `control_plane::activate_module`
 //! against the registry, and this module executes exactly what it is
 //! handed.
 

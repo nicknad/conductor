@@ -58,7 +58,7 @@ pub const MANIFEST_FILE_NAME: &str = "manifest.json";
 
 /// Parsed, validated manifest. All fields are opaque to this layer except
 /// for the consistency checks in [`Manifest::parse_bounded`]; runtime
-/// compatibility and lifecycle decisions belong to `application`/`modules`.
+/// compatibility and lifecycle decisions belong to `control_plane`/`modules`.
 #[derive(Debug, Clone)]
 pub struct Manifest {
     pub manifest_version: u32,

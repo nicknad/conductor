@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use conductor::application::validate_package::{PackageValidationBuilder, PackageValidator};
+use conductor::control_plane::validate_package::{PackageValidationBuilder, PackageValidator};
 use conductor::executions::executor::{
     ExecutionError, ExecutionLimits, ExecutionOutcome, TargetError, WorkerExecutor, WorkerTarget,
 };

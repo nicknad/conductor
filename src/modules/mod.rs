@@ -1,4 +1,3 @@
-//! Installed module registry and lifecycle.
+//! Installed module registry.
 
-pub mod lifecycle;
 pub mod registry;

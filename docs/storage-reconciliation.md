@@ -42,18 +42,18 @@
 
 1. **Receive ZIP / download from URL** — Partial: upload exists; URL download does not.
 2. **Size and processing limits** — Implemented: policy byte/entry/ratio/depth bounds, streaming cap, body/field/header caps, timeouts, upload rate floor, 8 concurrent slots returning `503` (`src/packages/policy.rs`, `src/api/routes.rs`, `src/api/uploads.rs`).
-3. **Digest + detached signature** — Implemented, with a different shape: the body streams to quarantine, then digest and signature verification run over one handle (`src/application/validate_package.rs`). The signature is Ed25519 over `domain ‖ zip/v1 ‖ sha256 ‖ archive-digest` — it covers the whole archive, not a separate manifest document, and it is not CMS (`src/packages/signature.rs`).
+3. **Digest + detached signature** — Implemented, with a different shape: the body streams to quarantine, then digest and signature verification run over one handle (`src/control_plane/validate_package.rs`). The signature is Ed25519 over `domain ‖ zip/v1 ‖ sha256 ‖ archive-digest` — it covers the whole archive, not a separate manifest document, and it is not CMS (`src/packages/signature.rs`).
 4. **Archive/manifest/paths/inventory/dependencies/limits** — Partial: everything implemented except dependencies — the manifest has no dependency concept, and unknown fields are rejected (`src/packages/manifest.rs`).
 5. **Extract into private staging with content and hash checks** — Implemented as a function (manifest v2 per-file size and SHA-256 enforced during extraction), but **not wired into the production upload path**.
 6. **Promote to immutable storage** — Implemented and wired: re-hash quarantine, `create_new`, file fsync, partial-write self-repair, quarantine consumed (`src/storage/artifact_store.rs`).
 7. **Register in database** — Partial: in-memory registry stores id/version/digest/signer/runtime/timestamp; no database, no validation report, lost on restart.
-8. **Explicit activation; execution resolves a registered artifact** — Partial: `activate()` checks the registry and runtime allowlist and returns digest + signer (`src/application/activate_module.rs`), but has no API/CLI wiring, no persisted activation, and the executor is handed a staged package rather than resolving a registered artifact.
+8. **Explicit activation; execution resolves a registered artifact** — Partial: `activate()` checks the registry and runtime allowlist and returns digest + signer (`src/control_plane/activate_module.rs`), but has no API/CLI wiring, no persisted activation, and the executor is handed a staged package rather than resolving a registered artifact.
 
 ## 4. Additional agreements
 
 | Agreement | Verdict |
 | --- | --- |
-| Immutable versions | Implemented: registry `VersionConflict`; artifact `create_new`. A version conflict intentionally leaves the promoted blob unreferenced (`src/application/register_package.rs`). |
+| Immutable versions | Implemented: registry `VersionConflict`; artifact `create_new`. A version conflict intentionally leaves the promoted blob unreferenced (`src/control_plane/register_package.rs`). |
 | Content addressing (SHA-256) | Implemented: SHA-256 over the exact archive bytes — ZIP encoding included, so semantically identical packages can have different digests |
 | Version pinning | Partial: the execution protocol pins `module_id`/`version`/`digest_hex` (`src/executions/protocol.rs`), but no dispatcher enforces a registry lookup yet |
 | TOCTOU protection | **Implemented, layered**: one handle in validation, re-hash at promotion, re-hash at staging, re-hash of staged files at resolve |

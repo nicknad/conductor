@@ -114,7 +114,7 @@ impl PackageValidator {
     ///
     /// Takes `&mut QuarantinedFile` — not a path — so hashing, inspection,
     /// and manifest reads are forced onto the same bytes. Open the handle
-    /// with [`QuarantinedFile::open`] in [`crate::application::upload_package::run_upload_workflow`].
+    /// with [`QuarantinedFile::open`] in [`crate::control_plane::upload_package::run_upload_workflow`].
     pub fn validate(
         &self,
         file: &mut QuarantinedFile,

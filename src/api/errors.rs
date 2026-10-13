@@ -16,7 +16,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 
-use crate::application::validate_package::ValidationError;
+use crate::control_plane::validate_package::ValidationError;
 use crate::audit::event::RejectionStage;
 use crate::packages::signature::SignatureError;
 

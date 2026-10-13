@@ -66,7 +66,7 @@ pub struct ValidatedArtifact {
 
 impl ValidatedArtifact {
     /// Mints an artifact. `pub(crate)` for the validator path only:
-    /// `application::validate_package` is the sole production caller, and
+    /// `control_plane::validate_package` is the sole production caller, and
     /// a bare artifact is useless without the private
     /// `ValidatedPackage::new` wrapper — no other module can promote it
     /// into a verdict. (Rust cannot express sibling-only visibility, so

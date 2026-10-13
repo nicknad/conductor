@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use thiserror::Error;
 
-use crate::application::validate_package::ValidatedPackage;
+use crate::control_plane::validate_package::ValidatedPackage;
 use crate::packages::archive::{
     ArchiveError, DeclaredIntegrity, ExtractedFile, ExtractedFiles, ExtractionTarget,
     QuarantinedFile, ZipArchiveReader,
@@ -159,7 +159,7 @@ fn unique_staging_dir(root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::validate_package::{PackageValidationBuilder, PackageValidator};
+    use crate::control_plane::validate_package::{PackageValidationBuilder, PackageValidator};
     use crate::packages::policy::PackageValidationPolicy;
     use crate::packages::signature::{
         canonical_payload, ConfiguredTrustedKeys, PackageSignature, SignatureAlgorithm,

@@ -3,8 +3,8 @@
 //!
 //! Promotion is content-addressed and idempotent: the destination is
 //! `artifacts/{module_id}/{version}/{digest_hex}.zip`, where `module_id`
-//! and `version` come from a [`ValidatedPackage`](crate::application::validate_package::ValidatedPackage)
-//! that only [`PackageValidator::validate`](crate::application::validate_package::PackageValidator::validate)
+//! and `version` come from a [`ValidatedPackage`](crate::control_plane::validate_package::ValidatedPackage)
+//! that only [`PackageValidator::validate`](crate::control_plane::validate_package::PackageValidator::validate)
 //! can mint, so path components are already path-safe. The quarantine file
 //! is re-hashed before promotion and compared to the verdict digest —
 //! validation and promotion never trust a path across time (TOCTOU).
@@ -20,7 +20,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-use crate::application::validate_package::ValidatedPackage;
+use crate::control_plane::validate_package::ValidatedPackage;
 use crate::packages::digest::Sha256DigestProvider;
 
 /// Promotion failures. Everything here is a server-side condition the
@@ -130,7 +130,7 @@ pub fn promote_quarantined(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::validate_package::{PackageValidationBuilder, PackageValidator};
+    use crate::control_plane::validate_package::{PackageValidationBuilder, PackageValidator};
     use crate::packages::archive::QuarantinedFile;
     use crate::packages::policy::PackageValidationPolicy;
     use crate::packages::signature::{

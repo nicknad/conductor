@@ -33,7 +33,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FIELD_BYTES: usize = 256;
 
 /// Identity of the invocation the request describes. Built by whoever
-/// resolves the execution (registry/application); the executor only
+/// resolves the execution (registry/control_plane); the executor only
 /// transports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invocation {

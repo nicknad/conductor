@@ -14,7 +14,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use conductor::application::validate_package::{
+use conductor::control_plane::validate_package::{
     BuildError, PackageValidationBuilder, PackageValidator, ValidationError,
 };
 use conductor::packages::archive::{ArchiveError, QuarantinedFile};
@@ -178,7 +178,7 @@ fn validate_path(
     validator: &PackageValidator,
     path: &Path,
     envelope: &PackageSignature,
-) -> Result<conductor::application::validate_package::ValidatedPackage, ValidationError> {
+) -> Result<conductor::control_plane::validate_package::ValidatedPackage, ValidationError> {
     let mut quarantined = QuarantinedFile::open(path).expect("temp quarantine must open");
     validator.validate(&mut quarantined, envelope)
 }

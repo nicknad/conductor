@@ -22,7 +22,7 @@ use base64::prelude::*;
 use bytes::Bytes;
 use conductor::api::routes::router;
 use conductor::api::uploads::{ApiToken, AppState};
-use conductor::application::validate_package::PackageValidationBuilder;
+use conductor::control_plane::validate_package::PackageValidationBuilder;
 use conductor::audit::recorder::RejectionRecorder;
 use conductor::modules::registry::ModuleRegistry;
 use conductor::packages::artifact::ArtifactDigest;

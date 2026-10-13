@@ -13,7 +13,7 @@
 //! content-addressed store unreferenced — harmless, immutable, and never
 //! the source of truth.
 
-use crate::application::validate_package::ValidatedPackage;
+use crate::control_plane::validate_package::ValidatedPackage;
 use crate::modules::registry::{ModuleRecord, ModuleRegistry, Registration, RegistryError};
 use std::time::SystemTime;
 
@@ -52,7 +52,7 @@ pub fn register(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::validate_package::{PackageValidationBuilder, PackageValidator};
+    use crate::control_plane::validate_package::{PackageValidationBuilder, PackageValidator};
     use crate::packages::archive::QuarantinedFile;
     use crate::packages::digest::Sha256DigestProvider;
     use crate::packages::policy::PackageValidationPolicy;

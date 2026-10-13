@@ -56,8 +56,8 @@ use tokio::sync::Semaphore;
 
 use crate::api::errors::ApiError;
 use crate::api::rejection::{request_id, Rejection};
-use crate::application::upload_package::run_upload_workflow;
-use crate::application::validate_package::PackageValidator;
+use crate::control_plane::upload_package::run_upload_workflow;
+use crate::control_plane::validate_package::PackageValidator;
 use crate::audit::recorder::RejectionRecorder;
 use crate::modules::registry::{ModuleRegistry, RegistryError};
 use crate::packages::signature::{PackageSignature, SUPPORTED_SIGNATURE_FORMAT_VERSION};
@@ -438,7 +438,7 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Result<Re
             // (immutable, never the source of truth) and rejects the
             // upload; an identical re-upload is idempotent. Storage
             // failures are server-side and never reported as conflicts.
-            match crate::application::register_package::register(
+            match crate::control_plane::register_package::register(
                 &registry,
                 &verdict,
                 &promoted_relpath,
