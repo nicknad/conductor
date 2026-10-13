@@ -7,7 +7,7 @@
 //! - the builder refuses to yield a validator without a trust store;
 //! - trust is configured by value (`ConfiguredTrustedKeys`);
 //! - manifest reads are bounded by the policy's `max_manifest_bytes`;
-//! - until backends land, validation fails closed with typed errors.
+//! - a missing archive fails at I/O before the signature stage runs.
 
 use std::path::Path;
 
@@ -17,7 +17,8 @@ use conductor::application::validate_package::{
 use conductor::packages::manifest::{Manifest, ManifestError};
 use conductor::packages::policy::PackageValidationPolicy;
 use conductor::packages::signature::{
-    ConfiguredTrustedKeys, SignatureAlgorithm, TrustedSigningKey,
+    ConfiguredTrustedKeys, PackageSignature, SignatureAlgorithm, TrustedSigningKey,
+    SUPPORTED_SIGNATURE_FORMAT_VERSION,
 };
 
 fn test_keys() -> ConfiguredTrustedKeys {
@@ -26,6 +27,14 @@ fn test_keys() -> ConfiguredTrustedKeys {
         SignatureAlgorithm::Ed25519,
         vec![],
     )])
+}
+
+fn dummy_envelope() -> PackageSignature {
+    PackageSignature {
+        format_version: SUPPORTED_SIGNATURE_FORMAT_VERSION,
+        key_id: "k1".to_owned(),
+        signature: vec![0u8; 64],
+    }
 }
 
 #[test]
@@ -57,20 +66,20 @@ fn unsigned_config_rejected_before_archive_stage() {
         .build()
         .expect("test validator must build");
     assert!(matches!(
-        validator.validate(Path::new("pkg.zip")),
+        validator.validate(Path::new("pkg.zip"), &dummy_envelope()),
         Err(ValidationError::Policy(_))
     ));
 }
 
 #[test]
-fn validator_fails_closed_until_backends_land() {
+fn missing_archive_fails_before_signature_stage() {
     let validator = PackageValidationBuilder::new(PackageValidationPolicy::production())
         .trusted_keys(test_keys())
         .build()
         .expect("test validator must build");
     assert!(validator.trusted_keys().key("k1").is_some());
     assert!(matches!(
-        validator.validate(Path::new("pkg.zip")),
+        validator.validate(Path::new("pkg.zip"), &dummy_envelope()),
         Err(ValidationError::Archive(_))
     ));
 }

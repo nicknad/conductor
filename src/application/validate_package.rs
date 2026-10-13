@@ -5,19 +5,24 @@
 //! defaults; [`PackageValidator`] owns the fixed stage order:
 //!
 //! 1. policy gate (production ingest requires a signature),
-//! 2. authenticate the exact package bytes: stream the upload into
-//!    quarantine while hashing SHA-256, then verify the detached
+//! 2. authenticate the exact package bytes: digest one open handle with
+//!    SHA-256, then verify the detached
 //!    [`PackageSignature`](crate::packages::signature::PackageSignature)
-//!    against the trust store (not wired yet),
-//! 3. archive inspection under [`ArchiveLimits`](crate::packages::archive::ArchiveLimits),
-//! 4. manifest parsing and inventory validation (not wired yet),
-//! 5. staged extraction with hashing plus module/runtime policy (not wired yet),
-//! 6. promotion verdict minting a [`ValidatedArtifact`](crate::packages::artifact::ValidatedArtifact).
+//!    against the trust store,
+//! 3. archive inspection of the same bytes under
+//!    [`PackageValidationPolicy::scan_config`](crate::packages::policy::PackageValidationPolicy::scan_config),
+//! 4. manifest parsing (bounded, version-gated) and inventory validation,
+//! 5. promotion verdict minting a [`ValidatedArtifact`](crate::packages::artifact::ValidatedArtifact).
 //!
 //! Authentication precedes parsing: nothing inside the archive is trusted
-//! before the outer bytes verify. Hashing and inspection operate on the
-//! same private quarantined file — never hash one file and reopen an
-//! attacker-controlled path for extraction (TOCTOU).
+//! before the outer bytes verify. Hashing, inspection, and the manifest
+//! read share one open [`File`](std::fs::File) handle — never hash one file
+//! and reopen an attacker-controlled path for inspection (TOCTOU). Per-file
+//! byte agreement during staged extraction lands with `storage::staging`;
+//! until then the outer digest plus inventory set-equality bind the bytes.
+//!
+//! The authorizing signer is established by authentication but not yet
+//! recorded: audit logging will attribute it once tracing lands.
 //!
 //! Callers cannot omit stages or build a production validator without a
 //! trust store — [`build`](PackageValidationBuilder::build) fails closed
@@ -28,13 +33,20 @@
 //! build a new immutable validator and publish it atomically so one
 //! validation never observes a policy halfway through a reload.
 
+use std::fs::File;
+use std::io::Seek as _;
 use std::path::Path;
 use thiserror::Error;
 
 use crate::packages::archive::{ArchiveError, ZipArchiveReader};
-use crate::packages::digest::Sha256DigestProvider;
+use crate::packages::artifact::{ArtifactDigest, ValidatedArtifact};
+use crate::packages::digest::{DigestError, Sha256DigestProvider};
+use crate::packages::inventory::{check_inventory, InventoryError};
+use crate::packages::manifest::{Manifest, ManifestError, MANIFEST_FILE_NAME};
 use crate::packages::policy::{PackageValidationPolicy, PolicyError};
-use crate::packages::signature::{ConfiguredTrustedKeys, Ed25519Verifier};
+use crate::packages::signature::{
+    ConfiguredTrustedKeys, Ed25519Verifier, PackageSignature, SignatureError,
+};
 
 /// Runs the mandatory stages in a fixed order and returns a verdict or a
 /// typed error. Holds one immutable policy snapshot per instance.
@@ -88,16 +100,67 @@ impl PackageValidator {
         &self.digest
     }
 
-    /// Fixed-order validation. Stages 3+ are not wired yet, so success is
-    /// currently unreachable: the method proves stage order and dependency
-    /// wiring, then fails closed.
-    pub fn validate(&self, archive: &Path) -> Result<(), ValidationError> {
+    /// Fixed-order validation over one open handle: policy gate →
+    /// hash-and-authenticate → inspect → manifest/inventory → promotion.
+    /// Returns the minted [`ValidatedArtifact`] on success; success is now
+    /// reachable, unlike the scaffold era where every path failed closed.
+    pub fn validate(
+        &self,
+        archive: &Path,
+        signature: &PackageSignature,
+    ) -> Result<ValidatedArtifact, ValidationError> {
         self.policy.ensure_production_ingest()?;
-        let _inspected = self
+        let mut file = File::open(archive)
+            .map_err(|e| ValidationError::Archive(ArchiveError::Io(e.to_string())))?;
+        let digest = self.digest.digest_stream(&mut file)?;
+        let _signer = self.signature_verifier.authenticate(
+            signature,
+            &digest,
+            &self.trusted_keys,
+            &self.policy.allowed_signature_algorithms,
+        )?;
+        file.rewind()
+            .map_err(|e| ValidationError::Archive(ArchiveError::Io(e.to_string())))?;
+        let inspected = self
             .archive_reader
-            .inspect(archive, &self.policy.scan_config())?;
-        Err(ValidationError::NotImplemented(
-            "manifest/signature stage not wired yet",
+            .inspect_file(&mut file, &self.policy.scan_config())?;
+        if !inspected.files.iter().any(|f| f == MANIFEST_FILE_NAME) {
+            return Err(ValidationError::Inventory(InventoryError::MissingFile(
+                MANIFEST_FILE_NAME.to_owned(),
+            )));
+        }
+        file.rewind()
+            .map_err(|e| ValidationError::Archive(ArchiveError::Io(e.to_string())))?;
+        let manifest_bytes = self
+            .archive_reader
+            .read_file_from(
+                &mut file,
+                MANIFEST_FILE_NAME,
+                self.policy.max_manifest_bytes,
+            )
+            .map_err(|e| match e {
+                // This call reads only the manifest, so a bound breach here
+                // is the manifest bound, not a generic archive limit.
+                ArchiveError::LimitExceeded(_) => {
+                    ValidationError::Manifest(ManifestError::TooLarge)
+                }
+                other => ValidationError::Archive(other),
+            })?;
+        let manifest = Manifest::parse_bounded(
+            &manifest_bytes,
+            self.policy.max_manifest_bytes,
+            &self.policy.allowed_manifest_versions,
+        )?;
+        let payload: Vec<String> = inspected
+            .files
+            .into_iter()
+            .filter(|f| f != MANIFEST_FILE_NAME)
+            .collect();
+        check_inventory(&manifest.declared_files(), &payload)?;
+        Ok(ValidatedArtifact::new(
+            ArtifactDigest::new(digest),
+            manifest.module_id,
+            manifest.version,
         ))
     }
 }
@@ -108,8 +171,14 @@ pub enum ValidationError {
     Policy(#[from] PolicyError),
     #[error("archive inspection failed: {0}")]
     Archive(#[from] ArchiveError),
-    #[error("validation stage pending: {0}")]
-    NotImplemented(&'static str),
+    #[error("package digest failed: {0}")]
+    Digest(#[from] DigestError),
+    #[error("signature authentication failed: {0}")]
+    Signature(#[from] SignatureError),
+    #[error("manifest rejected: {0}")]
+    Manifest(#[from] ManifestError),
+    #[error("inventory mismatch: {0}")]
+    Inventory(#[from] InventoryError),
 }
 
 /// Builder failure: required configuration missing. There is no
@@ -191,20 +260,38 @@ mod tests {
     }
 
     #[test]
-    fn defaults_fail_closed_after_policy_gate() {
+    fn missing_archive_fails_before_signature_stage() {
+        use crate::packages::signature::SUPPORTED_SIGNATURE_FORMAT_VERSION;
+
         let validator = test_validator(PackageValidationPolicy::production());
         assert!(validator.policy().require_signature);
         assert_eq!(validator.digest().algorithm(), DigestAlgorithm::Sha256);
-        let err = validator.validate(Path::new("pkg.zip")).unwrap_err();
+        let envelope = PackageSignature {
+            format_version: SUPPORTED_SIGNATURE_FORMAT_VERSION,
+            key_id: "k1".to_owned(),
+            signature: vec![0u8; 64],
+        };
+        let err = validator
+            .validate(Path::new("pkg.zip"), &envelope)
+            .unwrap_err();
         assert!(matches!(err, ValidationError::Archive(_)));
     }
 
     #[test]
     fn unsigned_config_rejected_before_archive_stage() {
+        use crate::packages::signature::SUPPORTED_SIGNATURE_FORMAT_VERSION;
+
         let mut policy = PackageValidationPolicy::production();
         policy.require_signature = false;
         let validator = test_validator(policy);
-        let err = validator.validate(Path::new("pkg.zip")).unwrap_err();
+        let envelope = PackageSignature {
+            format_version: SUPPORTED_SIGNATURE_FORMAT_VERSION,
+            key_id: "k1".to_owned(),
+            signature: vec![0u8; 64],
+        };
+        let err = validator
+            .validate(Path::new("pkg.zip"), &envelope)
+            .unwrap_err();
         assert!(matches!(err, ValidationError::Policy(_)));
     }
 

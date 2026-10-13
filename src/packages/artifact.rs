@@ -39,7 +39,6 @@ impl ArtifactDigest {
 
 /// A validated, promoted artifact. Minted only by the validation workflow;
 /// read through accessors.
-#[allow(dead_code)] // Scaffold: constructed once promotion lands; accessors define the read API.
 #[derive(Debug, Clone)]
 pub struct ValidatedArtifact {
     digest: ArtifactDigest,
@@ -48,9 +47,6 @@ pub struct ValidatedArtifact {
 }
 
 impl ValidatedArtifact {
-    // Scaffold: first call site lands with promotion; the unit test below
-    // exercises construction in test builds only.
-    #[allow(dead_code)]
     pub(crate) fn new(digest: ArtifactDigest, module_id: String, version: String) -> Self {
         Self {
             digest,
