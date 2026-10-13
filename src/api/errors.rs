@@ -28,13 +28,25 @@ pub struct ErrorBody {
 pub enum ApiError {
     /// Malformed request: missing fields, bad base64, bad envelope shape.
     BadRequest(&'static str, String),
-    /// Authentication failure: unknown key, disallowed algorithm, or a
-    /// signature that does not verify.
-    Unauthorized(&'static str, String),
+    /// Authentication failure. The `challenge` names the HTTP auth scheme
+    /// so the `WWW-Authenticate` response header matches the mechanism
+    /// that rejected the request (`Bearer` for transport auth, `Signature`
+    /// for package authentication).
+    Unauthorized {
+        code: &'static str,
+        message: String,
+        challenge: &'static str,
+    },
     /// Well-formed but semantically invalid package.
     Unprocessable(&'static str, String),
     /// Body exceeds the policy byte bound while streaming.
     PayloadTooLarge(String),
+    /// Request headers exceed the fixed count or byte caps.
+    HeadersTooLarge(String),
+    /// Body upload fell below the minimum speed floor.
+    SlowUpload(String),
+    /// Server is at its concurrent-upload bound.
+    Overloaded(String),
     /// Validation timed out.
     Timeout,
     /// Unexpected server failure (I/O around quarantine, task join).
@@ -51,7 +63,11 @@ impl ApiError {
                     message: message.clone(),
                 },
             ),
-            Self::Unauthorized(code, message) => (
+            Self::Unauthorized {
+                code,
+                message,
+                challenge: _,
+            } => (
                 StatusCode::UNAUTHORIZED,
                 ErrorBody {
                     code,
@@ -69,6 +85,27 @@ impl ApiError {
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ErrorBody {
                     code: "payload_too_large",
+                    message: message.clone(),
+                },
+            ),
+            Self::HeadersTooLarge(message) => (
+                StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                ErrorBody {
+                    code: "headers_too_large",
+                    message: message.clone(),
+                },
+            ),
+            Self::SlowUpload(message) => (
+                StatusCode::REQUEST_TIMEOUT,
+                ErrorBody {
+                    code: "slow_upload",
+                    message: message.clone(),
+                },
+            ),
+            Self::Overloaded(message) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorBody {
+                    code: "server_busy",
                     message: message.clone(),
                 },
             ),
@@ -95,14 +132,14 @@ impl IntoResponse for ApiError {
         let (status, body) = self.status_and_body();
         tracing::warn!(code = body.code, message = %body.message, "upload rejected");
         let mut response = (status, Json(body)).into_response();
-        // RFC 9110: a 401 response must carry WWW-Authenticate. These
-        // uploads authenticate with a detached package signature, not an
-        // HTTP auth scheme, so the challenge names that mechanism.
-        if status == StatusCode::UNAUTHORIZED {
-            response.headers_mut().insert(
-                axum::http::header::WWW_AUTHENTICATE,
-                axum::http::HeaderValue::from_static("Signature realm=\"package-upload\""),
-            );
+        // RFC 9110: a 401 response must carry WWW-Authenticate naming the
+        // scheme that rejected the request.
+        if let Self::Unauthorized { challenge, .. } = &self {
+            if let Ok(value) = axum::http::HeaderValue::from_str(challenge) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::WWW_AUTHENTICATE, value);
+            }
         }
         response
     }
@@ -121,7 +158,11 @@ impl From<ValidationError> for ApiError {
                     SignatureError::VerificationFailed => "signature_verification_failed",
                     SignatureError::InvalidEnvelope(_) => "invalid_signature_envelope",
                 };
-                Self::Unauthorized(code, inner.to_string())
+                Self::Unauthorized {
+                    code,
+                    message: inner.to_string(),
+                    challenge: "Signature realm=\"package-upload\"",
+                }
             }
             ValidationError::Policy(inner) => {
                 Self::Unprocessable("policy_rejected", inner.to_string())
@@ -161,6 +202,21 @@ mod tests {
         let (status, body) = err.status_and_body();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.code, "invalid_signature_envelope");
+    }
+
+    #[test]
+    fn transport_limits_map_to_431_408_and_503() {
+        let (status, body) = ApiError::HeadersTooLarge("too many".to_owned()).status_and_body();
+        assert_eq!(status, StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
+        assert_eq!(body.code, "headers_too_large");
+
+        let (status, body) = ApiError::SlowUpload("too slow".to_owned()).status_and_body();
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(body.code, "slow_upload");
+
+        let (status, body) = ApiError::Overloaded("busy".to_owned()).status_and_body();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.code, "server_busy");
     }
 
     #[test]

@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 
 /// Host configuration. Built once at startup and shared by value or by
 /// reference; the upload API derives its quarantine directory, request
-/// timeout, and body-limit headroom from these fields plus the validation
-/// policy (which remains the authoritative byte bound).
+/// timeout, TLS identity, upload rate floor, and concurrency bound from
+/// these fields plus the validation policy (which remains the authoritative
+/// byte bound).
 #[derive(Debug, Clone)]
 pub struct Config {
     pub http_bind: String,
@@ -13,6 +14,20 @@ pub struct Config {
     /// Per-request timeout in seconds, enforced by the HTTP timeout layer
     /// and the blocking validation task.
     pub request_timeout_secs: u64,
+    /// PEM certificate and private key for the TLS-only listener. There is
+    /// deliberately no plaintext option: this service never serves HTTP.
+    pub tls_cert_path: String,
+    pub tls_key_path: String,
+    /// Minimum accepted body-upload speed in bytes per second, enforced
+    /// after `rate_grace_secs` of transfer. Trickle (slow-loris) bodies
+    /// are rejected with `408`.
+    pub min_upload_bytes_per_sec: u64,
+    /// Grace period in seconds before the rate floor applies, covering
+    /// handshake and slow-start so small legitimate uploads never trip it.
+    pub rate_grace_secs: u64,
+    /// Maximum simultaneous upload validations. Excess uploads are
+    /// rejected with `503` instead of queueing unbounded work.
+    pub max_concurrent_uploads: usize,
 }
 
 impl Default for Config {
@@ -21,6 +36,11 @@ impl Default for Config {
             http_bind: "127.0.0.1:8080".to_owned(),
             storage_root: "data".to_owned(),
             request_timeout_secs: 30,
+            tls_cert_path: "tls/cert.pem".to_owned(),
+            tls_key_path: "tls/key.pem".to_owned(),
+            min_upload_bytes_per_sec: 8_192,
+            rate_grace_secs: 5,
+            max_concurrent_uploads: 8,
         }
     }
 }
@@ -59,5 +79,20 @@ mod tests {
     #[test]
     fn default_timeout_is_nonzero() {
         assert!(Config::default().request_timeout_secs > 0);
+    }
+
+    #[test]
+    fn default_tls_paths_are_configured() {
+        let config = Config::default();
+        assert!(!config.tls_cert_path.is_empty());
+        assert!(!config.tls_key_path.is_empty());
+    }
+
+    #[test]
+    fn default_rate_floor_and_slots_are_nonzero() {
+        let config = Config::default();
+        assert!(config.min_upload_bytes_per_sec > 0);
+        assert!(config.rate_grace_secs > 0);
+        assert!(config.max_concurrent_uploads > 0);
     }
 }
