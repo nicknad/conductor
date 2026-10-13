@@ -2,8 +2,9 @@
 //!
 //! What must hold (none of this is operator-configurable):
 //! - limits are validated before the backend touches the archive;
-//! - entry paths can never escape staging (no absolute, drive-prefixed,
-//!   dot-segment, empty-segment, backslash, or over-long names);
+//! - entry paths can never escape staging (no absolute, colon-bearing,
+//!   dot-segment, empty-segment, backslash, control-character, trailing
+//!   dot/space, reserved-device, or over-long names);
 //! - symlinks are never extracted; duplicates and case collisions rejected;
 //! - unexpected compression is rejected, never attempted opportunistically;
 //! - entry-count, byte, ratio, and depth bounds are enforced independently.
@@ -128,7 +129,14 @@ fn entry_count_limit_is_checked_before_backend_parses() {
 
 #[test]
 fn entry_path_policy_accepts_only_confined_relative_paths() {
-    for accepted in ["manifest.json", "bin/plugin.dll", "a/b/c/deep.dat", "docs/"] {
+    for accepted in [
+        "manifest.json",
+        "bin/plugin.dll",
+        "a/b/c/deep.dat",
+        "docs/",
+        "com10.txt",
+        "console/err.log",
+    ] {
         assert!(
             check_entry_path(accepted, false).is_ok(),
             "must accept {accepted:?}"
@@ -146,19 +154,20 @@ fn entry_path_policy_accepts_only_confined_relative_paths() {
         "a//b",
         "a\\b",
         "manifest.json ",
+        "payload/file:stream",
+        "aux",
+        "nul.log",
+        "trailing.",
+        "trailing ",
+        "with\ttab",
     ] {
-        // NOTE: "manifest.json " (trailing space) is currently accepted: it
-        // is confined, and trailing-space trimming is a backend/extraction
-        // concern, not a traversal vector. Listed here to pin the behavior.
-        let result = check_entry_path(hostile, false);
-        if hostile == "manifest.json " {
-            assert!(result.is_ok());
-        } else {
-            assert!(
-                matches!(result, Err(ArchiveError::PathRejected(_))),
-                "must reject {hostile:?}"
-            );
-        }
+        assert!(
+            matches!(
+                check_entry_path(hostile, false),
+                Err(ArchiveError::PathRejected(_))
+            ),
+            "must reject {hostile:?}"
+        );
     }
 }
 

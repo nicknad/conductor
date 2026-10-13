@@ -381,12 +381,15 @@ impl ZipArchiveReader {
 pub const MAX_ENTRY_PATH_LEN: usize = 1_024;
 
 /// Pure entry-path policy: the fixed archive-safety invariant, testable
-/// without I/O. Rejects absolute paths, Windows drive prefixes, `.` / `..`
-/// components, empty segments, backslashes, over-long names, and symlink
-/// entries. A single trailing `/` (explicit directory entry) is stripped —
-/// directories carry no payload and are recreated from file parents during
-/// extraction. Returns the normalized relative path, confined by
-/// construction: no caller can obtain an escaping path from this function.
+/// without I/O. Rejects absolute paths, any colon (drive prefixes and NTFS
+/// alternate data streams), ASCII control characters, `.` / `..`
+/// components, empty segments, backslashes, over-long names, components
+/// with trailing dots or spaces (Windows strips them, collapsing distinct
+/// entries), Windows reserved device names, and symlink entries. A single
+/// trailing `/` (explicit directory entry) is stripped — directories carry
+/// no payload and are recreated from file parents during extraction.
+/// Returns the normalized relative path, confined by construction: no
+/// caller can obtain an escaping path from this function.
 pub fn check_entry_path(entry: &str, is_symlink: bool) -> Result<String, ArchiveError> {
     if is_symlink {
         return Err(ArchiveError::PathRejected(
@@ -409,10 +412,14 @@ pub fn check_entry_path(entry: &str, is_symlink: bool) -> Result<String, Archive
     if entry.starts_with('/') {
         return Err(ArchiveError::PathRejected("absolute paths are rejected"));
     }
-    let bytes = entry.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+    if entry.contains(':') {
         return Err(ArchiveError::PathRejected(
-            "drive-prefixed paths are rejected",
+            "colon-bearing names are rejected (drive prefixes, NTFS data streams)",
+        ));
+    }
+    if entry.bytes().any(|b| b.is_ascii_control()) {
+        return Err(ArchiveError::PathRejected(
+            "control characters are never accepted in entry names",
         ));
     }
     let stripped = entry.strip_suffix('/').unwrap_or(entry);
@@ -430,10 +437,34 @@ pub fn check_entry_path(entry: &str, is_symlink: bool) -> Result<String, Archive
             "." | ".." => {
                 return Err(ArchiveError::PathRejected("dot segments are rejected"));
             }
-            _ => normalized.push(component),
+            _ => {}
         }
+        if component.ends_with(['.', ' ']) {
+            return Err(ArchiveError::PathRejected(
+                "components with trailing dots or spaces are rejected",
+            ));
+        }
+        if is_windows_reserved_name(component) {
+            return Err(ArchiveError::PathRejected(
+                "Windows reserved device names are rejected",
+            ));
+        }
+        normalized.push(component);
     }
     Ok(normalized.join("/"))
+}
+
+/// Windows treats `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, and
+/// `LPT1`-`LPT9` as reserved device names in every directory, with the
+/// extension ignored: `CON.txt` names the console just like `CON`. A
+/// cross-platform package must never contain one.
+fn is_windows_reserved_name(component: &str) -> bool {
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let stem = component.split('.').next().unwrap_or_default();
+    RESERVED.iter().any(|name| stem.eq_ignore_ascii_case(name))
 }
 
 /// Rejects exact-duplicate paths and case-fold collisions within one
@@ -877,6 +908,52 @@ mod tests {
         assert_eq!(inspected.files, vec!["bin/tool".to_owned()]);
         let untyped = stored_zip_with_mode("plain.dat", 0o600);
         scan_bytes(&untyped, &config).expect("type-less mode must pass");
+    }
+
+    #[test]
+    fn windows_unsafe_names_rejected() {
+        for hostile in [
+            "C:/windows/evil",
+            "c:evil",
+            "payload/file:stream",
+            "stream:name",
+            "aux",
+            "AUX.txt",
+            "con",
+            "nul.log",
+            "COM1",
+            "lpt9.bin",
+            "dir/COM1.txt",
+            "trailing.",
+            "trailing ",
+            "dir/trailing. ",
+            "with\nnewline",
+            "with\ttab",
+            "\u{7f}",
+        ] {
+            assert!(
+                matches!(
+                    check_entry_path(hostile, false),
+                    Err(ArchiveError::PathRejected(_))
+                ),
+                "must reject {hostile:?}"
+            );
+        }
+        for accepted in [
+            "conifer.txt",
+            "console/err.log",
+            "com10.txt",
+            "lpt0.dat",
+            "nulled/readme",
+            ".gitignore",
+            "internal space.txt",
+            "payload/report.2024",
+        ] {
+            assert!(
+                check_entry_path(accepted, false).is_ok(),
+                "must accept {accepted:?}"
+            );
+        }
     }
 
     #[test]
