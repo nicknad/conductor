@@ -88,8 +88,6 @@ fn minimal_state(tag: &str) -> (AppState, PathBuf, PathBuf) {
             request_timeout: Duration::from_secs(10),
             api_token: ApiToken::new("test-bearer-upload"),
             upload_slots: Arc::new(Semaphore::new(8)),
-            min_upload_bytes_per_sec: 8_192,
-            rate_grace: Duration::from_secs(5),
         },
         quarantine_dir,
         artifact_dir,

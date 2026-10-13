@@ -47,15 +47,15 @@ only. `packages` holds no lifecycle state and performs no directed writes.
 
 1. **Transport.** TLS-only (`bind_rustls`, no plaintext listener), bearer auth
    on every `/v1` route (`401`, constant-time, indistinguishable
-   missing/wrong), header caps (`431`), total-body bound (policy bound + 1 MiB
-   slack), per-request timeout, 8 concurrent-upload slots (`503`), minimum
-   upload speed (`408`), panic containment (bare `500`), security headers +
-   `x-request-id` on every response. `/healthz` is the sole unauthenticated
-   route and returns only `ok`.
+   missing/wrong), total-body bound (policy bound + 1 MiB slack),
+   per-request timeout, 8 concurrent-upload slots (`503`), panic
+   containment (bare `500`), security headers + `x-request-id` on every
+   response. `/healthz` is the sole unauthenticated route and returns
+   only `ok`.
 2. **Stream to quarantine** (`storage::quarantine`). Package bytes stream
-   straight to a `create_new` private file; per-chunk byte bound and rate
-   floor enforced while writing. A `QuarantineGuard` deletes partial files on
-   every failure path.
+   straight to a `create_new` private file with a per-chunk byte bound.
+   A `QuarantineGuard` deletes partial files on every failure path.
+   Slow bodies are bounded by the total per-request timeout.
 3. **Validate** (`control_plane::validate_package` over one open
    `QuarantinedFile` — hashing, inspection, and manifest reads share the
    handle, never a reopened path): policy gate → SHA-256 digest →

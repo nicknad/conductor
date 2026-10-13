@@ -65,14 +65,10 @@ Transport security, all fail-closed with no opt-outs:
   unauthenticated endpoint — liveness probes cannot present credentials —
   and returns only `ok`.
 - **Bounded everything.** Total body (policy bound + 1 MiB slack),
-  streaming package bytes, text fields, at most 16 multipart fields, at
-  most 32 request headers / 8 KiB header bytes (`431` beyond that, also
-  enforced at the hyper socket layer), and at most 8 concurrent uploads
-  (`503 server_busy` instead of unbounded queueing).
-- **Minimum upload speed.** Bodies averaging below
-  `min_upload_bytes_per_sec` after a grace period are rejected with
-  `408`, so trickle connections cannot occupy a slot until the total
-  timeout. Per-request timeouts bound the rest.
+  streaming package bytes, text fields, at most 16 multipart fields, and
+  at most 8 concurrent uploads (`503 server_busy` instead of unbounded
+  queueing). Oversized header sections are rejected at the hyper socket
+  layer; slow bodies are bounded by the total per-request timeout.
 - **Silent responses.** No `Server`/`Via`/`X-Powered-By` identity
   headers; `nosniff`, `DENY` framing, `no-referrer`, `no-store`, and a
   server-generated `x-request-id` on every response; panics become a bare
@@ -80,7 +76,7 @@ Transport security, all fail-closed with no opt-outs:
 
 Responses: `201` with `{module_id, version, digest, signer_key_id}` on
 acceptance; `400` malformed, `401` unauthenticated (with the matching
-`WWW-Authenticate` challenge), `408` stalled, `413` oversized, `422`
+`WWW-Authenticate` challenge), `413` oversized, `422`
 semantically invalid, `503` saturated. Rejected bytes are deleted from
 quarantine (drop-guaranteed); accepted bytes are kept for the artifact
 store to promote. The binary still refuses to serve until operator
@@ -123,9 +119,9 @@ included), output bounds, and staged-file tamper detection at resolve time.
   ported yet.
 - Reference: the original .NET 10 implementation is frozen under
   [`archive/dotnet-original/`](archive/README.md) for consultation only.
-- Specification: [`docs/`](docs/README.md) describes the **previous .NET design**. It is
-  kept as background and does **not** yet describe the Rust rewrite. Do not treat code
-  and docs agreement as guaranteed during the rewrite.
+- Specification: [`docs/architecture.md`](docs/architecture.md) describes the
+  Rust system as built. `docs/storage-reconciliation.md` and
+  `docs/design-persistence.md` are background/planning notes, not specs.
 
 ## Repository layout
 
@@ -147,7 +143,7 @@ tests/
   archive_security.rs       Archive security tests
   execution_worker.rs       Worker-process execution tests
   upload_workflow.rs        Upload workflow tests
-docs/                       Historical .NET-era specs (background only, not current spec)
+docs/                       Current architecture + background notes (see docs/README.md)
 archive/
   dotnet-original/          Frozen .NET 10 implementation (reference only)
   README.md                 What the archive contains and why

@@ -18,7 +18,6 @@ use std::time::{Duration, SystemTime};
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use base64::prelude::*;
-use bytes::Bytes;
 use conductor::api::routes::router;
 use conductor::api::uploads::{ApiToken, AppState};
 use conductor::audit::recorder::RejectionRecorder;
@@ -82,8 +81,6 @@ fn test_state(policy: PackageValidationPolicy, tag: &str) -> AppState {
         request_timeout: Duration::from_secs(10),
         api_token: ApiToken::new("test-bearer-upload"),
         upload_slots: Arc::new(Semaphore::new(8)),
-        min_upload_bytes_per_sec: 8_192,
-        rate_grace: Duration::from_secs(5),
     }
 }
 
@@ -618,33 +615,6 @@ async fn concurrent_upload_bound_sheds_load() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let json: serde_json::Value = serde_json::from_slice(&bytes).expect("body must be JSON");
     assert_eq!(json["code"], "server_busy");
-    assert_eq!(quarantine_zip_count(&state.quarantine_dir), 0);
-    cleanup(&state.quarantine_dir);
-}
-
-#[tokio::test]
-async fn trickle_upload_rejected_with_408() {
-    // Floor far above any legitimate speed with a millisecond grace, then
-    // a body that stalls mid-transfer: the rate floor must trip instead
-    // of occupying a slot until the total timeout.
-    let mut state = test_state(PackageValidationPolicy::production(), "trickle");
-    state.min_upload_bytes_per_sec = 50_000_000;
-    state.rate_grace = Duration::from_millis(50);
-    let full = golden_body(&golden_package_bytes());
-    let (first, rest) = full.split_at(128);
-    let first = first.to_vec();
-    let rest = rest.to_vec();
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
-    tokio::spawn(async move {
-        let _ = tx.send(Ok(Bytes::from(first))).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let _ = tx.send(Ok(Bytes::from(rest))).await;
-    });
-    let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
-    let (status, _, bytes) = send_upload(&state, body, Some("test-bearer-upload"), &[]).await;
-    assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
-    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("body must be JSON");
-    assert_eq!(json["code"], "slow_upload");
     assert_eq!(quarantine_zip_count(&state.quarantine_dir), 0);
     cleanup(&state.quarantine_dir);
 }

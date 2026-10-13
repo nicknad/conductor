@@ -20,10 +20,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 tower = { version = "0.5", features = ["util", "timeout"] }
 tower-http = { version = "0.6", features = ["trace", "limit", "timeout", "set-header", "catch-panic", "request-id"] }
 base64 = "0.23.1"
-bytes = "1.12.1"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 subtle = "2.6.1"
-tokio-stream = { version = "0.1.19", features = ["sync"] }
 
 [target.'cfg(unix)'.dependencies]
 # Process-group termination for worker descendants (`killpg`); Unix-only,

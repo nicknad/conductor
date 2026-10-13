@@ -46,8 +46,6 @@ pub enum ApiError {
     Conflict(&'static str, String),
     /// Body exceeds the policy byte bound while streaming.
     PayloadTooLarge(String),
-    /// Body upload fell below the minimum speed floor.
-    SlowUpload(String),
     /// Server is at its concurrent-upload bound.
     Overloaded(String),
     /// Validation timed out.
@@ -65,7 +63,6 @@ impl ApiError {
             Self::Unprocessable(..) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Conflict(..) => StatusCode::CONFLICT,
             Self::PayloadTooLarge(..) => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::SlowUpload(..) => StatusCode::REQUEST_TIMEOUT,
             Self::Overloaded(..) | Self::Timeout => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(..) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -80,7 +77,6 @@ impl ApiError {
             | Self::Unprocessable(code, _)
             | Self::Conflict(code, _) => code,
             Self::PayloadTooLarge(..) => "payload_too_large",
-            Self::SlowUpload(..) => "slow_upload",
             Self::Overloaded(..) => "server_busy",
             Self::Timeout => "validation_timeout",
             Self::Internal(..) => "internal",
@@ -94,7 +90,6 @@ impl ApiError {
             | Self::Unprocessable(_, message)
             | Self::Conflict(_, message)
             | Self::PayloadTooLarge(message)
-            | Self::SlowUpload(message)
             | Self::Overloaded(message)
             | Self::Internal(message) => message,
             Self::Unauthorized { message, .. } => message,
@@ -194,11 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_limits_map_to_408_and_503() {
-        let (status, body) = ApiError::SlowUpload("too slow".to_owned()).status_and_body();
-        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
-        assert_eq!(body.code, "slow_upload");
-
+    fn overload_maps_to_503() {
         let (status, body) = ApiError::Overloaded("busy".to_owned()).status_and_body();
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body.code, "server_busy");

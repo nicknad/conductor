@@ -18,11 +18,10 @@
 //! bearer token ([`require_bearer`]), then the package authenticates
 //! itself via its detached signature. Anonymous uploads do not exist.
 //!
-//! Transfer guards, all enforced while streaming: at most
-//! [`MAX_FORM_FIELDS`] multipart fields; a minimum body-upload speed
-//! ([`RateFloor`], rejecting trickle bodies with `408`); a concurrency
-//! slot per upload (excess uploads get `503` instead of queueing
-//! unbounded disk and CPU work).
+//! Transfer guards: at most [`MAX_FORM_FIELDS`] multipart fields and a
+//! concurrency slot per upload (excess uploads get `503` instead of
+//! queueing unbounded disk and CPU work). Slow bodies are bounded by the
+//! total request timeout, not a per-byte speed floor.
 //!
 //! On success the quarantine file is promoted to the artifact store, the
 //! validated identity is registered in the module registry (idempotent for
@@ -128,12 +127,6 @@ pub struct AppState {
     pub api_token: ApiToken,
     /// Concurrency slots: one permit per in-flight upload.
     pub upload_slots: Arc<Semaphore>,
-    /// Minimum accepted body-upload speed in bytes per second (0 disables,
-    /// nonzero is expected in production).
-    pub min_upload_bytes_per_sec: u64,
-    /// Grace period before the rate floor applies, covering handshake and
-    /// slow-start so small legitimate uploads never trip it.
-    pub rate_grace: Duration,
 }
 
 /// `201` body for an accepted package.
@@ -284,55 +277,6 @@ pub async fn require_bearer(
     }
 }
 
-/// Minimum body-upload-speed enforcement. Counts every consumed body byte
-/// (package, text, and drained unknown fields alike — all consume
-/// transfer) and trips once past the grace period when the average falls
-/// below the floor. `min_rate == 0` disables the check.
-struct RateFloor {
-    min_bytes_per_sec: u64,
-    grace: Duration,
-    start: std::time::Instant,
-    bytes: u64,
-}
-
-impl RateFloor {
-    fn new(min_bytes_per_sec: u64, grace: Duration) -> Self {
-        Self {
-            min_bytes_per_sec,
-            grace,
-            start: std::time::Instant::now(),
-            bytes: 0,
-        }
-    }
-
-    fn note(&mut self, n: usize) -> Result<(), ApiError> {
-        self.bytes += n as u64;
-        if rate_floor_tripped(
-            self.bytes,
-            self.start.elapsed(),
-            self.min_bytes_per_sec,
-            self.grace,
-        ) {
-            return Err(ApiError::SlowUpload(format!(
-                "body upload fell below {} bytes/s after the grace period",
-                self.min_bytes_per_sec
-            )));
-        }
-        Ok(())
-    }
-}
-
-/// Pure rate-floor predicate: true once past `grace` when `bytes` averages
-/// below `min_rate`. `u128` arithmetic cannot overflow (`u64` rate times
-/// nanosecond elapsed). Separated out so tests prove the exact boundary
-/// without sleeping.
-fn rate_floor_tripped(bytes: u64, elapsed: Duration, min_rate: u64, grace: Duration) -> bool {
-    if min_rate == 0 || elapsed < grace {
-        return false;
-    }
-    (bytes as u128) < (min_rate as u128) * (elapsed.as_nanos()) / 1_000_000_000
-}
-
 /// Streams one upload into quarantine, validates it, promotes it, and
 /// registers the module version. See the module docs for field layout and
 /// limits.
@@ -377,7 +321,6 @@ async fn process_upload(
         })?;
 
     let max_bytes = state.validator.policy().archive.max_compressed_bytes;
-    let mut rate = RateFloor::new(state.min_upload_bytes_per_sec, state.rate_grace);
     // Owns the quarantine file from creation: any error return below drops
     // the guard and deletes the partial file, so no failure path can leak
     // hostile bytes — including ones added later. Only the success path
@@ -439,13 +382,13 @@ async fn process_upload(
                 })?;
                 let file = tokio::fs::File::from_std(std_file);
                 let mut field = field;
-                // Owned from creation: any error below — streaming,
-                // limits, rate floor — drops the guard and deletes the
+                // Owned from creation: any error below — streaming or
+                // limits — drops the guard and deletes the
                 // partial file. The helper drops the write handle on
                 // every failure path (Windows cannot remove an open
                 // file); deletion itself is the guard's job.
                 quarantine.store(path);
-                let received = stream_package_to_quarantine(&mut field, file, max_bytes, &mut rate)
+                let received = stream_package_to_quarantine(&mut field, file, max_bytes)
                     .await
                     .map_err(|e| UploadFailure::from_api(RejectionStage::Streaming, e))?;
                 package_bytes = Some(received);
@@ -453,27 +396,22 @@ async fn process_upload(
             }
             "key_id" => {
                 key_id = Some(
-                    read_text_capped(field, MAX_KEY_ID_BYTES, "key_id", &mut rate)
+                    read_text_capped(field, MAX_KEY_ID_BYTES, "key_id")
                         .await
                         .map_err(|e| UploadFailure::from_api(RejectionStage::Multipart, e))?,
                 );
             }
             "signature" => {
                 signature_text = Some(
-                    read_text_capped(field, MAX_SIGNATURE_TEXT_BYTES, "signature", &mut rate)
+                    read_text_capped(field, MAX_SIGNATURE_TEXT_BYTES, "signature")
                         .await
                         .map_err(|e| UploadFailure::from_api(RejectionStage::Multipart, e))?,
                 );
             }
             "format_version" => {
-                let text = read_text_capped(
-                    field,
-                    MAX_FORMAT_VERSION_TEXT_BYTES,
-                    "format_version",
-                    &mut rate,
-                )
-                .await
-                .map_err(|e| UploadFailure::from_api(RejectionStage::Multipart, e))?;
+                let text = read_text_capped(field, MAX_FORMAT_VERSION_TEXT_BYTES, "format_version")
+                    .await
+                    .map_err(|e| UploadFailure::from_api(RejectionStage::Multipart, e))?;
                 format_version = text.trim().parse::<u16>().map_err(|_| {
                     UploadFailure::from_api(
                         RejectionStage::Multipart,
@@ -486,10 +424,9 @@ async fn process_upload(
             }
             _ => {
                 // Drain unknown fields so a misbehaving client cannot stall
-                // the connection; content is ignored but still counts toward
-                // the rate floor, since it consumes transfer.
+                // the connection; content is ignored.
                 let mut field = field;
-                while let Some(chunk) = field
+                while field
                     .chunk()
                     .await
                     .map_err(|e| {
@@ -498,11 +435,8 @@ async fn process_upload(
                             ApiError::BadRequest("invalid_multipart", e.to_string()),
                         )
                     })?
-                {
-                    rate.note(chunk.len()).map_err(|e| {
-                        UploadFailure::from_api(RejectionStage::Streaming, e)
-                    })?;
-                }
+                    .is_some()
+                {}
             }
         }
     }
@@ -748,16 +682,13 @@ impl Drop for QuarantineGuard {
 
 /// Streams the `package` field into its quarantine file, enforcing
 /// `max_bytes` per chunk so a lying `Content-Length` cannot force
-/// over-allocation, and noting every chunk against the rate floor so a
-/// trickling body trips `408` instead of occupying a slot until the total
-/// timeout. Drops the write handle before returning any error (Windows
-/// cannot remove an open file) and leaves deletion to the caller's
-/// [`QuarantineGuard`]; the path is stored only on success.
+/// over-allocation. Drops the write handle before returning any error
+/// (Windows cannot remove an open file) and leaves deletion to the
+/// caller's [`QuarantineGuard`]; the path is stored only on success.
 async fn stream_package_to_quarantine(
     field: &mut axum::extract::multipart::Field<'_>,
     mut file: tokio::fs::File,
     max_bytes: u64,
-    rate: &mut RateFloor,
 ) -> Result<u64, ApiError> {
     let fail = |file: tokio::fs::File, err: ApiError| {
         drop(file);
@@ -775,9 +706,6 @@ async fn stream_package_to_quarantine(
             }
         };
         let Some(chunk) = chunk else { break };
-        if let Err(e) = rate.note(chunk.len()) {
-            return fail(file, e);
-        }
         total += chunk.len() as u64;
         if total > max_bytes {
             let _ = file.shutdown().await;
@@ -806,13 +734,11 @@ async fn stream_package_to_quarantine(
 }
 
 /// Reads a small text field with a byte cap enforced per chunk, so a huge
-/// field cannot force buffering before the limit applies. Bytes count
-/// toward the rate floor like every other consumed body byte.
+/// field cannot force buffering before the limit applies.
 async fn read_text_capped(
     mut field: axum::extract::multipart::Field<'_>,
     cap: usize,
     what: &'static str,
-    rate: &mut RateFloor,
 ) -> Result<String, ApiError> {
     let mut bytes = Vec::new();
     while let Some(chunk) = field
@@ -820,7 +746,6 @@ async fn read_text_capped(
         .await
         .map_err(|e| ApiError::BadRequest("invalid_multipart", e.to_string()))?
     {
-        rate.note(chunk.len())?;
         if bytes.len() + chunk.len() > cap {
             return Err(ApiError::BadRequest(
                 "field_too_large",
@@ -878,44 +803,5 @@ mod tests {
         let expected = ApiToken::new("correct-token-value");
         let rendered = format!("{expected:?} {expected:?}");
         assert!(!rendered.contains("correct-token-value"));
-    }
-
-    #[test]
-    fn rate_floor_trips_only_past_grace_below_speed() {
-        // Below the floor after grace: trips.
-        assert!(rate_floor_tripped(
-            100,
-            Duration::from_secs(10),
-            1_000,
-            Duration::from_secs(1)
-        ));
-        // Exactly at the floor: passes (strictly-below trips).
-        assert!(!rate_floor_tripped(
-            10_000,
-            Duration::from_secs(10),
-            1_000,
-            Duration::from_secs(1)
-        ));
-        // Within grace: exempt regardless of speed.
-        assert!(!rate_floor_tripped(
-            1,
-            Duration::from_millis(500),
-            1_000,
-            Duration::from_secs(1)
-        ));
-        // Disabled floor never trips.
-        assert!(!rate_floor_tripped(
-            0,
-            Duration::from_secs(3600),
-            0,
-            Duration::from_secs(1)
-        ));
-        // Nanosecond-scale elapsed cannot overflow or divide by zero.
-        assert!(!rate_floor_tripped(
-            0,
-            Duration::ZERO,
-            1_000,
-            Duration::ZERO
-        ));
     }
 }
