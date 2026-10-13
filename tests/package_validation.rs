@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use conductor::application::validate_package::{
     BuildError, PackageValidationBuilder, PackageValidator, ValidationError,
 };
+use conductor::packages::archive::ArchiveError;
 use conductor::packages::artifact::ArtifactDigest;
 use conductor::packages::digest::Sha256DigestProvider;
 use conductor::packages::manifest::{Manifest, ManifestError};
@@ -86,6 +87,28 @@ fn missing_archive_fails_before_signature_stage() {
     assert!(matches!(
         validator.validate(Path::new("pkg.zip"), &dummy_envelope()),
         Err(ValidationError::Archive(_))
+    ));
+}
+
+/// The compressed-size bound is a pre-digest gate: an oversized archive
+/// must not be hashed and authenticated first. The envelope here names an
+/// unknown key, so reaching a signature failure would prove the ordering
+/// is wrong; `Archive(LimitExceeded)` proves the size gate ran first.
+#[test]
+fn oversized_archive_is_rejected_before_digest_and_signature() {
+    let mut policy = PackageValidationPolicy::production();
+    policy.archive.max_compressed_bytes = 1;
+    let (validator, _signing) = real_key_validator(policy);
+    let bytes = golden_package_bytes();
+    let package = TempPackage::write(&bytes, "oversized");
+    let envelope = PackageSignature {
+        format_version: SUPPORTED_SIGNATURE_FORMAT_VERSION,
+        key_id: "someone-else".to_owned(),
+        signature: vec![0u8; 64],
+    };
+    assert!(matches!(
+        validator.validate(package.path(), &envelope),
+        Err(ValidationError::Archive(ArchiveError::LimitExceeded(_)))
     ));
 }
 

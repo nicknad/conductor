@@ -4,7 +4,8 @@
 //! [`PackageValidationBuilder`] wires injectable dependencies with secure
 //! defaults; [`PackageValidator`] owns the fixed stage order:
 //!
-//! 1. policy gate (production ingest requires a signature),
+//! 1. policy gate (production ingest requires a signature; the on-disk
+//!    archive length is bounded before any hashing),
 //! 2. authenticate the exact package bytes: digest one open handle with
 //!    SHA-256, then verify the detached
 //!    [`PackageSignature`](crate::packages::signature::PackageSignature)
@@ -107,6 +108,19 @@ impl PackageValidator {
         self.policy.ensure_production_ingest()?;
         let mut file = File::open(archive)
             .map_err(|e| ValidationError::Archive(ArchiveError::Io(e.to_string())))?;
+        // Bound the work before hashing: the on-disk length is the one
+        // authoritative "compressed bytes" figure available without parsing,
+        // so an oversized upload is rejected before any digest or signature
+        // work. Inspection re-checks the exact per-entry totals later.
+        let on_disk = file
+            .metadata()
+            .map_err(|e| ValidationError::Archive(ArchiveError::Io(e.to_string())))?
+            .len();
+        if on_disk > self.policy.archive.max_compressed_bytes {
+            return Err(ValidationError::Archive(ArchiveError::LimitExceeded(
+                "archive size exceeds bound",
+            )));
+        }
         let digest = self.digest.digest_stream(&mut file)?;
         let _signer = self.signature_verifier.authenticate(
             signature,
