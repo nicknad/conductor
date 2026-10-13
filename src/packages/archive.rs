@@ -276,7 +276,7 @@ impl ZipArchiveReader {
         }
         let mut buf = Vec::new();
         entry
-            .take(max_bytes + 1)
+            .take(max_bytes.saturating_add(1))
             .read_to_end(&mut buf)
             .map_err(|e| ArchiveError::Io(e.to_string()))?;
         if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max_bytes {
@@ -630,6 +630,19 @@ mod tests {
             read_bytes(&dir_bytes, "docs/", 16),
             Err(ArchiveError::InvalidArchive(_))
         ));
+    }
+
+    #[test]
+    fn max_read_bound_does_not_overflow() {
+        // `u64::MAX` means "effectively unbounded", not "wrap to zero":
+        // debug builds must not panic and release builds must not return
+        // a silently truncated (here: empty) buffer.
+        let bytes = stored_zip(&[("x.dat", b"data")]);
+        assert_eq!(
+            read_bytes(&bytes, "x.dat", u64::MAX)
+                .expect("u64::MAX is an unbounded request, not an overflow"),
+            b"data"
+        );
     }
 
     #[test]
