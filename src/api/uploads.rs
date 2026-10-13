@@ -56,9 +56,9 @@ use tokio::sync::Semaphore;
 
 use crate::api::errors::ApiError;
 use crate::api::rejection::{request_id, Rejection};
+use crate::audit::recorder::RejectionRecorder;
 use crate::control_plane::upload_package::run_upload_workflow;
 use crate::control_plane::validate_package::PackageValidator;
-use crate::audit::recorder::RejectionRecorder;
 use crate::modules::registry::{ModuleRegistry, RegistryError};
 use crate::packages::signature::{PackageSignature, SUPPORTED_SIGNATURE_FORMAT_VERSION};
 use crate::storage::artifact_store::PromoteError;
@@ -123,7 +123,9 @@ pub struct AppState {
     /// with different bytes is a conflict, never an overwrite.
     pub registry: Arc<ModuleRegistry>,
     /// Structured rejection recorder: every refused upload produces exactly
-    /// one event (tracing in this phase; durable rows in a later phase).
+    /// one tracing event plus, when a store is attached, at most one
+    /// `package_rejections` row (best-effort; store failures never alter
+    /// the response).
     pub recorder: Arc<RejectionRecorder>,
     pub request_timeout: Duration,
     pub api_token: ApiToken,

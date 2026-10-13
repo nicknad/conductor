@@ -13,9 +13,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::api::errors::ApiError;
-use crate::control_plane::validate_package::ValidationError;
 use crate::audit::event::{RejectionEvent, RejectionStage};
 use crate::audit::recorder::RejectionRecorder;
+use crate::control_plane::validate_package::ValidationError;
 use crate::packages::artifact::ValidatedArtifact;
 
 /// Response extension marking that a rejection event for this response was

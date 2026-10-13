@@ -13,6 +13,7 @@
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, SystemTime};
 
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 use thiserror::Error;
@@ -197,6 +198,21 @@ impl Database {
         tx.commit().map_err(DatabaseError::from).map_err(E::from)?;
         Ok(out)
     }
+}
+
+/// Unix millis for a `SystemTime`, saturating at the `i64` bound and
+/// falling back to the epoch for pre-epoch times. Shared by every table
+/// that stores timestamps so rows stay comparable.
+pub(crate) fn to_millis(time: SystemTime) -> i64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Inverse of [`to_millis`]: negative stored values clamp to the epoch
+/// rather than panicking.
+pub(crate) fn from_millis(millis: i64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_millis(u64::try_from(millis).unwrap_or(0))
 }
 
 #[cfg(test)]

@@ -1,8 +1,8 @@
 # Persistence and Rejection Events — Design
 
-> **Status:** in progress — **PR1 (structured rejection events)** and
-> **PR2 (SQLite registry persistence)** implemented. Later phases are not yet
-> implemented. Implements audit items 7 and 8 from
+> **Status:** in progress — **PR1 (structured rejection events)**,
+> **PR2 (SQLite registry persistence)**, and **PR3 (durable rejection
+> rows)** implemented. Later phases are not yet implemented. Implements audit items 7 and 8 from
 > [storage-reconciliation.md](storage-reconciliation.md). Decisions recorded
 > here: **SQLite via `rusqlite` (bundled)** for the registry and rejection
 > records; rejections go to **structured `tracing` events and `package_rejections`
@@ -303,7 +303,11 @@ wait for the retention/GC work.
    (`fmt`, `clippy`, `test`, `cargo deny`). Wiring the store into
    `server::run` happens with startup assembly (still gated on trust-key
    loading).
-3. **PR3 — rejection rows**: DB sink, request-id plumbing, bounded detail.
+3. **PR3 — rejection rows (implemented)**: DB sink
+   (`src/audit/store.rs`), request-id plumbing, bounded detail.
+   `RejectionRecorder::new()` stays tracing-only; `with_store` attaches
+   the `package_rejections` insert (best-effort, never alters the
+   response).
 4. **PR4 — reconciliation**: integrity states, staging sweep, startup wiring,
    `reconciliation_runs`.
 5. **PR5+** — activation persistence wiring, artifact GC and retention, backup,

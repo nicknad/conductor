@@ -16,13 +16,13 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use rusqlite::{params, OptionalExtension};
 use thiserror::Error;
 
 use crate::packages::artifact::ArtifactDigest;
-use crate::storage::database::{Database, DatabaseError};
+use crate::storage::database::{from_millis, to_millis, Database, DatabaseError};
 
 /// One registered module version. Identity, provenance, the exact
 /// validated manifest bytes, and the promoted artifact's location and size
@@ -326,16 +326,6 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModuleRecord> {
         artifact_size: u64::try_from(artifact_size).unwrap_or(0),
         registered_at: from_millis(row.get(9)?),
     })
-}
-
-fn to_millis(time: SystemTime) -> i64 {
-    time.duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
-}
-
-fn from_millis(millis: i64) -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_millis(u64::try_from(millis).unwrap_or(0))
 }
 
 #[cfg(test)]

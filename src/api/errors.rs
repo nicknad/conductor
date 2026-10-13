@@ -16,8 +16,8 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 
-use crate::control_plane::validate_package::ValidationError;
 use crate::audit::event::RejectionStage;
+use crate::control_plane::validate_package::ValidationError;
 use crate::packages::signature::SignatureError;
 
 /// Machine-readable error body. `code` is stable for matching; `message`
