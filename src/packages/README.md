@@ -42,17 +42,20 @@ Two ordering rules are load-bearing:
   quarantined file; the implementation must never hash one file and reopen
   an attacker-controlled path for extraction.
 
-## What is flexible vs. fixed
+## What is configurable vs. fixed
 
-- **Injectable**: archive reader, signature verifier, key provider, digest
-  backend — swap per deployment or per test via the builder.
-- **Runtime policy** (`PackageValidationPolicy`, validated at startup):
-  size/entry bounds, accepted signature algorithms, compression methods,
-  manifest versions, `max_manifest_bytes`. Deserializable from operator
-  config; each validator snapshots one immutable policy.
-- **Fixed invariants**: stage order, mandatory signature on the production
-  path, traversal/duplicate/symlink rejection, fail-closed backends. These
-  live in code, never in config.
+- **Fixed backends**: one concrete implementation per stage — no provider
+  traits, nothing to swap. Fake backends for tests arrive as `#[cfg(test)]`
+  seams alongside their real counterparts.
+- **Configurable values**: trust store contents (`ConfiguredTrustedKeys`,
+  supplied by value) and runtime policy (`PackageValidationPolicy`,
+  validated at startup): size/entry bounds, compression ratio, nesting
+  depth, accepted signature algorithms, compression methods, manifest
+  versions, `max_manifest_bytes`. Deserializable from operator config; each
+  validator snapshots one immutable policy.
+- **Fixed invariants**: stage order, mandatory signature and mandatory
+  trust store on the production path, traversal/duplicate/symlink
+  rejection, fail-closed backends. These live in code, never in config.
 
 ## Errors
 
@@ -63,13 +66,12 @@ closed with `NotImplemented` variants — never silent success.
 ## Tests
 
 - Unit tests beside each module (bounds, path tables, fail-closed backends,
-  injection doubles).
+  trust-by-value configuration).
 - `tests/archive_security.rs` — confinement invariants through the public
   API, plus a presence check on the hostile corpus.
-- `tests/package_validation.rs` — policy gates and validator stage order
-  (including a `MustNotRun` reader proving unsigned configs never reach the
-  archive stage).
-- `tests/testdata/` — evil-but-inert ZIP fixtures (`traversal`,
-  `absolute`, `duplicate`, `symlink`, `entry-bomb`, `odd-compression`) with
-  their own README; consumed by real-reader tests once the ZIP backend
-  lands.
+- `tests/package_validation.rs` — policy gates, mandatory trust store at
+  build, and validator stage order (unsigned configs are rejected before
+  the archive stage runs).
+- `tests/testdata/` — evil-but-inert ZIP fixtures; see [the corpus
+  reference](../../tests/testdata/README.md). Consumed by real-reader
+  tests once the ZIP backend lands.

@@ -37,6 +37,8 @@ Conductor verifies the signature against trusted publishers, validates the archi
 
 **Package contents define what can run; Conductor controls whether, where, and under which permissions it runs.**
 
+Details: [package validation pipeline](src/packages/README.md) · [hostile archive corpus](tests/testdata/README.md).
+
 ## Status
 
 - Active code: single-crate Rust modular monolith (`src/`, `tests/`).

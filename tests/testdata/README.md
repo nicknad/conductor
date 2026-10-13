@@ -26,6 +26,10 @@ When the backend lands, each fixture gets a reader test asserting the
 verdict in its section. Nothing about the fixtures themselves should need
 to change.
 
+Pipeline context: the validation stages these fixtures feed are defined in
+[src/packages/README.md](../../src/packages/README.md); the package format
+they attack is sketched in [Service Packages](../../README.md#service-packages).
+
 ## Safety and size budget
 
 - Payloads must stay inert: plain text, no scripts, no executables, no
