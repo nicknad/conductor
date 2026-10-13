@@ -88,6 +88,34 @@ trusted-key loading lands (`conductor::server::run` fails closed), so
 the API is exercised through `router` in `tests/upload_api.rs` (one
 test per hardening effort) and `tests/tls_only.rs`.
 
+## Worker execution (unstable)
+
+Job functions never run in-process. One execution is one worker child process,
+started from the entrypoint of a staged, digest-re-verified artifact with an
+explicit environment (nothing inherited):
+
+- **Protocol.** One newline-delimited JSON request on stdin — execution id,
+  module/function identity, digest, configuration, deadline; secrets only ever
+  here, never argv or env — then EOF. The worker answers with exactly one
+  response line on stdout (`ok` with a result, or `failed` with a message);
+  stderr is diagnostics only.
+- **Bounds.** Request and response lines, captured stderr, and wall time are
+  all capped, and output is drained concurrently so a chatty worker cannot
+  deadlock on a full pipe.
+- **Termination.** Deadline overruns and cancellation SIGTERM the worker's
+  whole process group, SIGKILL it after a grace period, and clean up
+  descendants where the platform supports process groups.
+- **Identity & scope.** Workers inherit the host's identity (`uid`, `gid`, and
+  supplementary groups are never changed), so package code can reach whatever
+  the host process can: the process boundary is fault and resource
+  containment, not a sandbox. Stronger filesystem, network, or credential
+  isolation would be a separate OS-level design change.
+
+Proven in `tests/execution_worker.rs`: request round trip, secret and
+environment handling, host-identity inheritance, failure and
+protocol-violation reporting, timeout and cancellation teardown (descendants
+included), output bounds, and staged-file tamper detection at resolve time.
+
 ## Status
 
 - Active code: single-crate Rust modular monolith (`src/`, `tests/`).
@@ -112,11 +140,12 @@ src/
   packages/                 Package domain and validation
   storage/                  Filesystem persistence
   modules/                  Installed module registry/lifecycle
-  executions/               Scheduling and execution dispatch
+  executions/               Worker-process execution (spawn, IPC, limits)
   config.rs                 Host configuration
 tests/
   package_validation.rs     Package validation workflow tests
   archive_security.rs       Archive security tests
+  execution_worker.rs       Worker-process execution tests
   upload_workflow.rs        Upload workflow tests
 docs/                       Historical .NET-era specs (background only, not current spec)
 archive/

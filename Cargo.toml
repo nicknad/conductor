@@ -25,5 +25,10 @@ axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 subtle = "2.6.1"
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 
+[target.'cfg(unix)'.dependencies]
+# Process-group termination for worker descendants (`killpg`); Unix-only,
+# so it is not a portable dependency.
+libc = "0.2"
+
 [dev-dependencies]
 rcgen = "0.14.10"
