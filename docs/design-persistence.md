@@ -76,11 +76,11 @@ pub enum RejectionStage {
 | --- | --- |
 | `post_package` (`src/api/uploads.rs`) | multipart shape, streaming, timeout, validation stages, promotion, registration conflict |
 | `require_bearer` (`src/api/uploads.rs`) | 401 unauthenticated |
-| `limit_headers` (`src/api/middleware.rs`) | 431 header bloat |
-| Tower layers (timeout 503, body limit 413, panic 500) | generic `Transport` event via an outer audit middleware |
 
-The generic fallback records code `unclassified_rejection` with the response
-status in the detail; typed events record the error's stable code.
+Typed events record the error's stable code. Responses produced before the
+handler runs (wrong content type rejected by the multipart extractor, tower
+timeout 503 / body-limit 413 / panic 500 pages, hyper's own 431) are not
+audited: there is no fallback middleware.
 
 Two rules encode behavior that would otherwise erode:
 
@@ -90,14 +90,15 @@ Two rules encode behavior that would otherwise erode:
    *before* that conversion, so the row carries `UnknownKey("k9")` or
    `VerificationFailed` while callers still see
    `signature_verification_failed`. No key-enumeration oracle is reintroduced.
-2. **Exactly one event per rejection.** The recorder inserts a marker into
-   response extensions; the outer generic middleware records a fallback only
-   when no marker is present and the status is ≥ 400. Typed where possible,
-   generic otherwise, never twice.
+2. **Exactly one event per refusal.** Every failure in `post_package` is
+   returned as an `UploadFailure` carrying the audit facts and converted
+   once into a recorded response; `require_bearer` records inline. Handler
+   paths are therefore recorded exactly once by construction.
 
 `request_id` is read from the request's `x-request-id` header —
-`SetRequestIdLayer` already issues it before handlers run. `post_package` gains
-a `HeaderMap` extractor; middleware reads request headers directly.
+`SetRequestIdLayer` already issues it before handlers run. `post_package`
+takes a `HeaderMap` extractor and `require_bearer` reads request headers
+directly.
 
 ### 3.4 Sinks and failure isolation
 

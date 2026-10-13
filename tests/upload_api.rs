@@ -22,6 +22,7 @@ use bytes::Bytes;
 use conductor::api::routes::router;
 use conductor::api::uploads::{ApiToken, AppState};
 use conductor::audit::recorder::RejectionRecorder;
+use conductor::audit::store::RejectionStore;
 use conductor::control_plane::validate_package::PackageValidationBuilder;
 use conductor::modules::registry::ModuleRegistry;
 use conductor::packages::artifact::ArtifactDigest;
@@ -67,12 +68,17 @@ fn test_state(policy: PackageValidationPolicy, tag: &str) -> AppState {
     ));
     std::fs::create_dir_all(&quarantine_dir).expect("quarantine dir must be created");
     std::fs::create_dir_all(&artifact_dir).expect("artifact dir must be created");
+    // Durable rejection sink: a private in-memory store per test so rows
+    // can be asserted without sharing state. Recorder failures stay
+    // invisible to the response path by contract.
+    let rejection_store =
+        Arc::new(RejectionStore::open_in_memory().expect("rejection store must open"));
     AppState {
         validator: Arc::new(validator),
         quarantine_dir,
         artifact_dir,
         registry: Arc::new(ModuleRegistry::new()),
-        recorder: Arc::new(RejectionRecorder::new()),
+        recorder: Arc::new(RejectionRecorder::with_store(rejection_store)),
         request_timeout: Duration::from_secs(10),
         api_token: ApiToken::new("test-bearer-upload"),
         upload_slots: Arc::new(Semaphore::new(8)),
@@ -719,4 +725,64 @@ async fn malformed_multipart_body_records_one_typed_event() {
     assert!(events.contains("stage=\"multipart\""), "{events}");
     assert!(events.contains("code=\"invalid_multipart\""), "{events}");
     cleanup(&state.quarantine_dir);
+}
+
+fn rejection_rows(state: &AppState) -> Vec<conductor::audit::store::StoredRejection> {
+    state
+        .recorder
+        .store()
+        .expect("test state must attach a rejection store")
+        .list()
+        .expect("rejection rows must read")
+}
+
+#[tokio::test]
+async fn version_conflict_persists_one_row_with_stage_code_and_attribution() {
+    let state = test_state(PackageValidationPolicy::production(), "rejection-row");
+    let package = golden_package_bytes();
+    let (first, _, _) = post_multipart(state.clone(), golden_body(&package)).await;
+    assert_eq!(first, StatusCode::CREATED);
+    // Same module_id+version, different payload: the version already means
+    // different bytes, so the upload is a 409 with an unchanged body.
+    let other = package_bytes_with_payload(b"different executable");
+    let (conflict, json, _) = post_multipart(state.clone(), golden_body(&other)).await;
+    assert_eq!(conflict, StatusCode::CONFLICT);
+    assert_eq!(json["code"], "version_conflict");
+    let rows = rejection_rows(&state);
+    assert_eq!(rows.len(), 1, "one rejection must persist exactly one row");
+    let row = &rows[0];
+    assert_eq!(row.stage, "registration");
+    assert_eq!(row.code, "version_conflict");
+    assert_eq!(row.module_id.as_deref(), Some("reporting-service"));
+    assert_eq!(row.version.as_deref(), Some("1.2.0"));
+    assert_eq!(row.key_id.as_deref(), Some("k1"));
+    assert_eq!(
+        row.digest.as_deref().map(str::len),
+        Some(64),
+        "digest attribution must survive once the digest stage was reached"
+    );
+    assert!(
+        row.byte_count.is_some(),
+        "streamed byte count must be attributed"
+    );
+    assert!(
+        !row.detail.is_empty(),
+        "the internal reason must be persisted"
+    );
+    cleanup(&state.quarantine_dir);
+    cleanup(&state.artifact_dir);
+}
+
+#[tokio::test]
+async fn accepted_upload_persists_no_rejection_row() {
+    let state = test_state(PackageValidationPolicy::production(), "accepted-no-row");
+    let package = golden_package_bytes();
+    let (status, _, _) = post_multipart(state.clone(), golden_body(&package)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(
+        rejection_rows(&state).is_empty(),
+        "an accepted upload must leave the rejection table empty"
+    );
+    cleanup(&state.quarantine_dir);
+    cleanup(&state.artifact_dir);
 }

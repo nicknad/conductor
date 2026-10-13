@@ -173,6 +173,7 @@ fn validation_stage(err: &ValidationError) -> RejectionStage {
 /// `detail` defaults to the caller message when no more specific internal
 /// reason exists (validation sites pass `err.to_string()` instead, so the
 /// event keeps e.g. the unknown key id while the body stays generic).
+#[allow(clippy::too_many_arguments)]
 fn reject(
     recorder: &RejectionRecorder,
     request_id: Option<String>,
@@ -180,6 +181,9 @@ fn reject(
     api: ApiError,
     detail: Option<String>,
     key_id: Option<&str>,
+    module_id: Option<String>,
+    version: Option<String>,
+    digest: Option<String>,
     byte_count: Option<u64>,
 ) -> Response {
     let code = api.code();
@@ -188,6 +192,9 @@ fn reject(
         &RejectionEvent::new(stage, code, detail)
             .with_request_id(request_id)
             .with_key_id(key_id.map(str::to_owned))
+            .with_module_id(module_id)
+            .with_version(version)
+            .with_digest(digest)
             .with_byte_count(byte_count),
     );
     api.into_response()
@@ -201,6 +208,9 @@ struct UploadFailure {
     stage: RejectionStage,
     detail: String,
     key_id: Option<String>,
+    module_id: Option<String>,
+    version: Option<String>,
+    digest: Option<String>,
     byte_count: Option<u64>,
 }
 
@@ -212,6 +222,9 @@ impl UploadFailure {
             stage,
             detail,
             key_id: None,
+            module_id: None,
+            version: None,
+            digest: None,
             byte_count: None,
         })
     }
@@ -224,6 +237,9 @@ impl UploadFailure {
             self.api,
             Some(self.detail),
             self.key_id.as_deref(),
+            self.module_id,
+            self.version,
+            self.digest,
             self.byte_count,
         )
     }
@@ -257,6 +273,9 @@ pub async fn require_bearer(
                 id,
                 RejectionStage::Transport,
                 api,
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -559,6 +578,9 @@ async fn process_upload(
                         stage,
                         detail,
                         key_id: Some(audit_key.clone()),
+                        module_id: None,
+                        version: None,
+                        digest: None,
                         byte_count: bytes,
                     })
                 })?;
@@ -578,11 +600,15 @@ async fn process_upload(
                     }
                 };
                 let detail = api.message().to_owned();
+                let artifact = verdict.artifact();
                 Box::new(UploadFailure {
                     api,
                     stage: RejectionStage::Promotion,
                     detail,
                     key_id: Some(audit_key.clone()),
+                    module_id: Some(artifact.module_id().to_owned()),
+                    version: Some(artifact.version().to_owned()),
+                    digest: Some(artifact.digest().to_hex()),
                     byte_count: bytes,
                 })
             })?;
@@ -613,11 +639,17 @@ async fn process_upload(
                         ),
                     };
                     let detail = api.message().to_owned();
+                    // The verdict validated, so its identity is trustworthy
+                    // audit attribution even though registration refused it.
+                    let artifact = verdict.artifact();
                     Err(Box::new(UploadFailure {
                         api,
                         stage,
                         detail,
                         key_id: Some(audit_key.clone()),
+                        module_id: Some(artifact.module_id().to_owned()),
+                        version: Some(artifact.version().to_owned()),
+                        digest: Some(artifact.digest().to_hex()),
                         byte_count: bytes,
                     }))
                 }
@@ -634,6 +666,9 @@ async fn process_upload(
             stage: RejectionStage::Transport,
             detail,
             key_id: Some(audit_key_id_outer.clone()),
+            module_id: None,
+            version: None,
+            digest: None,
             byte_count: audit_bytes,
         })
     })?
@@ -645,6 +680,9 @@ async fn process_upload(
             stage: RejectionStage::Internal,
             detail,
             key_id: Some(audit_key_id_outer.clone()),
+            module_id: None,
+            version: None,
+            digest: None,
             byte_count: audit_bytes,
         })
     })?;
