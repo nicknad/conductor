@@ -42,6 +42,9 @@ pub enum ApiError {
     },
     /// Well-formed but semantically invalid package.
     Unprocessable(&'static str, String),
+    /// The request conflicts with existing state (e.g. a module version
+    /// already registered with a different digest).
+    Conflict(&'static str, String),
     /// Body exceeds the policy byte bound while streaming.
     PayloadTooLarge(String),
     /// Request headers exceed the fixed count or byte caps.
@@ -79,6 +82,13 @@ impl ApiError {
             ),
             Self::Unprocessable(code, message) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
+                ErrorBody {
+                    code,
+                    message: message.clone(),
+                },
+            ),
+            Self::Conflict(code, message) => (
+                StatusCode::CONFLICT,
                 ErrorBody {
                     code,
                     message: message.clone(),
@@ -236,5 +246,10 @@ mod tests {
         let (status, body) = err.status_and_body();
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body.code, "inventory_mismatch");
+
+        let (status, body) =
+            ApiError::Conflict("version_conflict", "taken".to_owned()).status_and_body();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.code, "version_conflict");
     }
 }

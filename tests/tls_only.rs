@@ -82,6 +82,7 @@ fn minimal_state(tag: &str) -> (AppState, PathBuf, PathBuf) {
             validator: Arc::new(validator),
             quarantine_dir: quarantine_dir.clone(),
             artifact_dir: artifact_dir.clone(),
+            registry: Arc::new(conductor::modules::registry::ModuleRegistry::new()),
             request_timeout: Duration::from_secs(10),
             api_token: ApiToken::new("test-bearer-upload"),
             upload_slots: Arc::new(Semaphore::new(8)),

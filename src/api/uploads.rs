@@ -24,12 +24,15 @@
 //! slot per upload (excess uploads get `503` instead of queueing
 //! unbounded disk and CPU work).
 //!
-//! On success the quarantine file is promoted to the artifact store and
-//! the handler returns `201` with the module identity, hex digest, and
-//! authorizing signer. On validation or promotion failure the quarantine
-//! file is removed so hostile bytes cannot accumulate. Validation and
-//! promotion run on a blocking thread (synchronous file I/O) under the
-//! configured request timeout.
+//! On success the quarantine file is promoted to the artifact store, the
+//! validated identity is registered in the module registry (idempotent for
+//! the same digest; a version re-registered with different bytes is a
+//! `409`), and the handler returns `201` with the module identity, hex
+//! digest, and authorizing signer. On validation or promotion failure the
+//! quarantine file is removed so hostile bytes cannot accumulate.
+//! Validation, promotion, and registration run on a blocking thread
+//! (synchronous file I/O and in-memory state) under the configured request
+//! timeout.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,6 +51,7 @@ use tokio::sync::Semaphore;
 use crate::api::errors::ApiError;
 use crate::application::upload_package::run_upload_workflow;
 use crate::application::validate_package::PackageValidator;
+use crate::modules::registry::ModuleRegistry;
 use crate::packages::signature::{PackageSignature, SUPPORTED_SIGNATURE_FORMAT_VERSION};
 
 /// Caps for small text fields. The signature itself is 64 bytes (88 base64
@@ -106,6 +110,9 @@ pub struct AppState {
     pub validator: Arc<PackageValidator>,
     pub quarantine_dir: PathBuf,
     pub artifact_dir: PathBuf,
+    /// Module registry: versions already accepted. A version re-registered
+    /// with different bytes is a conflict, never an overwrite.
+    pub registry: Arc<ModuleRegistry>,
     pub request_timeout: Duration,
     pub api_token: ApiToken,
     /// Concurrency slots: one permit per in-flight upload.
@@ -351,19 +358,19 @@ pub async fn post_package(
     };
 
     let validator = Arc::clone(&state.validator);
+    let registry = Arc::clone(&state.registry);
     let timeout = state.request_timeout;
     let blocking_path = path.clone();
     let artifact_dir = state.artifact_dir.clone();
     let outcome = tokio::time::timeout(
         timeout,
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
             let verdict = run_upload_workflow(&validator, &blocking_path, &envelope)?;
             crate::storage::artifact_store::promote_quarantined(
                 &artifact_dir,
                 &blocking_path,
                 &verdict,
             )
-            .map(|_| verdict)
             .map_err(|e| match e {
                 crate::storage::artifact_store::PromoteError::DigestMismatch => {
                     crate::storage::quarantine::discard(&blocking_path);
@@ -373,7 +380,15 @@ pub async fn post_package(
                     crate::storage::quarantine::discard(&blocking_path);
                     ApiError::Internal(format!("artifact promotion failed: {message}"))
                 }
-            })
+            })?;
+            // Post-promotion binding: the digest is now durable, so the
+            // registry learns which bytes this module version means. A
+            // version conflict leaves the promoted blob unreferenced
+            // (immutable, never the source of truth) and rejects the
+            // upload; an identical re-upload is idempotent.
+            crate::application::register_package::register(&registry, &verdict)
+                .map(|_| verdict)
+                .map_err(|e| ApiError::Conflict("version_conflict", e.to_string()))
         }),
     )
     .await

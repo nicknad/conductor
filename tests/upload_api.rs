@@ -23,6 +23,8 @@ use bytes::Bytes;
 use conductor::api::routes::router;
 use conductor::api::uploads::{ApiToken, AppState};
 use conductor::application::validate_package::PackageValidationBuilder;
+use conductor::modules::registry::ModuleRegistry;
+use conductor::packages::artifact::ArtifactDigest;
 use conductor::packages::digest::Sha256DigestProvider;
 use conductor::packages::policy::PackageValidationPolicy;
 use conductor::packages::signature::{
@@ -69,6 +71,7 @@ fn test_state(policy: PackageValidationPolicy, tag: &str) -> AppState {
         validator: Arc::new(validator),
         quarantine_dir,
         artifact_dir,
+        registry: Arc::new(ModuleRegistry::new()),
         request_timeout: Duration::from_secs(10),
         api_token: ApiToken::new("test-bearer-upload"),
         upload_slots: Arc::new(Semaphore::new(8)),
@@ -78,6 +81,12 @@ fn test_state(policy: PackageValidationPolicy, tag: &str) -> AppState {
 }
 
 fn golden_package_bytes() -> Vec<u8> {
+    package_bytes_with_payload(b"not a real executable")
+}
+
+/// Golden identity (`reporting-service` `1.2.0`) with a caller-chosen
+/// payload, for conflict cases that must differ only in bytes.
+fn package_bytes_with_payload(payload: &[u8]) -> Vec<u8> {
     let manifest = serde_json::json!({
         "manifest_version": 1,
         "module_id": "reporting-service",
@@ -100,7 +109,7 @@ fn golden_package_bytes() -> Vec<u8> {
         .start_file("payload/reporting-service", options)
         .expect("zip writer must accept payload");
     writer
-        .write_all(b"not a real executable")
+        .write_all(payload)
         .expect("zip writer must accept payload bytes");
     writer.finish().expect("zip must finalize");
     cursor.into_inner()
@@ -292,6 +301,29 @@ async fn identical_reupload_is_idempotent_over_one_artifact() {
         .filter_map(|e| e.ok())
         .collect();
     assert_eq!(artifacts.len(), 1);
+    cleanup(&state.quarantine_dir);
+    cleanup(&state.artifact_dir);
+}
+
+#[tokio::test]
+async fn same_version_different_bytes_conflicts_with_409() {
+    let state = test_state(PackageValidationPolicy::production(), "version-conflict");
+    let package = golden_package_bytes();
+    let (first, _, _) = post_multipart(state.clone(), golden_body(&package)).await;
+    assert_eq!(first, StatusCode::CREATED);
+    // Same module_id+version, different payload: valid signature, valid
+    // package, but the version already means different bytes.
+    let other = package_bytes_with_payload(b"different executable");
+    let (conflict, json, _) = post_multipart(state.clone(), golden_body(&other)).await;
+    assert_eq!(conflict, StatusCode::CONFLICT);
+    assert_eq!(json["code"], "version_conflict");
+    // The registered version still means the first bytes.
+    let registered = state
+        .registry
+        .get("reporting-service", "1.2.0")
+        .expect("version must stay registered");
+    let expected: [u8; 32] = Sha256DigestProvider.digest(&package).expect("hash");
+    assert_eq!(registered.digest, ArtifactDigest::new(expected));
     cleanup(&state.quarantine_dir);
     cleanup(&state.artifact_dir);
 }
