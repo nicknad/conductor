@@ -61,10 +61,12 @@ struct RawManifest {
 
 impl Manifest {
     /// Parses bounded input, gates the schema version against the policy
-    /// allowlist, and checks required-field shape. Path confinement is
-    /// *not* checked here — declared paths are attacker-adjacent until the
-    /// package signature verifies, and inventory runs them through the
-    /// archive path policy.
+    /// allowlist, and checks required-field shape. `module_id` and
+    /// `version` are additionally constrained to path-safe identity
+    /// components because downstream artifact-store paths are built from
+    /// them. Path confinement of *declared files* is not checked here —
+    /// declared paths are attacker-adjacent until the package signature
+    /// verifies, and inventory runs them through the archive path policy.
     pub fn parse_bounded(
         bytes: &[u8],
         max_bytes: u64,
@@ -91,6 +93,19 @@ impl Manifest {
                 return Err(ManifestError::Invalid(format!("{name} must not be empty")));
             }
         }
+        // module_id and version become path components in the artifact store
+        // (`artifacts/{module_id}/{version}/…`) and registry keys, so their
+        // shape is a security boundary, not cosmetics.
+        for (name, value) in [
+            ("module_id", raw.module_id.as_str()),
+            ("version", raw.version.as_str()),
+        ] {
+            if !is_safe_identity(value) {
+                return Err(ManifestError::Invalid(format!(
+                    "{name} must be a path-safe identity component"
+                )));
+            }
+        }
         if raw.files.is_empty() {
             return Err(ManifestError::Invalid(
                 "manifest must declare at least one file".to_owned(),
@@ -115,6 +130,26 @@ impl Manifest {
     pub fn declared_files(&self) -> Vec<DeclaredFile> {
         self.files.iter().map(DeclaredFile::new).collect()
     }
+}
+
+/// Maximum accepted byte length of a path-forming identity field
+/// (`module_id`, `version`).
+const MAX_IDENTITY_BYTES: usize = 64;
+
+/// Identity fields become path components in the artifact store
+/// (`artifacts/{module_id}/{version}/…`) and registry keys. They must be
+/// single portable path components: non-empty, bounded, no leading or
+/// trailing dots, and only `[A-Za-z0-9._+-]` — so `reporting-service`,
+/// `example.module_2`, and semver `1.2.3+build.7` all pass while
+/// traversal, separators, control characters, and over-long values fail.
+fn is_safe_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_IDENTITY_BYTES
+        && !value.starts_with('.')
+        && !value.ends_with('.')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'))
 }
 
 #[derive(Debug, Error)]
@@ -202,6 +237,57 @@ mod tests {
             Manifest::parse_bounded(extra, 1 << 20, &[1]),
             Err(ManifestError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn path_unsafe_identity_fields_rejected() {
+        let doc = |module_id: &str, version: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "manifest_version": 1,
+                "module_id": module_id,
+                "version": version,
+                "runtime": "rust",
+                "entrypoint": "payload/x",
+                "files": ["payload/x"],
+            }))
+            .expect("manifest json must serialize")
+        };
+
+        for bad in [
+            "../evil", "a/b", "a\\b", "..", ".", ".hidden", "a b", "a\u{0}b",
+        ] {
+            let bytes = doc(bad, "1.2.0");
+            assert!(
+                matches!(
+                    Manifest::parse_bounded(&bytes, 1 << 20, &[1]),
+                    Err(ManifestError::Invalid(message)) if message.contains("module_id")
+                ),
+                "module_id {bad:?} must be rejected"
+            );
+            let bytes = doc("module", bad);
+            assert!(
+                matches!(
+                    Manifest::parse_bounded(&bytes, 1 << 20, &[1]),
+                    Err(ManifestError::Invalid(message)) if message.contains("version")
+                ),
+                "version {bad:?} must be rejected"
+            );
+        }
+
+        let too_long = "a".repeat(65);
+        assert!(
+            Manifest::parse_bounded(&doc(&too_long, "1.2.0"), 1 << 20, &[1]).is_err(),
+            "over-long module_id must be rejected"
+        );
+
+        for (module_id, version) in [
+            ("reporting-service", "1.2.0"),
+            ("example.module_2", "1.2.3+build.7"),
+            ("a", "0"),
+        ] {
+            Manifest::parse_bounded(&doc(module_id, version), 1 << 20, &[1])
+                .expect("legitimate identity must parse");
+        }
     }
 
     #[test]
