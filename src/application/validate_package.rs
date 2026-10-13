@@ -18,10 +18,13 @@
 //!
 //! Authentication precedes parsing: nothing inside the archive is trusted
 //! before the outer bytes verify. Hashing, inspection, and the manifest
-//! read share one open [`File`](std::fs::File) handle — never hash one file
-//! and reopen an attacker-controlled path for inspection (TOCTOU). Per-file
-//! byte agreement during staged extraction lands with `storage::staging`;
-//! until then the outer digest plus inventory set-equality bind the bytes.
+//! read share one open [`QuarantinedFile`](crate::packages::archive::QuarantinedFile)
+//! handle — never hash one file and reopen an attacker-controlled path for
+//! inspection (TOCTOU). Validation binds the outer bytes; per-file byte
+//! agreement for manifest v2 packages is enforced at staged extraction
+//! ([`extract_verified`](crate::storage::staging::extract_verified)),
+//! where each decompressed stream is hashed while written. v1 packages
+//! retain inventory set-equality.
 //!
 //! The verdict carries everything registry, audit, and activation consume:
 //! no downstream stage re-opens or re-parses the archive to recover the
@@ -196,11 +199,7 @@ pub struct ValidatedPackage {
 impl ValidatedPackage {
     /// Mints the promotion verdict. Private to this module so only
     /// [`PackageValidator::validate`] can construct it.
-    fn new(
-        artifact: ValidatedArtifact,
-        manifest: Manifest,
-        signer: TrustedSigningKey,
-    ) -> Self {
+    fn new(artifact: ValidatedArtifact, manifest: Manifest, signer: TrustedSigningKey) -> Self {
         Self {
             artifact,
             manifest,
@@ -349,15 +348,12 @@ mod tests {
             signature: vec![0u8; 64],
         };
         // Policy gate runs before any handle use; contents do not matter.
-        let dir = std::env::temp_dir().join(format!(
-            "conductor-validate-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("conductor-validate-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir must be created");
         let path = dir.join("empty.zip");
         std::fs::write(&path, b"").expect("temp file must be writable");
-        let mut quarantined =
-            QuarantinedFile::open(&path).expect("temp quarantine must open");
+        let mut quarantined = QuarantinedFile::open(&path).expect("temp quarantine must open");
         let err = validator.validate(&mut quarantined, &envelope).unwrap_err();
         let _ = std::fs::remove_file(&path);
         assert!(matches!(err, ValidationError::Policy(_)));

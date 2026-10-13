@@ -7,8 +7,9 @@
 //! bounded by hard implementation maxima. Path-traversal, duplicate-path,
 //! and symlink rejection are fixed invariants — never operator options.
 
-use std::fs::File;
-use std::io::{Read, Seek};
+use sha2::{Digest as _, Sha256};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, Write as _};
 use std::path::Path;
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
@@ -97,6 +98,38 @@ pub struct ScanConfig<'a> {
     pub max_nesting_depth: usize,
 }
 
+/// Declared byte-level identity for one extraction target: the actual
+/// decompressed stream must match both. Mirrors the manifest's v2 integrity
+/// declaration without creating a module cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeclaredIntegrity {
+    pub size: u64,
+    pub sha256: [u8; 32],
+}
+
+/// One file the caller requires to be extracted. `integrity` is `None`
+/// for legacy (v1) declarations, which fall back to path-only agreement.
+#[derive(Debug, Clone)]
+pub struct ExtractionTarget {
+    pub path: String,
+    pub integrity: Option<DeclaredIntegrity>,
+}
+
+/// One extracted file with its actual byte size and SHA-256.
+#[derive(Debug, Clone)]
+pub struct ExtractedFile {
+    pub path: String,
+    pub size: u64,
+    pub sha256: [u8; 32],
+}
+
+/// Outcome of one extraction run: every declared target, in archive order,
+/// with the actual bytes' size and digest.
+#[derive(Debug, Clone)]
+pub struct ExtractedFiles {
+    pub files: Vec<ExtractedFile>,
+}
+
 #[derive(Debug, Error)]
 pub enum ArchiveError {
     #[error("archive limit exceeded: {0}")]
@@ -109,6 +142,18 @@ pub enum ArchiveError {
     UnsupportedCompression(String),
     #[error("archive I/O failure: {0}")]
     Io(String),
+    #[error("undeclared archive entry: {0}")]
+    UndeclaredEntry(String),
+    #[error("declared entry missing from archive: {0}")]
+    MissingEntry(String),
+    #[error("declared size mismatch for {path}: declared {declared}, wrote {actual}")]
+    SizeMismatch {
+        path: String,
+        declared: u64,
+        actual: u64,
+    },
+    #[error("declared digest mismatch for {path}")]
+    DigestMismatch { path: String },
 }
 
 /// Unix file-type bits (`S_IFMT`) and the types a package may contain:
@@ -119,6 +164,27 @@ const UNIX_FILE_TYPE_MASK: u32 = 0o170_000;
 const UNIX_SYMLINK_TYPE: u32 = 0o120_000;
 const UNIX_REGULAR_TYPE: u32 = 0o100_000;
 const UNIX_DIRECTORY_TYPE: u32 = 0o040_000;
+
+/// Classification of an entry's Unix file-type bits (`S_IFMT`). `Regular`
+/// covers type-less modes, regular files, and directories; `Forbidden`
+/// covers FIFOs, devices, and sockets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryFileType {
+    Regular,
+    Symlink,
+    Forbidden,
+}
+
+/// Classifies central-directory mode bits. Shared by inspection and
+/// extraction so both consult file types the same way.
+#[must_use]
+pub fn entry_file_type(mode: Option<u32>) -> EntryFileType {
+    match mode.map_or(0, |mode| mode & UNIX_FILE_TYPE_MASK) {
+        UNIX_SYMLINK_TYPE => EntryFileType::Symlink,
+        0 | UNIX_REGULAR_TYPE | UNIX_DIRECTORY_TYPE => EntryFileType::Regular,
+        _ => EntryFileType::Forbidden,
+    }
+}
 
 /// End-of-central-directory magic (`PK\x05\x06`), ZIP64 locator magic
 /// (`PK\x06\x07`), and ZIP64 end magic (`PK\x06\x06`).
@@ -312,8 +378,8 @@ impl ZipArchiveReader {
         name: &str,
         max_bytes: u64,
     ) -> Result<Vec<u8>, ArchiveError> {
-        let mut zip = zip::ZipArchive::new(file)
-            .map_err(|e| ArchiveError::InvalidArchive(e.to_string()))?;
+        let mut zip =
+            zip::ZipArchive::new(file).map_err(|e| ArchiveError::InvalidArchive(e.to_string()))?;
         let entry = zip
             .by_name(name)
             .map_err(|_| ArchiveError::InvalidArchive(format!("{name} not found in archive")))?;
@@ -334,6 +400,160 @@ impl ZipArchiveReader {
             return Err(ArchiveError::LimitExceeded("file exceeds read bound"));
         }
         Ok(buf)
+    }
+
+    /// Bounded extraction of every non-directory entry into `dest_root`,
+    /// directed by `declared` targets, hashing each stream exactly once —
+    /// the same bytes feed the hasher and the file writer, so what was
+    /// verified is what was written.
+    ///
+    /// Mechanics only: the caller owns the destination directory (creation,
+    /// permissions, cleanup) and has already validated the package
+    /// signature on this same handle. Every archive entry must be declared
+    /// (`UndeclaredEntry` otherwise); every declared target must appear
+    /// (`MissingEntry` otherwise). Declared paths pass the same confinement
+    /// policy as entries before any filesystem contact. Targets carrying
+    /// [`DeclaredIntegrity`] are enforced against the actual decompressed
+    /// stream. On `Err`, `dest_root` may contain partial files; the caller
+    /// removes it.
+    ///
+    /// Takes `&mut QuarantinedFile` for the same reason as
+    /// [`inspect_file`](Self::inspect_file): extraction can only run over
+    /// the handle that was hashed and authenticated.
+    pub fn extract_to(
+        &self,
+        file: &mut QuarantinedFile,
+        dest_root: &Path,
+        declared: &[ExtractionTarget],
+        config: &ScanConfig<'_>,
+    ) -> Result<ExtractedFiles, ArchiveError> {
+        use std::collections::HashMap;
+
+        config.limits.validate()?;
+        // Normalize declared paths through the same confinement policy as
+        // archive entries; a target that cannot produce a confined path
+        // condemns the extraction before any filesystem contact. Duplicate
+        // targets would make "every target written" ambiguous.
+        let mut wanted: HashMap<String, Option<DeclaredIntegrity>> = HashMap::new();
+        for target in declared {
+            let normalized = check_entry_path(&target.path, false)?;
+            if wanted.insert(normalized, target.integrity).is_some() {
+                return Err(ArchiveError::PathRejected("duplicate extraction targets"));
+            }
+        }
+        let mut zip =
+            zip::ZipArchive::new(file).map_err(|e| ArchiveError::InvalidArchive(e.to_string()))?;
+        let entry_count = zip.len();
+        if entry_count > config.limits.max_entries {
+            return Err(ArchiveError::LimitExceeded(
+                "archive entry count exceeds bound",
+            ));
+        }
+        let mut total_written: u64 = 0;
+        let mut extracted = Vec::new();
+        for index in 0..entry_count {
+            let mut entry = zip
+                .by_index(index)
+                .map_err(|e| ArchiveError::InvalidArchive(e.to_string()))?;
+            if entry.encrypted() {
+                return Err(ArchiveError::InvalidArchive(
+                    "encrypted entries are not accepted".to_owned(),
+                ));
+            }
+            let method = match entry.compression() {
+                zip::CompressionMethod::Stored => CompressionMethod::Stored,
+                zip::CompressionMethod::Deflated => CompressionMethod::Deflate,
+                other => {
+                    return Err(ArchiveError::UnsupportedCompression(format!("{other:?}")));
+                }
+            };
+            if !config.allowed_methods.contains(&method) {
+                return Err(ArchiveError::UnsupportedCompression(format!("{method:?}")));
+            }
+            let file_type = entry_file_type(entry.unix_mode());
+            if file_type == EntryFileType::Forbidden {
+                return Err(ArchiveError::PathRejected(
+                    "non-regular entries are never extracted",
+                ));
+            }
+            let normalized = check_entry_path(entry.name(), file_type == EntryFileType::Symlink)?;
+            if entry.is_dir() {
+                // Directories carry no payload; they are recreated from
+                // file parents below.
+                continue;
+            }
+            if normalized.split('/').count() > config.max_nesting_depth {
+                return Err(ArchiveError::LimitExceeded(
+                    "entry nesting depth exceeds bound",
+                ));
+            }
+            let Some(integrity) = wanted.remove(&normalized) else {
+                return Err(ArchiveError::UndeclaredEntry(normalized));
+            };
+            // `normalized` is confined by construction: no absolute paths,
+            // dot segments, separators, or colons — joining it under
+            // `dest_root` cannot escape.
+            let dest = dest_root.join(&normalized);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| ArchiveError::Io(e.to_string()))?;
+            }
+            let mut out = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&dest)
+                .map_err(|e| ArchiveError::Io(e.to_string()))?;
+            let mut hasher = Sha256::new();
+            let mut wrote: u64 = 0;
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = entry
+                    .read(&mut buf)
+                    .map_err(|e| ArchiveError::Io(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                wrote += n as u64;
+                // Authoritative counts over actual decompressed output; the
+                // central-directory sizes were only hints at inspection.
+                if wrote > config.limits.max_entry_bytes {
+                    return Err(ArchiveError::LimitExceeded(
+                        "entry exceeds per-entry bound during extraction",
+                    ));
+                }
+                total_written += n as u64;
+                if total_written > config.limits.max_uncompressed_bytes {
+                    return Err(ArchiveError::LimitExceeded(
+                        "archive exceeds uncompressed bound during extraction",
+                    ));
+                }
+                hasher.update(&buf[..n]);
+                out.write_all(&buf[..n])
+                    .map_err(|e| ArchiveError::Io(e.to_string()))?;
+            }
+            out.flush().map_err(|e| ArchiveError::Io(e.to_string()))?;
+            let digest: [u8; 32] = hasher.finalize().into();
+            if let Some(declared) = integrity {
+                if declared.size != wrote {
+                    return Err(ArchiveError::SizeMismatch {
+                        path: normalized,
+                        declared: declared.size,
+                        actual: wrote,
+                    });
+                }
+                if declared.sha256 != digest {
+                    return Err(ArchiveError::DigestMismatch { path: normalized });
+                }
+            }
+            extracted.push(ExtractedFile {
+                path: normalized,
+                size: wrote,
+                sha256: digest,
+            });
+        }
+        if let Some((missing, _)) = wanted.into_iter().next() {
+            return Err(ArchiveError::MissingEntry(missing));
+        }
+        Ok(ExtractedFiles { files: extracted })
     }
 
     /// Entry-by-entry enforcement over an open archive. Central-directory
@@ -372,20 +592,13 @@ impl ZipArchiveReader {
             if !config.allowed_methods.contains(&method) {
                 return Err(ArchiveError::UnsupportedCompression(format!("{method:?}")));
             }
-            let file_type = entry
-                .unix_mode()
-                .map_or(0, |mode| mode & UNIX_FILE_TYPE_MASK);
-            let is_symlink = file_type == UNIX_SYMLINK_TYPE;
-            if !is_symlink
-                && file_type != 0
-                && file_type != UNIX_REGULAR_TYPE
-                && file_type != UNIX_DIRECTORY_TYPE
-            {
+            let file_type = entry_file_type(entry.unix_mode());
+            if file_type == EntryFileType::Forbidden {
                 return Err(ArchiveError::PathRejected(
                     "non-regular entries are never extracted",
                 ));
             }
-            let normalized = check_entry_path(entry.name(), is_symlink)?;
+            let normalized = check_entry_path(entry.name(), file_type == EntryFileType::Symlink)?;
             if entry.is_dir() {
                 continue;
             }
@@ -544,7 +757,6 @@ pub fn check_no_duplicate_paths(paths: &[impl AsRef<str>]) -> Result<(), Archive
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     fn sane_limits() -> ArchiveLimits {
         ArchiveLimits {

@@ -30,8 +30,7 @@ pub fn run_upload_workflow(
     archive_path: &Path,
     signature: &PackageSignature,
 ) -> Result<ValidatedPackage, ValidationError> {
-    let mut quarantined =
-        QuarantinedFile::open(archive_path).map_err(ValidationError::Archive)?;
+    let mut quarantined = QuarantinedFile::open(archive_path).map_err(ValidationError::Archive)?;
     let verdict = validator.validate(&mut quarantined, signature)?;
     tracing::info!(
         module_id = verdict.artifact().module_id(),

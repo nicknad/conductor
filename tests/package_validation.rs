@@ -75,8 +75,7 @@ fn unsigned_config_rejected_before_archive_stage() {
     // Policy gate runs before any handle use; write a dummy file so the
     // handle opens, then expect the policy rejection.
     let package = TempPackage::write(b"dummy", "unsigned");
-    let mut quarantined =
-        QuarantinedFile::open(package.path()).expect("temp quarantine must open");
+    let mut quarantined = QuarantinedFile::open(package.path()).expect("temp quarantine must open");
     assert!(matches!(
         validator.validate(&mut quarantined, &dummy_envelope()),
         Err(ValidationError::Policy(_))
@@ -179,10 +178,7 @@ fn validate_path(
     validator: &PackageValidator,
     path: &Path,
     envelope: &PackageSignature,
-) -> Result<
-    conductor::application::validate_package::ValidatedPackage,
-    ValidationError,
-> {
+) -> Result<conductor::application::validate_package::ValidatedPackage, ValidationError> {
     let mut quarantined = QuarantinedFile::open(path).expect("temp quarantine must open");
     validator.validate(&mut quarantined, envelope)
 }
@@ -417,4 +413,45 @@ fn disallowed_manifest_version_is_rejected() {
         validate_path(&validator, package.path(), &envelope),
         Err(ValidationError::Manifest(_))
     ));
+}
+
+#[test]
+fn v2_manifest_carries_integrity_through_validation() {
+    let payload = b"not a real executable";
+    let sha256_hex: String = Sha256DigestProvider
+        .digest(payload)
+        .expect("hashing must succeed")
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let manifest = serde_json::json!({
+        "manifest_version": 2,
+        "module_id": "reporting-service",
+        "version": "1.2.0",
+        "runtime": "rust",
+        "entrypoint": "payload/reporting-service",
+        "files": [{
+            "path": "payload/reporting-service",
+            "size": payload.len(),
+            "sha256": sha256_hex,
+        }],
+    });
+    let bytes = package_bytes(
+        &serde_json::to_vec(&manifest).expect("manifest must serialize"),
+        &[("payload/reporting-service", payload.as_slice())],
+    );
+    let (validator, signing) = real_key_validator(PackageValidationPolicy::production());
+    let (envelope, _) = sign_package(&signing, &bytes);
+    let package = TempPackage::write(&bytes, "v2-integrity");
+    let verdict = validate_path(&validator, package.path(), &envelope)
+        .expect("v2 package must validate under production policy");
+    assert_eq!(verdict.manifest().manifest_version, 2);
+    let file = &verdict.manifest().files[0];
+    assert_eq!(file.path, "payload/reporting-service");
+    let integrity = file.integrity.expect("v2 declares per-file integrity");
+    assert_eq!(integrity.size, payload.len() as u64);
+    assert_eq!(
+        integrity.sha256.to_vec(),
+        Sha256DigestProvider.digest(payload).expect("hash")
+    );
 }

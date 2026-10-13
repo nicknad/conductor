@@ -53,11 +53,7 @@ impl ValidatedArtifact {
     /// `ValidatedPackage::new` wrapper — no other module can promote it
     /// into a verdict. (Rust cannot express sibling-only visibility, so
     /// this relies on the package-private verdict constructor plus review.)
-    pub(crate) fn new(
-        digest: ArtifactDigest,
-        module_id: String,
-        version: String,
-    ) -> Self {
+    pub(crate) fn new(digest: ArtifactDigest, module_id: String, version: String) -> Self {
         Self {
             digest,
             module_id,

@@ -44,7 +44,9 @@ pub const HARD_MAX_NESTING_DEPTH: usize = 256;
 
 impl PackageValidationPolicy {
     /// Secure initial defaults. Signature is required; allowlists are
-    /// minimal (Ed25519, stored/deflate, manifest v1).
+    /// minimal (Ed25519, stored/deflate, manifest v1 and v2). Operators who
+    /// require per-file byte agreement (manifest v2 integrity) pin
+    /// `allowed_manifest_versions = vec![2]`.
     #[must_use]
     pub fn production() -> Self {
         Self {
@@ -59,7 +61,7 @@ impl PackageValidationPolicy {
                 CompressionMethod::Stored,
                 CompressionMethod::Deflate,
             ],
-            allowed_manifest_versions: vec![1],
+            allowed_manifest_versions: vec![1, 2],
             max_manifest_bytes: 1 << 20,
             max_compression_ratio: 100,
             max_nesting_depth: 32,

@@ -10,8 +10,8 @@ next (that is `application`).
 
 | File | Owns | Must not |
 |---|---|---|
-| `archive.rs` | Real `ZipArchiveReader`: entry-count bound enforced before the central directory is parsed, EOCD record-count cross-check (duplicate collapse), path/non-regular-file-type/symlink/compression/size/ratio/depth enforcement, bounded single-entry reads | Decide validation outcomes |
-| `manifest.rs` | Real schema-v1 parsing: byte bound, version gating, required-field shape, path-safe `module_id`/`version`, `entrypoint ∈ files`, `deny_unknown_fields` | Trust hashes without checking file bytes |
+| `archive.rs` | Real `ZipArchiveReader`: entry-count bound enforced before the central directory is parsed, EOCD record-count cross-check (duplicate collapse), path/non-regular-file-type/symlink/compression/size/ratio/depth enforcement, bounded single-entry reads, directed extraction (`extract_to`) with per-stream hashing and declared-integrity enforcement | Decide validation outcomes |
+| `manifest.rs` | Real schema-v1/v2 parsing: byte bound, version gating (shape selected by allowlisted version), required-field shape, v2 per-file `size` + lowercase-hex `sha256`, path-safe `module_id`/`version`, `entrypoint ∈ files`, `deny_unknown_fields` | Trust hashes without checking file bytes (enforcement is staged extraction) |
 | `signature.rs` | Real `Ed25519Verifier` + `ConfiguredTrustedKeys` (rejects empty/duplicate key ids at construction), closed `SignatureAlgorithm` enum, key-owned algorithm records, `PackageSignature` detached envelope, `canonical_payload` + `authenticate` | Load or execute plugin code |
 | `digest.rs` | Real SHA-256 `Sha256DigestProvider`, buffered and streaming | Decide activation policy |
 | `inventory.rs` | `DeclaredFile` set comparison vs. actual entries (`MissingFile` / `UnexpectedFile` / `DuplicateDeclaration`), declared paths through the archive confinement policy | Persist lifecycle state; check byte agreement (extraction stage) |
@@ -67,10 +67,12 @@ Two ordering rules are load-bearing:
 All error enums derive `Display` + `Error` via `thiserror`; messages are
 part of the observable contract. Every backend is real and fails closed on
 rejected input — there are no `NotImplemented` variants left in this
-module. Still future: staged extraction with per-file byte agreement
-(`storage::staging`). The authorizing signer is returned by
-`validate_with_signer` and recorded by the upload workflow as a `tracing`
-audit event; persistent audit records are still future.
+module. Staged extraction with per-file byte agreement is real:
+`storage::staging::extract_verified` re-hashes the source against the
+verdict and enforces manifest v2 integrity (`archive.rs::extract_to`).
+The authorizing signer travels in the `ValidatedPackage` verdict and is
+recorded by the upload workflow as a `tracing` audit event; persistent
+audit records are still future.
 
 ## Tests
 

@@ -15,10 +15,14 @@
 use std::path::{Path, PathBuf};
 
 use conductor::packages::archive::{
-    check_entry_path, check_no_duplicate_paths, ArchiveError, ArchiveLimits, InspectedArchive,
-    ScanConfig, ZipArchiveReader, MAX_ENTRY_PATH_LEN,
+    check_entry_path, check_no_duplicate_paths, ArchiveError, ArchiveLimits, DeclaredIntegrity,
+    ExtractionTarget, InspectedArchive, QuarantinedFile, ScanConfig, ZipArchiveReader,
+    MAX_ENTRY_PATH_LEN,
 };
+use conductor::packages::digest::Sha256DigestProvider;
 use conductor::packages::policy::PackageValidationPolicy;
+
+use std::io::Write as _;
 
 fn production_limits() -> ArchiveLimits {
     PackageValidationPolicy::production().archive
@@ -296,5 +300,253 @@ fn out_of_allowlist_compression_is_rejected() {
     assert!(matches!(
         inspect_fixture("odd-compression.zip"),
         Err(ArchiveError::InvalidArchive(_))
+    ));
+}
+
+// --- Extraction mechanics: directed, bounded, confined, per-stream hashed. ---
+
+/// Builds a Stored archive in memory for extraction tests.
+fn stored_zip(entries: &[(&str, &[u8])], deflated: bool) -> Vec<u8> {
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    let mut writer = zip::ZipWriter::new(&mut cursor);
+    let method = if deflated {
+        zip::CompressionMethod::Deflated
+    } else {
+        zip::CompressionMethod::Stored
+    };
+    let options = zip::write::SimpleFileOptions::default().compression_method(method);
+    for (name, data) in entries {
+        writer.start_file(*name, options).expect("zip must build");
+        writer.write_all(data).expect("zip must build");
+    }
+    writer.finish().expect("zip must finalize");
+    cursor.into_inner()
+}
+
+/// Temp extraction destination; removed on drop.
+struct TempDest(PathBuf);
+
+impl TempDest {
+    fn new(tag: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("conductor-extract-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("dest must be created");
+        Self(path)
+    }
+}
+
+impl Drop for TempDest {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256DigestProvider.digest(bytes).expect("hash")
+}
+
+fn target(path: &str, integrity: Option<DeclaredIntegrity>) -> ExtractionTarget {
+    ExtractionTarget {
+        path: path.to_owned(),
+        integrity,
+    }
+}
+
+#[test]
+fn extraction_writes_declared_files_with_actual_digests() {
+    let bytes = stored_zip(
+        &[("manifest.json", b"{}"), ("payload/ok.txt", b"data")],
+        false,
+    );
+    let archive = TempArchive::write(&bytes, "extract-ok");
+    let dest = TempDest::new("ok");
+    let mut handle = QuarantinedFile::open(archive.path()).expect("open");
+    let extracted = with_production(|config| {
+        ZipArchiveReader
+            .extract_to(
+                &mut handle,
+                &dest.0,
+                &[
+                    target("manifest.json", None),
+                    target(
+                        "payload/ok.txt",
+                        Some(DeclaredIntegrity {
+                            size: 4,
+                            sha256: sha256(b"data"),
+                        }),
+                    ),
+                ],
+                config,
+            )
+            .expect("declared extraction must succeed")
+    });
+    assert_eq!(
+        std::fs::read(dest.0.join("payload/ok.txt")).expect("payload must exist"),
+        b"data"
+    );
+    let payload = extracted
+        .files
+        .iter()
+        .find(|f| f.path == "payload/ok.txt")
+        .expect("payload recorded");
+    assert_eq!(payload.size, 4);
+    assert_eq!(payload.sha256, sha256(b"data"));
+}
+
+#[test]
+fn extraction_rejects_undeclared_entries_and_missing_targets() {
+    let bytes = stored_zip(
+        &[("manifest.json", b"{}"), ("payload/stowaway", b"x")],
+        false,
+    );
+    let archive = TempArchive::write(&bytes, "extract-undeclared");
+    let dest = TempDest::new("undeclared");
+    let mut handle = QuarantinedFile::open(archive.path()).expect("open");
+    let undeclared = with_production(|config| {
+        ZipArchiveReader.extract_to(
+            &mut handle,
+            &dest.0,
+            &[target("manifest.json", None)],
+            config,
+        )
+    });
+    assert!(matches!(
+        undeclared,
+        Err(ArchiveError::UndeclaredEntry(path)) if path == "payload/stowaway"
+    ));
+
+    // Declared target absent from the archive fails the other direction.
+    let bytes = stored_zip(&[("manifest.json", b"{}")], false);
+    let archive = TempArchive::write(&bytes, "extract-missing");
+    let dest = TempDest::new("missing");
+    let mut handle = QuarantinedFile::open(archive.path()).expect("open");
+    let missing = with_production(|config| {
+        ZipArchiveReader.extract_to(
+            &mut handle,
+            &dest.0,
+            &[target("manifest.json", None), target("payload/ghost", None)],
+            config,
+        )
+    });
+    assert!(matches!(
+        missing,
+        Err(ArchiveError::MissingEntry(path)) if path == "payload/ghost"
+    ));
+}
+
+#[test]
+fn extraction_rejects_unconfined_duplicate_and_deep_targets() {
+    let bytes = stored_zip(&[("manifest.json", b"{}"), ("a/b/c", b"x")], false);
+    let archive = TempArchive::write(&bytes, "extract-path-policy");
+    let dest = TempDest::new("path-policy");
+
+    // Traversal in a declared target condemns the run before any writes.
+    let mut handle = QuarantinedFile::open(archive.path()).expect("open");
+    let traversal = with_production(|config| {
+        ZipArchiveReader.extract_to(
+            &mut handle,
+            &dest.0,
+            &[target("../evil", None), target("manifest.json", None)],
+            config,
+        )
+    });
+    assert!(matches!(traversal, Err(ArchiveError::PathRejected(_))));
+
+    // Duplicate targets make "every target written" ambiguous.
+    let mut handle = QuarantinedFile::open(archive.path()).expect("open");
+    let duplicate = with_production(|config| {
+        ZipArchiveReader.extract_to(
+            &mut handle,
+            &dest.0,
+            &[target("manifest.json", None), target("manifest.json", None)],
+            config,
+        )
+    });
+    assert!(matches!(duplicate, Err(ArchiveError::PathRejected(_))));
+
+    // Depth bound applies during extraction too.
+    let policy = PackageValidationPolicy::production();
+    let config = ScanConfig {
+        limits: &policy.archive,
+        allowed_methods: &policy.allowed_compression_methods,
+        max_compression_ratio: policy.max_compression_ratio,
+        max_nesting_depth: 2,
+    };
+    let mut handle = QuarantinedFile::open(archive.path()).expect("open");
+    let deep = ZipArchiveReader.extract_to(
+        &mut handle,
+        &dest.0,
+        &[target("manifest.json", None), target("a/b/c", None)],
+        &config,
+    );
+    assert!(matches!(deep, Err(ArchiveError::LimitExceeded(_))));
+}
+
+#[test]
+fn extraction_enforces_integrity_and_method_allowlist() {
+    let bytes = stored_zip(&[("payload/bin", b"data")], false);
+    let archive = TempArchive::write(&bytes, "extract-integrity");
+
+    let mut handle = QuarantinedFile::open(archive.path()).expect("open");
+    let wrong_size = with_production(|config| {
+        ZipArchiveReader.extract_to(
+            &mut handle,
+            &TempDest::new("integrity-size").0,
+            &[target(
+                "payload/bin",
+                Some(DeclaredIntegrity {
+                    size: 5,
+                    sha256: sha256(b"data"),
+                }),
+            )],
+            config,
+        )
+    });
+    assert!(matches!(wrong_size, Err(ArchiveError::SizeMismatch { .. })));
+
+    // Fresh destination: the failed attempt may have written a partial file.
+    let digest_dest = TempDest::new("integrity-digest");
+    let mut handle = QuarantinedFile::open(archive.path()).expect("open");
+    let wrong_digest = with_production(|config| {
+        ZipArchiveReader.extract_to(
+            &mut handle,
+            &digest_dest.0,
+            &[target(
+                "payload/bin",
+                Some(DeclaredIntegrity {
+                    size: 4,
+                    sha256: sha256(b"other"),
+                }),
+            )],
+            config,
+        )
+    });
+    assert!(matches!(
+        wrong_digest,
+        Err(ArchiveError::DigestMismatch { .. })
+    ));
+
+    // Deflate is compiled but not allowlisted under a stored-only policy.
+    let deflated_bytes = stored_zip(&[("payload/bin", b"data")], true);
+    let deflated = TempArchive::write(&deflated_bytes, "extract-method");
+    let method_dest = TempDest::new("method");
+    let policy = PackageValidationPolicy::production();
+    let stored_only = ScanConfig {
+        limits: &policy.archive,
+        allowed_methods: &[conductor::packages::archive::CompressionMethod::Stored],
+        max_compression_ratio: policy.max_compression_ratio,
+        max_nesting_depth: policy.max_nesting_depth,
+    };
+    let mut handle = QuarantinedFile::open(deflated.path()).expect("open");
+    let rejected = ZipArchiveReader.extract_to(
+        &mut handle,
+        &method_dest.0,
+        &[target("payload/bin", None)],
+        &stored_only,
+    );
+    assert!(matches!(
+        rejected,
+        Err(ArchiveError::UnsupportedCompression(_))
     ));
 }
