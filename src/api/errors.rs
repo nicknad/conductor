@@ -4,8 +4,11 @@
 //! underlying message. Signature failures map to `401 Unauthorized`
 //! (the request is unauthenticated) except malformed envelopes, which are
 //! `400`; semantic validation failures are `422`; oversized bodies are
-//! `413`. The signature `VerificationFailed` message stays generic by
-//! construction, so the mapping adds no verification oracle.
+//! `413`. All key-lookup and cryptographic failures (`UnknownKey`,
+//! `UnsupportedAlgorithm`, `VerificationFailed`) map to one generic
+//! `signature_verification_failed` body so the response cannot be used to
+//! enumerate trusted key ids. Internal detail is logged server-side at
+//! conversion time, never echoed to the caller.
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -152,15 +155,14 @@ impl From<ValidationError> for ApiError {
                 Self::BadRequest("invalid_signature_envelope", message)
             }
             ValidationError::Signature(inner) => {
-                let code = match inner {
-                    SignatureError::UnknownKey(_) => "unknown_signing_key",
-                    SignatureError::UnsupportedAlgorithm => "unsupported_signature_algorithm",
-                    SignatureError::VerificationFailed => "signature_verification_failed",
-                    SignatureError::InvalidEnvelope(_) => "invalid_signature_envelope",
-                };
+                // Unify the external body: distinguishing unknown keys from
+                // bad signatures would let any bearer-token holder probe
+                // for valid key ids. Log the internal variant for
+                // operators, return a generic body to callers.
+                tracing::warn!(internal = %inner, "package signature rejected");
                 Self::Unauthorized {
-                    code,
-                    message: inner.to_string(),
+                    code: "signature_verification_failed",
+                    message: "package signature verification failed".to_owned(),
                     challenge: "Signature realm=\"package-upload\"",
                 }
             }
@@ -189,12 +191,19 @@ mod tests {
 
     #[test]
     fn signature_failures_are_unauthorized_except_envelope() {
-        let err = ApiError::from(ValidationError::Signature(
+        // Unknown keys, disallowed algorithms, and bad signatures are
+        // externally indistinguishable: one status, one code, one message.
+        for inner in [
             SignatureError::VerificationFailed,
-        ));
-        let (status, body) = err.status_and_body();
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body.code, "signature_verification_failed");
+            SignatureError::UnknownKey("k9".to_owned()),
+            SignatureError::UnsupportedAlgorithm,
+        ] {
+            let err = ApiError::from(ValidationError::Signature(inner));
+            let (status, body) = err.status_and_body();
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(body.code, "signature_verification_failed");
+            assert_eq!(body.message, "package signature verification failed");
+        }
 
         let err = ApiError::from(ValidationError::Signature(SignatureError::InvalidEnvelope(
             "bad".to_owned(),

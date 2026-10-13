@@ -275,7 +275,7 @@ async fn tampered_bytes_are_unauthorized_and_discarded() {
 }
 
 #[tokio::test]
-async fn unknown_key_is_unauthorized() {
+async fn unknown_key_is_unauthorized_without_key_oracle() {
     let state = test_state(PackageValidationPolicy::production(), "unknown-key");
     let package = golden_package_bytes();
     let mut body = Vec::new();
@@ -284,7 +284,10 @@ async fn unknown_key_is_unauthorized() {
     text_part(&mut body, "signature", &signature_base64_for(&package));
     let (status, json, _) = post_multipart(state.clone(), finish_body(&mut body)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(json["code"], "unknown_signing_key");
+    // Same generic body as a bad signature: callers cannot probe for valid
+    // key ids.
+    assert_eq!(json["code"], "signature_verification_failed");
+    assert_eq!(json["message"], "package signature verification failed");
     cleanup(&state.quarantine_dir);
 }
 
