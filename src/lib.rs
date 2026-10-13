@@ -6,4 +6,5 @@ pub mod config;
 pub mod executions;
 pub mod modules;
 pub mod packages;
+pub mod server;
 pub mod storage;

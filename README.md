@@ -84,9 +84,9 @@ acceptance; `400` malformed, `401` unauthenticated (with the matching
 semantically invalid, `503` saturated. Rejected bytes are deleted from
 quarantine (drop-guaranteed); accepted bytes are kept for the artifact
 store to promote. The binary still refuses to serve until operator
-trusted-key loading lands (`main` fails closed), so the API is exercised
-through `router` in `tests/upload_api.rs` (one test per hardening
-effort) and `tests/tls_only.rs`.
+trusted-key loading lands (`conductor::server::run` fails closed), so
+the API is exercised through `router` in `tests/upload_api.rs` (one
+test per hardening effort) and `tests/tls_only.rs`.
 
 ## Status
 
@@ -104,8 +104,9 @@ effort) and `tests/tls_only.rs`.
 ```text
 Cargo.toml                  Single-crate package definition
 src/
-  main.rs                   Binary entry point
+  main.rs                   Binary entry point (thin wrapper over `server::run`)
   lib.rs                    Library root
+  server.rs                 Host startup and TLS-only serving path
   api/                      HTTP interface (routes, uploads, errors)
   application/              Use cases and workflow orchestration
   packages/                 Package domain and validation
