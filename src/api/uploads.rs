@@ -24,12 +24,12 @@
 //! slot per upload (excess uploads get `503` instead of queueing
 //! unbounded disk and CPU work).
 //!
-//! On success the quarantined file is kept for the artifact store to
-//! promote and the handler returns `201` with the module identity, hex
-//! digest, and authorizing signer. On validation failure the quarantine
-//! file is removed so hostile bytes cannot accumulate. Validation runs on
-//! a blocking thread (it is synchronous file I/O) under the configured
-//! request timeout.
+//! On success the quarantine file is promoted to the artifact store and
+//! the handler returns `201` with the module identity, hex digest, and
+//! authorizing signer. On validation or promotion failure the quarantine
+//! file is removed so hostile bytes cannot accumulate. Validation and
+//! promotion run on a blocking thread (synchronous file I/O) under the
+//! configured request timeout.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -105,6 +105,7 @@ impl std::fmt::Debug for ApiToken {
 pub struct AppState {
     pub validator: Arc<PackageValidator>,
     pub quarantine_dir: PathBuf,
+    pub artifact_dir: PathBuf,
     pub request_timeout: Duration,
     pub api_token: ApiToken,
     /// Concurrency slots: one permit per in-flight upload.
@@ -352,10 +353,27 @@ pub async fn post_package(
     let validator = Arc::clone(&state.validator);
     let timeout = state.request_timeout;
     let blocking_path = path.clone();
+    let artifact_dir = state.artifact_dir.clone();
     let outcome = tokio::time::timeout(
         timeout,
         tokio::task::spawn_blocking(move || {
-            run_upload_workflow(&validator, &blocking_path, &envelope)
+            let verdict = run_upload_workflow(&validator, &blocking_path, &envelope)?;
+            crate::storage::artifact_store::promote_quarantined(
+                &artifact_dir,
+                &blocking_path,
+                &verdict,
+            )
+            .map(|_| verdict)
+            .map_err(|e| match e {
+                crate::storage::artifact_store::PromoteError::DigestMismatch => {
+                    crate::storage::quarantine::discard(&blocking_path);
+                    ApiError::Internal("quarantine bytes changed after validation".to_owned())
+                }
+                crate::storage::artifact_store::PromoteError::Io(message) => {
+                    crate::storage::quarantine::discard(&blocking_path);
+                    ApiError::Internal(format!("artifact promotion failed: {message}"))
+                }
+            })
         }),
     )
     .await
@@ -375,9 +393,12 @@ pub async fn post_package(
                 signer_key_id: outcome.signer().key_id.clone(),
             }),
         )),
-        Err(validation_err) => {
+        Err(api_err) => {
+            // Validation failures auto-converted via `From<ValidationError>`;
+            // promotion failures already discarded their quarantine file.
+            // Best-effort discard covers both (idempotent).
             crate::storage::quarantine::discard(&path);
-            Err(ApiError::from(validation_err))
+            Err(api_err)
         }
     }
 }

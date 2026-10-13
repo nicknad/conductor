@@ -52,6 +52,14 @@ impl Config {
     pub fn quarantine_dir(&self) -> PathBuf {
         Path::new(&self.storage_root).join("quarantine")
     }
+
+    /// Directory holding promoted immutable artifacts at
+    /// `artifacts/{module_id}/{version}/{digest}.zip`. Written only by the
+    /// artifact store via `create_new`; never overwritten.
+    #[must_use]
+    pub fn artifact_dir(&self) -> PathBuf {
+        Path::new(&self.storage_root).join("artifacts")
+    }
 }
 
 /// Loads host configuration from file and environment.

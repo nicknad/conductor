@@ -62,6 +62,33 @@ pub fn discard(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
+/// Removes stale quarantine files left by crashed uploads. Only files
+/// matching the `upload-*.zip` naming are considered; anything else is
+/// left alone. Returns the number of files removed.
+pub fn sweep_older_than(dir: &Path, max_age: std::time::Duration) -> usize {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+    let mut removed = 0;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("upload-") || path.extension().is_none_or(|e| e != "zip") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().map(|age| age > max_age).unwrap_or(false))
+            .unwrap_or(false);
+        if stale && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +132,54 @@ mod tests {
             b"original"
         );
         std::fs::remove_dir_all(&dir).expect("quarantine dir must clean up");
+    }
+
+    #[test]
+    fn sweep_removes_only_stale_quarantine_files() {
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!(
+            "conductor-quarantine-sweep-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        ensure_dir(&dir).expect("dir must be created");
+        let stale = dir.join("upload-1-1-1.zip");
+        let fresh = dir.join("upload-1-1-2.zip");
+        let other = dir.join("keep.txt");
+        std::fs::write(&stale, b"stale").expect("write");
+        std::fs::write(&fresh, b"fresh").expect("write");
+        std::fs::write(&other, b"other").expect("write");
+        // Backdate only the stale file.
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        filetime_backdate(&stale, old);
+        assert_eq!(sweep_older_than(&dir, Duration::from_secs(60)), 1);
+        assert!(!stale.exists());
+        assert!(fresh.exists());
+        assert!(other.exists());
+        std::fs::remove_dir_all(&dir).expect("quarantine dir must clean up");
+    }
+
+    #[cfg(test)]
+    fn filetime_backdate(path: &Path, t: SystemTime) {
+        // No extra deps: set mtime via /usr/bin/touch equivalent is
+        // overkill; libc-free backdating uses the file's atime/mtime
+        // through std only on nightly, so shell out to `touch -d`.
+        // Tests run on Linux; failure fails the test loudly.
+        let secs = t
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("time must be past epoch")
+            .as_secs()
+            .to_string();
+        let status = std::process::Command::new("touch")
+            .arg("-d")
+            .arg(format!("@{secs}"))
+            .arg(path)
+            .status()
+            .expect("touch must run");
+        assert!(status.success());
     }
 }

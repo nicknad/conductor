@@ -48,7 +48,7 @@ fn test_identity(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
     (cert_path, key_path, dir)
 }
 
-fn minimal_state(tag: &str) -> (AppState, PathBuf) {
+fn minimal_state(tag: &str) -> (AppState, PathBuf, PathBuf) {
     // Health probes need no real trust: the router only serves /healthz in
     // these tests, and every /v1 route additionally demands the bearer.
     let keys = ConfiguredTrustedKeys::new(vec![TrustedSigningKey::new(
@@ -71,10 +71,17 @@ fn minimal_state(tag: &str) -> (AppState, PathBuf) {
         nanos
     ));
     std::fs::create_dir_all(&quarantine_dir).expect("quarantine dir must be created");
+    let artifact_dir = std::env::temp_dir().join(format!(
+        "conductor-tls-a-{}-{}-{tag}",
+        std::process::id(),
+        nanos
+    ));
+    std::fs::create_dir_all(&artifact_dir).expect("artifact dir must be created");
     (
         AppState {
             validator: Arc::new(validator),
             quarantine_dir: quarantine_dir.clone(),
+            artifact_dir: artifact_dir.clone(),
             request_timeout: Duration::from_secs(10),
             api_token: ApiToken::new("test-bearer-upload"),
             upload_slots: Arc::new(Semaphore::new(8)),
@@ -82,6 +89,7 @@ fn minimal_state(tag: &str) -> (AppState, PathBuf) {
             rate_grace: Duration::from_secs(5),
         },
         quarantine_dir,
+        artifact_dir,
     )
 }
 
@@ -122,7 +130,7 @@ async fn plaintext_http_gets_no_response() {
         .set_nonblocking(true)
         .expect("listener must be non-blocking");
     let port = listener.local_addr().expect("port must read").port();
-    let (state, quarantine_dir) = minimal_state("plaintext");
+    let (state, quarantine_dir, artifact_dir) = minimal_state("plaintext");
     let server = axum_server::from_tcp_rustls(listener, tls).expect("TLS server must build");
     let serving = tokio::spawn(async move {
         let _ = server.serve(router(state).into_make_service()).await;
@@ -151,4 +159,5 @@ async fn plaintext_http_gets_no_response() {
     serving.abort();
     std::fs::remove_dir_all(&tls_dir).expect("tls dir must clean up");
     std::fs::remove_dir_all(&quarantine_dir).expect("quarantine dir must clean up");
+    std::fs::remove_dir_all(&artifact_dir).expect("artifact dir must clean up");
 }

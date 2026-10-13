@@ -54,14 +54,21 @@ fn test_state(policy: PackageValidationPolicy, tag: &str) -> AppState {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let quarantine_dir = std::env::temp_dir().join(format!(
-        "conductor-upload-api-{}-{}-{tag}",
+        "conductor-upload-api-{}-{}-{tag}-q",
+        std::process::id(),
+        nanos
+    ));
+    let artifact_dir = std::env::temp_dir().join(format!(
+        "conductor-upload-api-{}-{}-{tag}-a",
         std::process::id(),
         nanos
     ));
     std::fs::create_dir_all(&quarantine_dir).expect("quarantine dir must be created");
+    std::fs::create_dir_all(&artifact_dir).expect("artifact dir must be created");
     AppState {
         validator: Arc::new(validator),
         quarantine_dir,
+        artifact_dir,
         request_timeout: Duration::from_secs(10),
         api_token: ApiToken::new("test-bearer-upload"),
         upload_slots: Arc::new(Semaphore::new(8)),
@@ -249,9 +256,44 @@ async fn valid_upload_returns_created_with_audit_fields() {
         64,
         "digest must be 32-byte hex"
     );
-    // Accepted bytes stay quarantined for the artifact store to promote.
-    assert_eq!(quarantine_zip_count(&dir), 1);
+    // Promotion consumes quarantine: nothing attacker-controlled is left
+    // behind, and exactly one immutable artifact exists.
+    assert_eq!(quarantine_zip_count(&dir), 0);
+    let digest = json["digest"].as_str().expect("digest");
+    let artifact = state
+        .artifact_dir
+        .join("reporting-service")
+        .join("1.2.0")
+        .join(format!("{digest}.zip"));
+    assert!(artifact.is_file());
+    assert_eq!(
+        std::fs::read(&artifact).expect("artifact must read"),
+        package
+    );
     cleanup(&state.quarantine_dir);
+    cleanup(&state.artifact_dir);
+}
+
+#[tokio::test]
+async fn identical_reupload_is_idempotent_over_one_artifact() {
+    let state = test_state(PackageValidationPolicy::production(), "idempotent");
+    let package = golden_package_bytes();
+    let (first, first_json, _) = post_multipart(state.clone(), golden_body(&package)).await;
+    assert_eq!(first, StatusCode::CREATED);
+    let (second, second_json, _) = post_multipart(state.clone(), golden_body(&package)).await;
+    assert_eq!(second, StatusCode::CREATED);
+    assert_eq!(second_json["digest"], first_json["digest"]);
+    assert_eq!(quarantine_zip_count(&state.quarantine_dir), 0);
+    // Exactly one immutable artifact file exists; the re-upload was
+    // consumed as an identical duplicate, not written again.
+    let version_dir = state.artifact_dir.join("reporting-service").join("1.2.0");
+    let artifacts: Vec<_> = std::fs::read_dir(&version_dir)
+        .expect("version dir must exist")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(artifacts.len(), 1);
+    cleanup(&state.quarantine_dir);
+    cleanup(&state.artifact_dir);
 }
 
 #[tokio::test]
