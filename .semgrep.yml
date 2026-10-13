@@ -84,8 +84,8 @@ rules:
     severity: WARNING
     paths:
       include:
-        - "crates/**"
-        - "apps/**"
+        - "src/**"
+        - "tests/**"
     patterns:
       - pattern-either:
           - pattern: std::net::TcpStream::connect(...)

@@ -1,0 +1,1 @@
+//! Module lifecycle transitions.

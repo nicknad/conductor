@@ -9,8 +9,8 @@ restarting the scheduler host**.
 
 ## Status
 
-- Active code: Rust Cargo workspace at the repo root (`Cargo.toml`, `crates/`).
-- Scaffold only: the workspace compiles and tests pass, but no scheduler behavior is
+- Active code: single-crate Rust modular monolith (`src/`, `tests/`).
+- Scaffold only: module boundaries and responsibilities are laid out, but no scheduler behavior is
   ported yet.
 - Reference: the original .NET 10 implementation is frozen under
   [`archive/dotnet-original/`](archive/README.md) for consultation only.
@@ -21,13 +21,21 @@ restarting the scheduler host**.
 ## Repository layout
 
 ```text
-Cargo.toml                  Rust workspace definition
-crates/
-  conductor-contracts/      Stable API for job modules
-  conductor-package/        Manifest, signatures, archive validation
-  conductor-host/           HTTP API, workflow, storage, scheduler
-apps/
-  conductor-worker/         Optional isolated worker executable
+Cargo.toml                  Single-crate package definition
+src/
+  main.rs                   Binary entry point
+  lib.rs                    Library root
+  api/                      HTTP interface (routes, uploads, errors)
+  application/              Use cases and workflow orchestration
+  packages/                 Package domain and validation
+  storage/                  Filesystem persistence
+  modules/                  Installed module registry/lifecycle
+  executions/               Scheduling and execution dispatch
+  config.rs                 Host configuration
+tests/
+  package_validation.rs     Package validation workflow tests
+  archive_security.rs       Archive security tests
+  upload_workflow.rs        Upload workflow tests
 docs/                       Historical .NET-era specs (background only, not current spec)
 archive/
   dotnet-original/          Frozen .NET 10 implementation (reference only)

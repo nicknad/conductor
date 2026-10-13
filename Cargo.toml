@@ -1,3 +1,6 @@
-[workspace]
-members = ["crates/*", "apps/*"]
-resolver = "2"
+[package]
+name = "conductor"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Modular-monolith job host (unstable scaffold)"
