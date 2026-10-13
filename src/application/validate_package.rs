@@ -18,9 +18,9 @@
 //! atomically so one validation never observes a policy halfway through a
 //! reload.
 
-use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
+use thiserror::Error;
 
 use crate::packages::archive::{ArchiveError, ArchiveReader, ZipArchiveReader};
 use crate::packages::digest::{DigestProvider, Sha256DigestProvider};
@@ -85,44 +85,22 @@ impl PackageValidator {
     /// currently unreachable: the method proves stage order and dependency
     /// wiring, then fails closed.
     pub fn validate(&self, archive: &Path) -> Result<(), ValidationError> {
-        self.policy
-            .ensure_production_ingest()
-            .map_err(ValidationError::Policy)?;
-        let _inspected = self
-            .archive_reader
-            .inspect(archive, &self.policy.archive)
-            .map_err(ValidationError::Archive)?;
+        self.policy.ensure_production_ingest()?;
+        let _inspected = self.archive_reader.inspect(archive, &self.policy.archive)?;
         Err(ValidationError::NotImplemented(
             "manifest/signature stage not wired yet",
         ))
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum ValidationError {
-    Policy(PolicyError),
-    Archive(ArchiveError),
+    #[error("policy gate failed: {0}")]
+    Policy(#[from] PolicyError),
+    #[error("archive inspection failed: {0}")]
+    Archive(#[from] ArchiveError),
+    #[error("validation stage pending: {0}")]
     NotImplemented(&'static str),
-}
-
-impl fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Policy(err) => write!(f, "policy gate failed: {err}"),
-            Self::Archive(err) => write!(f, "archive inspection failed: {err}"),
-            Self::NotImplemented(stage) => write!(f, "validation stage pending: {stage}"),
-        }
-    }
-}
-
-impl std::error::Error for ValidationError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Policy(err) => Some(err),
-            Self::Archive(err) => Some(err),
-            Self::NotImplemented(_) => None,
-        }
-    }
 }
 
 /// Assembles a [`PackageValidator`]. Required security dependencies are

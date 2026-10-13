@@ -7,3 +7,4 @@ description = "Modular-monolith job host (unstable scaffold)"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+thiserror = "2"

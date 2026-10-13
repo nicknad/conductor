@@ -7,7 +7,7 @@
 //! [`SignatureAlgorithm`] enum gated by policy — never whatever string the
 //! uploaded package declares.
 
-use std::fmt;
+use thiserror::Error;
 
 /// Closed set of accepted signature algorithms.
 ///
@@ -46,28 +46,19 @@ impl TrustedSigningKey {
 
 /// Signature verification failures. No silent fallback: every variant is an
 /// error, never a downgrade to unsigned.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum SignatureError {
+    #[error("unknown signing key: {0}")]
     UnknownKey(String),
+    #[error("signature algorithm not allowlisted")]
     UnsupportedAlgorithm,
+    #[error("signature verification failed")]
     VerificationFailed,
+    #[error("key provider failure: {0}")]
     ProviderFailure(String),
+    #[error("signature backend not implemented yet")]
     NotImplemented,
 }
-
-impl fmt::Display for SignatureError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnknownKey(id) => write!(f, "unknown signing key: {id}"),
-            Self::UnsupportedAlgorithm => write!(f, "signature algorithm not allowlisted"),
-            Self::VerificationFailed => write!(f, "signature verification failed"),
-            Self::ProviderFailure(detail) => write!(f, "key provider failure: {detail}"),
-            Self::NotImplemented => write!(f, "signature backend not implemented yet"),
-        }
-    }
-}
-
-impl std::error::Error for SignatureError {}
 
 /// Injectable signature backend. Implementations vary (portable Rust,
 /// HSM/KMS wrappers); the validator only sees this contract.

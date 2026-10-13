@@ -7,8 +7,8 @@
 //! bounded by hard implementation maxima. Path-traversal, duplicate-path,
 //! and symlink rejection are fixed invariants — never operator options.
 
-use std::fmt;
 use std::path::Path;
+use thiserror::Error;
 
 /// Hard implementation ceilings. Operator-configured [`ArchiveLimits`] must
 /// fit inside these; raising them requires a code change, not a config edit.
@@ -79,34 +79,23 @@ impl InspectedArchive {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum ArchiveError {
+    #[error("archive limit exceeded: {0}")]
     LimitExceeded(&'static str),
+    #[error("invalid archive: {0}")]
     InvalidArchive(String),
+    #[error("archive path rejected: {0}")]
     PathRejected(&'static str),
+    #[error("unsupported compression method: {0}")]
     UnsupportedCompression(String),
+    #[error("archive I/O failure: {0}")]
     Io(String),
     /// Scaffold-only: the ZIP backend is not wired yet. Removed once a real
     /// reader lands; never produced for policy violations.
+    #[error("archive backend not implemented yet")]
     NotImplemented,
 }
-
-impl fmt::Display for ArchiveError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::LimitExceeded(detail) => write!(f, "archive limit exceeded: {detail}"),
-            Self::InvalidArchive(detail) => write!(f, "invalid archive: {detail}"),
-            Self::PathRejected(detail) => write!(f, "archive path rejected: {detail}"),
-            Self::UnsupportedCompression(detail) => {
-                write!(f, "unsupported compression method: {detail}")
-            }
-            Self::Io(detail) => write!(f, "archive I/O failure: {detail}"),
-            Self::NotImplemented => write!(f, "archive backend not implemented yet"),
-        }
-    }
-}
-
-impl std::error::Error for ArchiveError {}
 
 /// Injectable archive backend. The validator drives inspection first;
 /// extraction (directed by `storage::staging`) only runs against a verified

@@ -8,7 +8,7 @@
 //! outside it. Validate policy at startup; snapshot one immutable policy
 //! per validation so a reload cannot change rules mid-check.
 
-use std::fmt;
+use thiserror::Error;
 
 use super::archive::{ArchiveLimits, CompressionMethod};
 use super::signature::SignatureAlgorithm;
@@ -55,7 +55,7 @@ impl PackageValidationPolicy {
     /// anything outside implementation maxima. Unsupported algorithms are an
     /// error here, never silently ignored.
     pub fn validate(&self) -> Result<(), PolicyError> {
-        self.archive.validate().map_err(PolicyError::Archive)?;
+        self.archive.validate()?;
         if self.allowed_signature_algorithms.is_empty() {
             return Err(PolicyError::EmptyAllowlist("signature algorithms"));
         }
@@ -90,34 +90,16 @@ impl PackageValidationPolicy {
     fn audit_digest_placeholder() {}
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum PolicyError {
-    Archive(super::archive::ArchiveError),
+    #[error("invalid archive policy: {0}")]
+    Archive(#[from] super::archive::ArchiveError),
+    #[error("policy allowlist is empty: {0}")]
     EmptyAllowlist(&'static str),
+    #[error("manifest byte bound out of range")]
     BadManifestBound,
+    #[error("production ingest requires require_signature = true")]
     SignatureNotRequired,
-}
-
-impl fmt::Display for PolicyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Archive(err) => write!(f, "invalid archive policy: {err}"),
-            Self::EmptyAllowlist(what) => write!(f, "policy allowlist is empty: {what}"),
-            Self::BadManifestBound => write!(f, "manifest byte bound out of range"),
-            Self::SignatureNotRequired => {
-                write!(f, "production ingest requires require_signature = true")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PolicyError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Archive(err) => Some(err),
-            _ => None,
-        }
-    }
 }
 
 #[cfg(test)]

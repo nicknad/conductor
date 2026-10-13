@@ -5,7 +5,7 @@
 //! allowlist); parsing itself stays bounded by `max_manifest_bytes` before
 //! any field is interpreted.
 
-use std::fmt;
+use thiserror::Error;
 
 /// Parsed manifest placeholder. Grows with the ported schema; the version
 /// gate below ships first so format evolution stays explicit.
@@ -36,26 +36,17 @@ impl Manifest {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum ManifestError {
+    #[error("manifest exceeds byte bound")]
     TooLarge,
+    #[error("invalid manifest: {0}")]
     Invalid(String),
+    #[error("unsupported manifest version: {0}")]
     UnsupportedVersion(u32),
+    #[error("manifest parsing not implemented yet")]
     NotImplemented,
 }
-
-impl fmt::Display for ManifestError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TooLarge => write!(f, "manifest exceeds byte bound"),
-            Self::Invalid(detail) => write!(f, "invalid manifest: {detail}"),
-            Self::UnsupportedVersion(v) => write!(f, "unsupported manifest version: {v}"),
-            Self::NotImplemented => write!(f, "manifest parsing not implemented yet"),
-        }
-    }
-}
-
-impl std::error::Error for ManifestError {}
 
 /// Parses and validates the manifest from bounded input.
 #[allow(dead_code)]

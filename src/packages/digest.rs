@@ -7,7 +7,7 @@
 //! interfaces for large files once real hashing lands — the current
 //! `&[u8]` form is illustrative, not the final large-file contract.
 
-use std::fmt;
+use thiserror::Error;
 
 /// Closed digest set. SHA-256 is the initial (and currently only)
 /// file-integrity algorithm; artifact-store content addressing stays pinned
@@ -18,24 +18,15 @@ pub enum DigestAlgorithm {
     Sha256,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum DigestError {
+    #[error("digest algorithm not supported")]
     Unsupported,
+    #[error("digest failure: {0}")]
     Failure(String),
+    #[error("digest backend not implemented yet")]
     NotImplemented,
 }
-
-impl fmt::Display for DigestError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unsupported => write!(f, "digest algorithm not supported"),
-            Self::Failure(detail) => write!(f, "digest failure: {detail}"),
-            Self::NotImplemented => write!(f, "digest backend not implemented yet"),
-        }
-    }
-}
-
-impl std::error::Error for DigestError {}
 
 /// Injectable hash backend.
 pub trait DigestProvider: Send + Sync {
