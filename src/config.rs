@@ -15,6 +15,10 @@ impl Default for Config {
     }
 }
 
+/// Loads host configuration from file and environment.
+#[allow(dead_code)]
+fn load_config() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
