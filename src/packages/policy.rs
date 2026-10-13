@@ -10,7 +10,7 @@
 
 use thiserror::Error;
 
-use super::archive::{ArchiveLimits, CompressionMethod};
+use super::archive::{ArchiveLimits, CompressionMethod, ScanConfig};
 use super::signature::SignatureAlgorithm;
 
 /// What the validator is permitted to accept. Built once at startup (e.g.
@@ -105,6 +105,18 @@ impl PackageValidationPolicy {
             return Err(PolicyError::SignatureNotRequired);
         }
         Ok(())
+    }
+
+    /// Borrows this policy as one inspection run's enforcement parameters.
+    /// The reader enforces these; it never reads the policy itself.
+    #[must_use]
+    pub fn scan_config(&self) -> ScanConfig<'_> {
+        ScanConfig {
+            limits: &self.archive,
+            allowed_methods: &self.allowed_compression_methods,
+            max_compression_ratio: self.max_compression_ratio,
+            max_nesting_depth: self.max_nesting_depth,
+        }
     }
 
     /// Records the policy alongside the validation audit record so verdicts

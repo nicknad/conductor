@@ -93,7 +93,9 @@ impl PackageValidator {
     /// wiring, then fails closed.
     pub fn validate(&self, archive: &Path) -> Result<(), ValidationError> {
         self.policy.ensure_production_ingest()?;
-        let _inspected = self.archive_reader.inspect(archive, &self.policy.archive)?;
+        let _inspected = self
+            .archive_reader
+            .inspect(archive, &self.policy.scan_config())?;
         Err(ValidationError::NotImplemented(
             "manifest/signature stage not wired yet",
         ))

@@ -13,8 +13,8 @@
 use std::path::Path;
 
 use conductor::packages::archive::{
-    check_entry_path, check_no_duplicate_paths, ArchiveError, ArchiveLimits, ZipArchiveReader,
-    MAX_ENTRY_PATH_LEN,
+    check_entry_path, check_no_duplicate_paths, ArchiveError, ArchiveLimits, ScanConfig,
+    ZipArchiveReader, MAX_ENTRY_PATH_LEN,
 };
 use conductor::packages::policy::PackageValidationPolicy;
 
@@ -30,13 +30,20 @@ fn limits_are_checked_before_backend_touches_disk() {
         max_entries: 0,
         ..production_limits()
     };
+    let policy = PackageValidationPolicy::production();
+    let zero_config = ScanConfig {
+        limits: &zero,
+        allowed_methods: &policy.allowed_compression_methods,
+        max_compression_ratio: policy.max_compression_ratio,
+        max_nesting_depth: policy.max_nesting_depth,
+    };
     assert!(matches!(
-        reader.inspect(missing, &zero),
+        reader.inspect(missing, &zero_config),
         Err(ArchiveError::LimitExceeded(_))
     ));
     assert!(matches!(
-        reader.inspect(missing, &production_limits()),
-        Err(ArchiveError::NotImplemented)
+        reader.inspect(missing, &policy.scan_config()),
+        Err(ArchiveError::Io(_))
     ));
 }
 

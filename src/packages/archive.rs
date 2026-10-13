@@ -7,6 +7,8 @@
 //! bounded by hard implementation maxima. Path-traversal, duplicate-path,
 //! and symlink rejection are fixed invariants — never operator options.
 
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use thiserror::Error;
 
@@ -66,17 +68,32 @@ pub enum CompressionMethod {
 }
 
 /// Outcome of structural inspection: entry counts and size bounds before any
-/// payload bytes are trusted.
+/// payload bytes are trusted. `files` holds the normalized paths of every
+/// non-directory entry, in listing order — the inventory stage compares this
+/// against the manifest's declared files.
 #[derive(Debug, Clone)]
 pub struct InspectedArchive {
     pub entry_count: usize,
+    pub files: Vec<String>,
 }
 
 impl InspectedArchive {
     #[must_use]
-    pub fn new(entry_count: usize) -> Self {
-        Self { entry_count }
+    pub fn new(entry_count: usize, files: Vec<String>) -> Self {
+        Self { entry_count, files }
     }
+}
+
+/// What one inspection run enforces. Borrowed from the validation policy
+/// ([`PackageValidationPolicy::scan_config`](super::policy::PackageValidationPolicy::scan_config));
+/// bundling the parameters here keeps the dependency direction
+/// policy → archive instead of a module cycle.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanConfig<'a> {
+    pub limits: &'a ArchiveLimits,
+    pub allowed_methods: &'a [CompressionMethod],
+    pub max_compression_ratio: u32,
+    pub max_nesting_depth: usize,
 }
 
 #[derive(Debug, Error)]
@@ -91,11 +108,13 @@ pub enum ArchiveError {
     UnsupportedCompression(String),
     #[error("archive I/O failure: {0}")]
     Io(String),
-    /// Scaffold-only: the ZIP backend is not wired yet. Removed once a real
-    /// reader lands; never produced for policy violations.
-    #[error("archive backend not implemented yet")]
-    NotImplemented,
 }
+
+/// Unix file-type bits for symlinks (`S_IFLNK`), masked with `S_IFMT`.
+/// The threat is in entry metadata, not the name: a `link` entry passes the
+/// path policy, so every entry's mode bits are consulted.
+const UNIX_SYMLINK_MASK: u32 = 0o170_000;
+const UNIX_SYMLINK_TYPE: u32 = 0o120_000;
 
 /// The concrete archive backend. Inspection first; extraction (directed
 /// by `storage::staging`) only runs against a verified inventory — never
@@ -105,17 +124,159 @@ pub struct ZipArchiveReader;
 
 impl ZipArchiveReader {
     /// Inspects ZIP structure and entry limits without trusting payload
-    /// bytes. Validates limits before touching the archive.
-    ///
-    /// The ZIP backend is not wired yet, so inspection validates limits
-    /// then fails closed.
+    /// bytes. Validates limits before touching the archive, so a zeroed
+    /// config against a missing file reports `LimitExceeded`, never I/O.
     pub fn inspect(
         &self,
-        _archive: &Path,
-        limits: &ArchiveLimits,
+        archive: &Path,
+        config: &ScanConfig<'_>,
     ) -> Result<InspectedArchive, ArchiveError> {
-        limits.validate()?;
-        Err(ArchiveError::NotImplemented)
+        config.limits.validate()?;
+        let mut file = File::open(archive).map_err(|e| ArchiveError::Io(e.to_string()))?;
+        self.inspect_file(&mut file, config)
+    }
+
+    /// Same inspection over an already-open handle. The validator hashes
+    /// and inspects one open file through this, so hashing and inspection
+    /// can never diverge onto different bytes (TOCTOU).
+    pub fn inspect_file(
+        &self,
+        file: &mut File,
+        config: &ScanConfig<'_>,
+    ) -> Result<InspectedArchive, ArchiveError> {
+        config.limits.validate()?;
+        let mut zip =
+            zip::ZipArchive::new(file).map_err(|e| ArchiveError::InvalidArchive(e.to_string()))?;
+        self.scan_entries(&mut zip, config)
+    }
+
+    /// Bounded read of one entry's bytes. `max_bytes` is enforced during
+    /// the read (metadata `size` is only an early hint — a lying
+    /// central directory cannot force over-allocation). Used for
+    /// `manifest.json`; general extraction lives in `storage::staging`.
+    pub fn read_file(
+        &self,
+        archive: &Path,
+        name: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, ArchiveError> {
+        let mut file = File::open(archive).map_err(|e| ArchiveError::Io(e.to_string()))?;
+        self.read_file_from(&mut file, name, max_bytes)
+    }
+
+    /// Same bounded read over an already-open handle (see
+    /// [`inspect_file`](Self::inspect_file)).
+    pub fn read_file_from(
+        &self,
+        file: &mut File,
+        name: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, ArchiveError> {
+        let mut zip =
+            zip::ZipArchive::new(file).map_err(|e| ArchiveError::InvalidArchive(e.to_string()))?;
+        let entry = zip
+            .by_name(name)
+            .map_err(|_| ArchiveError::InvalidArchive(format!("{name} not found in archive")))?;
+        if entry.is_dir() {
+            return Err(ArchiveError::InvalidArchive(format!(
+                "{name} is a directory"
+            )));
+        }
+        if entry.size() > max_bytes {
+            return Err(ArchiveError::LimitExceeded("file exceeds read bound"));
+        }
+        let mut buf = Vec::new();
+        entry
+            .take(max_bytes + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| ArchiveError::Io(e.to_string()))?;
+        if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max_bytes {
+            return Err(ArchiveError::LimitExceeded("file exceeds read bound"));
+        }
+        Ok(buf)
+    }
+
+    /// Entry-by-entry enforcement over an open archive. Central-directory
+    /// sizes are treated as hints for early rejection; authoritative byte
+    /// counting over actual decompressed output happens at extraction.
+    fn scan_entries(
+        &self,
+        zip: &mut zip::ZipArchive<&mut File>,
+        config: &ScanConfig<'_>,
+    ) -> Result<InspectedArchive, ArchiveError> {
+        let entry_count = zip.len();
+        if entry_count > config.limits.max_entries {
+            return Err(ArchiveError::LimitExceeded(
+                "archive entry count exceeds bound",
+            ));
+        }
+        let mut compressed_total: u64 = 0;
+        let mut uncompressed_total: u64 = 0;
+        let mut files = Vec::new();
+        for index in 0..entry_count {
+            let entry = zip
+                .by_index(index)
+                .map_err(|e| ArchiveError::InvalidArchive(e.to_string()))?;
+            if entry.encrypted() {
+                return Err(ArchiveError::InvalidArchive(
+                    "encrypted entries are not accepted".to_owned(),
+                ));
+            }
+            let method = match entry.compression() {
+                zip::CompressionMethod::Stored => CompressionMethod::Stored,
+                zip::CompressionMethod::Deflated => CompressionMethod::Deflate,
+                other => {
+                    return Err(ArchiveError::UnsupportedCompression(format!("{other:?}")));
+                }
+            };
+            if !config.allowed_methods.contains(&method) {
+                return Err(ArchiveError::UnsupportedCompression(format!("{method:?}")));
+            }
+            let is_symlink = entry
+                .unix_mode()
+                .is_some_and(|mode| mode & UNIX_SYMLINK_MASK == UNIX_SYMLINK_TYPE);
+            let normalized = check_entry_path(entry.name(), is_symlink)?;
+            if entry.is_dir() {
+                continue;
+            }
+            if normalized.split('/').count() > config.max_nesting_depth {
+                return Err(ArchiveError::LimitExceeded(
+                    "entry nesting depth exceeds bound",
+                ));
+            }
+            if entry.size() > config.limits.max_entry_bytes {
+                return Err(ArchiveError::LimitExceeded(
+                    "archive entry exceeds per-entry bound",
+                ));
+            }
+            compressed_total = compressed_total
+                .checked_add(entry.compressed_size())
+                .ok_or(ArchiveError::LimitExceeded("archive size total overflow"))?;
+            uncompressed_total = uncompressed_total
+                .checked_add(entry.size())
+                .ok_or(ArchiveError::LimitExceeded("archive size total overflow"))?;
+            files.push(normalized);
+        }
+        if compressed_total > config.limits.max_compressed_bytes
+            || uncompressed_total > config.limits.max_uncompressed_bytes
+        {
+            return Err(ArchiveError::LimitExceeded(
+                "archive size totals exceed bounds",
+            ));
+        }
+        if compressed_total == 0 {
+            if uncompressed_total > 0 {
+                return Err(ArchiveError::LimitExceeded(
+                    "compression ratio exceeds bound",
+                ));
+            }
+        } else if uncompressed_total > u64::from(config.max_compression_ratio) * compressed_total {
+            return Err(ArchiveError::LimitExceeded(
+                "compression ratio exceeds bound",
+            ));
+        }
+        check_no_duplicate_paths(&files)?;
+        Ok(InspectedArchive::new(entry_count, files))
     }
 }
 
@@ -212,6 +373,15 @@ mod tests {
         }
     }
 
+    fn sane_config(limits: &ArchiveLimits) -> ScanConfig<'_> {
+        ScanConfig {
+            limits,
+            allowed_methods: &[CompressionMethod::Stored, CompressionMethod::Deflate],
+            max_compression_ratio: 100,
+            max_nesting_depth: 32,
+        }
+    }
+
     #[test]
     fn limits_carry_all_bounds() {
         let limits = sane_limits();
@@ -259,19 +429,36 @@ mod tests {
     }
 
     #[test]
-    fn production_reader_fails_closed_after_limit_check() {
+    fn limits_are_checked_before_backend_touches_disk() {
         let reader = ZipArchiveReader;
         let bad = ArchiveLimits {
             max_entries: 0,
             ..sane_limits()
         };
+        let bad_config = sane_config(&bad);
         assert!(matches!(
-            reader.inspect(Path::new("pkg.zip"), &bad),
+            reader.inspect(Path::new("pkg.zip"), &bad_config),
             Err(ArchiveError::LimitExceeded(_))
         ));
+    }
+
+    #[test]
+    fn missing_file_is_io_not_policy() {
+        let reader = ZipArchiveReader;
+        let limits = sane_limits();
+        let config = sane_config(&limits);
         assert!(matches!(
-            reader.inspect(Path::new("pkg.zip"), &sane_limits()),
-            Err(ArchiveError::NotImplemented)
+            reader.inspect(Path::new("pkg.zip"), &config),
+            Err(ArchiveError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn missing_entry_read_is_invalid_not_found() {
+        let reader = ZipArchiveReader;
+        assert!(matches!(
+            reader.read_file(Path::new("pkg.zip"), "manifest.json", 16),
+            Err(ArchiveError::Io(_))
         ));
     }
 
