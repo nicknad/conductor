@@ -110,11 +110,14 @@ pub enum ArchiveError {
     Io(String),
 }
 
-/// Unix file-type bits for symlinks (`S_IFLNK`), masked with `S_IFMT`.
-/// The threat is in entry metadata, not the name: a `link` entry passes the
-/// path policy, so every entry's mode bits are consulted.
-const UNIX_SYMLINK_MASK: u32 = 0o170_000;
+/// Unix file-type bits (`S_IFMT`) and the types a package may contain:
+/// regular files and directories. The threat is in entry metadata, not the
+/// name: a `link` — or a FIFO/device/socket — passes the path policy, so
+/// every entry's mode bits are consulted.
+const UNIX_FILE_TYPE_MASK: u32 = 0o170_000;
 const UNIX_SYMLINK_TYPE: u32 = 0o120_000;
+const UNIX_REGULAR_TYPE: u32 = 0o100_000;
+const UNIX_DIRECTORY_TYPE: u32 = 0o040_000;
 
 /// End-of-central-directory magic (`PK\x05\x06`), ZIP64 locator magic
 /// (`PK\x06\x07`), and ZIP64 end magic (`PK\x06\x06`).
@@ -318,9 +321,19 @@ impl ZipArchiveReader {
             if !config.allowed_methods.contains(&method) {
                 return Err(ArchiveError::UnsupportedCompression(format!("{method:?}")));
             }
-            let is_symlink = entry
+            let file_type = entry
                 .unix_mode()
-                .is_some_and(|mode| mode & UNIX_SYMLINK_MASK == UNIX_SYMLINK_TYPE);
+                .map_or(0, |mode| mode & UNIX_FILE_TYPE_MASK);
+            let is_symlink = file_type == UNIX_SYMLINK_TYPE;
+            if !is_symlink
+                && file_type != 0
+                && file_type != UNIX_REGULAR_TYPE
+                && file_type != UNIX_DIRECTORY_TYPE
+            {
+                return Err(ArchiveError::PathRejected(
+                    "non-regular entries are never extracted",
+                ));
+            }
             let normalized = check_entry_path(entry.name(), is_symlink)?;
             if entry.is_dir() {
                 continue;
@@ -481,6 +494,34 @@ mod tests {
         }
         writer.finish().expect("test zip must finalize");
         cursor.into_inner()
+    }
+
+    /// Builds a one-entry Stored archive carrying explicit Unix file-type
+    /// bits in the central directory's external attributes. The writer
+    /// masks `unix_permissions` to `0o777` and always ORs in `S_IFREG`, so
+    /// hostile type bits are injected at the byte level — exactly as a
+    /// hostile producer would emit them.
+    fn stored_zip_with_mode(name: &str, mode: u32) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        writer
+            .start_file(
+                name,
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .expect("test zip must build");
+        writer.write_all(b"x").expect("test zip must build");
+        writer.finish().expect("test zip must finalize");
+        let mut bytes = cursor.into_inner();
+
+        let cd = bytes
+            .windows(4)
+            .position(|w| w == [0x50, 0x4b, 0x01, 0x02])
+            .expect("central directory record must exist");
+        bytes[cd + 5] = 3; // host system: Unix, so `unix_mode` is honored
+        bytes[cd + 38..cd + 42].copy_from_slice(&(mode << 16).to_le_bytes());
+        bytes
     }
 
     fn scan_bytes(bytes: &[u8], config: &ScanConfig<'_>) -> Result<InspectedArchive, ArchiveError> {
@@ -797,6 +838,32 @@ mod tests {
             Err(ArchiveError::PathRejected(_))
         ));
         assert!(check_entry_path(&"a".repeat(MAX_ENTRY_PATH_LEN), false).is_ok());
+    }
+
+    #[test]
+    fn scan_rejects_non_regular_file_types_not_only_symlinks() {
+        let limits = ArchiveLimits {
+            max_entries: 16,
+            max_compressed_bytes: 1 << 20,
+            max_uncompressed_bytes: 1 << 20,
+            max_entry_bytes: 1 << 20,
+        };
+        let config = sane_config(&limits);
+
+        // FIFO mode bits (S_IFIFO) with otherwise ordinary permissions: the
+        // name policy passes, so only the file-type check can condemn it.
+        let fifo = stored_zip_with_mode("pipe", 0o010644);
+        assert!(matches!(
+            scan_bytes(&fifo, &config),
+            Err(ArchiveError::PathRejected(_))
+        ));
+
+        // Regular-file and type-less modes must stay accepted.
+        let regular = stored_zip_with_mode("bin/tool", 0o100755);
+        let inspected = scan_bytes(&regular, &config).expect("regular mode must pass");
+        assert_eq!(inspected.files, vec!["bin/tool".to_owned()]);
+        let untyped = stored_zip_with_mode("plain.dat", 0o600);
+        scan_bytes(&untyped, &config).expect("type-less mode must pass");
     }
 
     #[test]

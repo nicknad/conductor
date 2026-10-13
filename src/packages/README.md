@@ -10,7 +10,7 @@ next (that is `application`).
 
 | File | Owns | Must not |
 |---|---|---|
-| `archive.rs` | Real `ZipArchiveReader`: entry-count bound enforced before the central directory is parsed, EOCD record-count cross-check (duplicate collapse), path/symlink/compression/size/ratio/depth enforcement, bounded single-entry reads | Decide validation outcomes |
+| `archive.rs` | Real `ZipArchiveReader`: entry-count bound enforced before the central directory is parsed, EOCD record-count cross-check (duplicate collapse), path/non-regular-file-type/symlink/compression/size/ratio/depth enforcement, bounded single-entry reads | Decide validation outcomes |
 | `manifest.rs` | Real schema-v1 parsing: byte bound, version gating, required-field shape, `entrypoint ∈ files`, `deny_unknown_fields` | Trust hashes without checking file bytes |
 | `signature.rs` | Real `Ed25519Verifier` + `ConfiguredTrustedKeys`, closed `SignatureAlgorithm` enum, key-owned algorithm records, `PackageSignature` detached envelope, `canonical_payload` + `authenticate` | Load or execute plugin code |
 | `digest.rs` | Real SHA-256 `Sha256DigestProvider`, buffered and streaming | Decide activation policy |
@@ -55,7 +55,7 @@ Two ordering rules are load-bearing:
   versions, `max_manifest_bytes`. Deserializable from operator config; each
   validator snapshots one immutable policy.
 - **Fixed invariants**: stage order, mandatory signature and mandatory
-  trust store on the production path, traversal/duplicate/symlink
+  trust store on the production path, traversal/duplicate/non-regular-entry
   rejection, fail-closed backends. These live in code, never in config.
 
 ## Errors
