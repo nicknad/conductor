@@ -25,10 +25,10 @@ coverage/
 *.trx
 *.xml.results
 
-# NuGet
+# NuGet (root-only: bare 'packages/' would shadow src/packages/ in the Rust layout)
 *.nupkg
 *.snupkg
-packages/
+/packages/
 project.lock.json
 .nuget/
 
