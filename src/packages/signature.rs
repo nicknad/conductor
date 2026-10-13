@@ -56,13 +56,12 @@ pub const SUPPORTED_SIGNATURE_FORMAT_VERSION: u16 = 1;
 /// what the holder of `key_id` signed. The envelope itself is validated —
 /// arbitrary bytes are never treated as a signature.
 ///
-/// The signature covers a canonical payload the signer and verifier must
-/// construct byte-identically: a domain-separation prefix, the package
-/// format/version, the digest-algorithm identifier, and the SHA-256 digest
-/// of the exact archive bytes. Ed25519 ordinary signing and Ed25519ph are
-/// not interchangeable here. If certificate-based interoperability is ever
-/// required, prefer a standard detached format such as CMS over extending
-/// this envelope.
+/// The signature covers the [`canonical_payload`]: a domain-separation
+/// prefix, the package format/version, the digest-algorithm identifier, and
+/// the SHA-256 digest of the exact archive bytes. Ed25519 ordinary signing
+/// and Ed25519ph are not interchangeable here. If certificate-based
+/// interoperability is ever required, prefer a standard detached format
+/// such as CMS over extending this envelope.
 #[derive(Clone, Debug)]
 pub struct PackageSignature {
     pub format_version: u16,
@@ -92,6 +91,38 @@ impl PackageSignature {
         }
         Ok(())
     }
+}
+
+/// Domain-separation prefix for the canonical payload. Binds signatures to
+/// this package format so a signature over unrelated data can never verify
+/// as a package signature.
+pub const SIGNATURE_DOMAIN: &[u8] = b"conductor/package-signature/v1";
+
+/// Package format identifier covered by the signature. Bumping the archive
+/// layout without bumping this invalidates old signatures by construction.
+pub const SIGNATURE_FORMAT_ID: &[u8] = b"zip/v1";
+
+/// Digest-algorithm identifier covered by the signature. Pinned to SHA-256
+/// alongside the artifact store; algorithm agility needs a new format id.
+pub const SIGNATURE_DIGEST_ID: &[u8] = b"sha256";
+
+/// Builds the exact bytes the signer signs and the verifier checks:
+/// `domain || 0x00 || format || 0x00 || digest-id || 0x00 || digest`.
+/// NUL separators keep the fields unambiguous without length prefixes.
+/// Single constructor shared by signer and verifier — never rebuilt ad hoc.
+#[must_use]
+pub fn canonical_payload(package_digest: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        SIGNATURE_DOMAIN.len() + SIGNATURE_FORMAT_ID.len() + SIGNATURE_DIGEST_ID.len() + 32 + 3,
+    );
+    out.extend_from_slice(SIGNATURE_DOMAIN);
+    out.push(0);
+    out.extend_from_slice(SIGNATURE_FORMAT_ID);
+    out.push(0);
+    out.extend_from_slice(SIGNATURE_DIGEST_ID);
+    out.push(0);
+    out.extend_from_slice(package_digest);
+    out
 }
 
 /// Signature verification failures. No silent fallback: every variant is an
@@ -142,6 +173,32 @@ impl Ed25519Verifier {
         verifying
             .verify(message, &Ed25519Signature::from_bytes(&bytes))
             .map_err(|_| SignatureError::VerificationFailed)
+    }
+
+    /// Full authentication of a detached signature over a package digest:
+    /// envelope precheck → key lookup → policy allowlist → cryptographic
+    /// verification. Returns the authorizing key record on success so the
+    /// caller can attribute the package to its signer in the audit log.
+    pub fn authenticate(
+        &self,
+        signature: &PackageSignature,
+        package_digest: &[u8; 32],
+        keys: &ConfiguredTrustedKeys,
+        allowed_algorithms: &[SignatureAlgorithm],
+    ) -> Result<TrustedSigningKey, SignatureError> {
+        signature.check_envelope()?;
+        let key = keys
+            .key(&signature.key_id)
+            .ok_or_else(|| SignatureError::UnknownKey(signature.key_id.clone()))?;
+        if !allowed_algorithms.contains(&key.algorithm) {
+            return Err(SignatureError::UnsupportedAlgorithm);
+        }
+        self.verify(
+            &key,
+            &canonical_payload(package_digest),
+            &signature.signature,
+        )?;
+        Ok(key)
     }
 }
 
@@ -212,6 +269,86 @@ mod tests {
         assert!(matches!(
             Ed25519Verifier.verify(&short_key, b"m", &signature.to_bytes()),
             Err(SignatureError::VerificationFailed)
+        ));
+    }
+
+    #[test]
+    fn canonical_payload_is_pinned_and_unambiguous() {
+        let digest = [9u8; 32];
+        let payload = canonical_payload(&digest);
+        assert!(payload.starts_with(SIGNATURE_DOMAIN));
+        assert!(payload.ends_with(&digest));
+        // NUL separators: no field boundary is ambiguous.
+        assert_eq!(payload.iter().filter(|b| **b == 0).count(), 3);
+        // Different digests diverge; same digest is deterministic.
+        assert_ne!(payload, canonical_payload(&[8u8; 32]));
+        assert_eq!(payload, canonical_payload(&digest));
+    }
+
+    #[test]
+    fn authenticate_roundtrip_attributes_the_signer() {
+        use ed25519_dalek::{Signer as _, SigningKey};
+
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let digest = [7u8; 32];
+        let signature = signing.sign(&canonical_payload(&digest));
+        let keys = ConfiguredTrustedKeys::new(vec![TrustedSigningKey::new(
+            "k1",
+            SignatureAlgorithm::Ed25519,
+            signing.verifying_key().to_bytes().to_vec(),
+        )]);
+        let envelope = PackageSignature {
+            format_version: SUPPORTED_SIGNATURE_FORMAT_VERSION,
+            key_id: "k1".to_owned(),
+            signature: signature.to_bytes().to_vec(),
+        };
+        let key = Ed25519Verifier
+            .authenticate(&envelope, &digest, &keys, &[SignatureAlgorithm::Ed25519])
+            .expect("genuine detached signature must authenticate");
+        assert_eq!(key.key_id, "k1");
+    }
+
+    #[test]
+    fn authenticate_rejects_unknown_key_tampered_digest_and_allowlist() {
+        use ed25519_dalek::{Signer as _, SigningKey};
+
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let digest = [7u8; 32];
+        let signature = signing.sign(&canonical_payload(&digest));
+        let keys = ConfiguredTrustedKeys::new(vec![TrustedSigningKey::new(
+            "k1",
+            SignatureAlgorithm::Ed25519,
+            signing.verifying_key().to_bytes().to_vec(),
+        )]);
+        let envelope = PackageSignature {
+            format_version: SUPPORTED_SIGNATURE_FORMAT_VERSION,
+            key_id: "k1".to_owned(),
+            signature: signature.to_bytes().to_vec(),
+        };
+        // Tampered package bytes change the digest, which changes the payload.
+        assert!(matches!(
+            Ed25519Verifier.authenticate(
+                &envelope,
+                &[8u8; 32],
+                &keys,
+                &[SignatureAlgorithm::Ed25519]
+            ),
+            Err(SignatureError::VerificationFailed)
+        ));
+        // Unknown key id fails before any crypto.
+        let unknown = PackageSignature {
+            key_id: "nope".to_owned(),
+            ..envelope.clone()
+        };
+        assert!(matches!(
+            Ed25519Verifier.authenticate(&unknown, &digest, &keys, &[SignatureAlgorithm::Ed25519]),
+            Err(SignatureError::UnknownKey(_))
+        ));
+        // Key algorithm outside the policy allowlist is rejected even though
+        // the signature itself is genuine.
+        assert!(matches!(
+            Ed25519Verifier.authenticate(&envelope, &digest, &keys, &[]),
+            Err(SignatureError::UnsupportedAlgorithm)
         ));
     }
 
