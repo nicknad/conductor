@@ -39,6 +39,27 @@ Conductor verifies the signature against trusted publishers, validates the archi
 
 Details: [package validation pipeline](src/packages/README.md) · [hostile archive corpus](tests/testdata/README.md).
 
+## Upload API (unstable)
+
+`POST /v1/packages` accepts a `multipart/form-data` body:
+
+| Field | Contents |
+|---|---|
+| `package` | The exact ZIP bytes covered by the detached signature, streamed into quarantine under the policy byte bound |
+| `key_id` | Trusted-key id (text) |
+| `signature` | Standard-base64 Ed25519 signature over the canonical payload (text) |
+| `format_version` | Optional envelope version, defaults to 1 |
+
+Responses: `201` with `{module_id, version, digest, signer_key_id}` on
+acceptance; `400` for malformed requests, `401` (with `WWW-Authenticate:
+Signature`) for authentication failures, `413` for oversized bodies, `422`
+for semantically invalid packages. Rejected bytes are deleted from
+quarantine; accepted bytes are kept for the artifact store to promote.
+`GET /healthz` is a liveness probe. Request timeouts and tracing spans are
+wired in; the binary still refuses to serve until operator trusted-key
+loading lands (`main` fails closed), so the API is exercised through
+`router` in `tests/upload_api.rs`.
+
 ## Status
 
 - Active code: single-crate Rust modular monolith (`src/`, `tests/`).

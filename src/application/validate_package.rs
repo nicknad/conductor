@@ -22,8 +22,8 @@
 //! byte agreement during staged extraction lands with `storage::staging`;
 //! until then the outer digest plus inventory set-equality bind the bytes.
 //!
-//! The authorizing signer is established by authentication but not yet
-//! recorded: audit logging will attribute it once tracing lands.
+//! The authorizing signer established by authentication is returned to the
+//! caller alongside the artifact for audit attribution.
 //!
 //! Callers cannot omit stages or build a production validator without a
 //! trust store — [`build`](PackageValidationBuilder::build) fails closed
@@ -51,6 +51,7 @@ use crate::packages::signature::{
 
 /// Runs the mandatory stages in a fixed order and returns a verdict or a
 /// typed error. Holds one immutable policy snapshot per instance.
+#[derive(Debug)]
 pub struct PackageValidator {
     archive_reader: ZipArchiveReader,
     signature_verifier: Ed25519Verifier,
@@ -100,11 +101,32 @@ impl PackageValidator {
     /// hash-and-authenticate → inspect → manifest/inventory → promotion.
     /// Returns the minted [`ValidatedArtifact`] on success; success is now
     /// reachable, unlike the scaffold era where every path failed closed.
+    /// The authorizing signer is discarded here; use
+    /// [`validate_with_signer`](Self::validate_with_signer) when the caller
+    /// must attribute the verdict (audit log, HTTP response).
     pub fn validate(
         &self,
         archive: &Path,
         signature: &PackageSignature,
     ) -> Result<ValidatedArtifact, ValidationError> {
+        self.validate_with_signer(archive, signature)
+            .map(|(artifact, _signer)| artifact)
+    }
+
+    /// Same fixed-order validation, additionally returning the authorizing
+    /// [`TrustedSigningKey`] established by authentication so callers can
+    /// attribute the package to its signer in the audit log.
+    pub fn validate_with_signer(
+        &self,
+        archive: &Path,
+        signature: &PackageSignature,
+    ) -> Result<
+        (
+            ValidatedArtifact,
+            crate::packages::signature::TrustedSigningKey,
+        ),
+        ValidationError,
+    > {
         self.policy.ensure_production_ingest()?;
         let mut file = File::open(archive)
             .map_err(|e| ValidationError::Archive(ArchiveError::Io(e.to_string())))?;
@@ -122,7 +144,7 @@ impl PackageValidator {
             )));
         }
         let digest = self.digest.digest_stream(&mut file)?;
-        let _signer = self.signature_verifier.authenticate(
+        let signer = self.signature_verifier.authenticate(
             signature,
             &digest,
             &self.trusted_keys,
@@ -166,11 +188,12 @@ impl PackageValidator {
             .filter(|f| f != MANIFEST_FILE_NAME)
             .collect();
         check_inventory(&manifest.declared_files(), &payload)?;
-        Ok(ValidatedArtifact::new(
+        let artifact = ValidatedArtifact::new(
             ArtifactDigest::new(digest),
             manifest.module_id,
             manifest.version,
-        ))
+        );
+        Ok((artifact, signer))
     }
 }
 

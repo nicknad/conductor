@@ -64,7 +64,9 @@ All error enums derive `Display` + `Error` via `thiserror`; messages are
 part of the observable contract. Every backend is real and fails closed on
 rejected input — there are no `NotImplemented` variants left in this
 module. Still future: staged extraction with per-file byte agreement
-(`storage::staging`) and audit logging of the authorizing signer.
+(`storage::staging`). The authorizing signer is returned by
+`validate_with_signer` and recorded by the upload workflow as a `tracing`
+audit event; persistent audit records are still future.
 
 ## Tests
 
