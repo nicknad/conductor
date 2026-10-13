@@ -132,29 +132,77 @@ const EOCD_MAX_COMMENT: u64 = 0xFFFF;
 /// The concrete archive backend. Inspection first; extraction (directed
 /// by `storage::staging`) only runs against a verified inventory — never
 /// as a casual `unzip(path, destination)` utility.
+///
+/// All multi-stage callers must thread one [`QuarantinedFile`] handle
+/// through hashing, inspection, and manifest reads. The one-shot
+/// [`ZipArchiveReader::inspect`] opens the path once internally and is
+/// safe for standalone inspection, but production validation must never
+/// hash one open and inspect another path.
 #[derive(Debug)]
 pub struct ZipArchiveReader;
 
+/// A private quarantine file opened once for reading. Hashing, inspection,
+/// and manifest reads all borrow `&mut self`, so the compiler forces every
+/// stage onto the same OS handle — the same bytes the signature
+/// authenticated. Construct with [`QuarantinedFile::open`]; access the
+/// handle only through the reader/digest stages.
+#[derive(Debug)]
+pub struct QuarantinedFile {
+    file: File,
+}
+
+impl QuarantinedFile {
+    /// Opens `path` for validation. `path` must be a private quarantine
+    /// file the server wrote, never a client-supplied path.
+    pub fn open(path: &Path) -> Result<Self, ArchiveError> {
+        File::open(path)
+            .map(|file| Self { file })
+            .map_err(|e| ArchiveError::Io(e.to_string()))
+    }
+
+    /// On-disk length without parsing. Used as the pre-hash size gate.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> std::io::Result<u64> {
+        self.file.metadata().map(|m| m.len())
+    }
+}
+
+impl Read for QuarantinedFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl Seek for QuarantinedFile {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
 impl ZipArchiveReader {
-    /// Inspects ZIP structure and entry limits without trusting payload
-    /// bytes. Validates limits before touching the archive, so a zeroed
-    /// config against a missing file reports `LimitExceeded`, never I/O.
+    /// One-shot inspection of the archive at `path`. Opens the file once
+    /// and inspects that same handle, so this single call is atomic.
+    ///
+    /// Production validation must NOT combine this with a separate hash of
+    /// the same path (two opens can diverge under replacement). Thread one
+    /// [`QuarantinedFile`] through [`ZipArchiveReader::inspect_file`] and
+    /// [`ZipArchiveReader::read_file_from`] instead.
     pub fn inspect(
         &self,
         archive: &Path,
         config: &ScanConfig<'_>,
     ) -> Result<InspectedArchive, ArchiveError> {
         config.limits.validate()?;
-        let mut file = File::open(archive).map_err(|e| ArchiveError::Io(e.to_string()))?;
-        self.inspect_file(&mut file, config)
+        let mut quarantined = QuarantinedFile::open(archive)?;
+        self.inspect_file(&mut quarantined, config)
     }
 
-    /// Same inspection over an already-open handle. The validator hashes
-    /// and inspects one open file through this, so hashing and inspection
-    /// can never diverge onto different bytes (TOCTOU).
+    /// Inspection over an already-open quarantine handle. The validator
+    /// hashes and inspects one [`QuarantinedFile`] through this, so hashing
+    /// and inspection can never diverge onto different bytes (TOCTOU).
     pub fn inspect_file(
         &self,
-        file: &mut File,
+        file: &mut QuarantinedFile,
         config: &ScanConfig<'_>,
     ) -> Result<InspectedArchive, ArchiveError> {
         config.limits.validate()?;
@@ -251,19 +299,21 @@ impl ZipArchiveReader {
         usize::try_from(total64).map_err(|_| invalid("ZIP64 entry count out of range"))
     }
 
-    /// Bounded read of one entry's bytes over an already-open handle (see
-    /// [`inspect_file`](Self::inspect_file)). `max_bytes` is enforced
+    /// Bounded read of one entry's bytes over the same quarantined handle
+    /// (see [`inspect_file`](Self::inspect_file)). `max_bytes` is enforced
     /// during the read (metadata `size` is only an early hint — a lying
     /// central directory cannot force over-allocation). Used for
     /// `manifest.json`; general extraction lives in `storage::staging`.
+    /// Takes `&mut QuarantinedFile` — not a generic seekable — so the
+    /// manifest can only come from the inspected handle.
     pub fn read_file_from(
         &self,
-        file: &mut (impl Read + Seek),
+        file: &mut QuarantinedFile,
         name: &str,
         max_bytes: u64,
     ) -> Result<Vec<u8>, ArchiveError> {
-        let mut zip =
-            zip::ZipArchive::new(file).map_err(|e| ArchiveError::InvalidArchive(e.to_string()))?;
+        let mut zip = zip::ZipArchive::new(file)
+            .map_err(|e| ArchiveError::InvalidArchive(e.to_string()))?;
         let entry = zip
             .by_name(name)
             .map_err(|_| ArchiveError::InvalidArchive(format!("{name} not found in archive")))?;
@@ -584,8 +634,16 @@ mod tests {
     }
 
     fn read_bytes(bytes: &[u8], name: &str, max: u64) -> Result<Vec<u8>, ArchiveError> {
-        let mut cursor = std::io::Cursor::new(bytes);
-        ZipArchiveReader.read_file_from(&mut cursor, name, max)
+        let path = std::env::temp_dir().join(format!(
+            "conductor-read-test-{}-{}.zip",
+            std::process::id(),
+            bytes.len()
+        ));
+        std::fs::write(&path, bytes).expect("temp archive must be writable");
+        let mut quarantined = QuarantinedFile::open(&path)?;
+        let out = ZipArchiveReader.read_file_from(&mut quarantined, name, max);
+        let _ = std::fs::remove_file(&path);
+        out
     }
 
     #[test]

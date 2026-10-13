@@ -105,9 +105,7 @@ fn signature_base64_for(bytes: &[u8]) -> String {
     let signing = SigningKey::from_bytes(&TEST_SIGNING_KEY);
     let digest: [u8; 32] = Sha256DigestProvider
         .digest(bytes)
-        .expect("hashing must succeed")
-        .try_into()
-        .expect("SHA-256 is 32 bytes");
+        .expect("hashing must succeed");
     BASE64_STANDARD.encode(signing.sign(&canonical_payload(&digest)).to_bytes())
 }
 

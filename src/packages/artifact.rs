@@ -47,7 +47,17 @@ pub struct ValidatedArtifact {
 }
 
 impl ValidatedArtifact {
-    pub(crate) fn new(digest: ArtifactDigest, module_id: String, version: String) -> Self {
+    /// Mints an artifact. `pub(crate)` for the validator path only:
+    /// `application::validate_package` is the sole production caller, and
+    /// a bare artifact is useless without the private
+    /// `ValidatedPackage::new` wrapper — no other module can promote it
+    /// into a verdict. (Rust cannot express sibling-only visibility, so
+    /// this relies on the package-private verdict constructor plus review.)
+    pub(crate) fn new(
+        digest: ArtifactDigest,
+        module_id: String,
+        version: String,
+    ) -> Self {
         Self {
             digest,
             module_id,

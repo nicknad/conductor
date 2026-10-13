@@ -1,30 +1,38 @@
 //! Coordinates ingestion: quarantine, inspect, authenticate, validate
 //! contents, validate policy, promote.
 //!
-//! The workflow is synchronous file I/O over a quarantined path: the HTTP
-//! layer streams the request body into quarantine first (enforcing its byte
-//! bound while writing), then calls [`run_upload_workflow`] on a blocking
-//! thread. Validation runs on the same quarantined file it hashed — never a
-//! reopened attacker-controlled path.
+//! The workflow owns the quarantine handle: the HTTP layer streams the
+//! request body into quarantine first (enforcing its byte bound while
+//! writing), then calls [`run_upload_workflow`] on a blocking thread with
+//! the quarantine path. This function opens one [`QuarantinedFile`] and
+//! threads it through [`PackageValidator::validate`], so hashing,
+//! inspection, and manifest reads share the same handle — never a reopened
+//! attacker-controlled path. Staged extraction with per-file byte agreement
+//! and artifact-store promotion land here once `storage::staging` is real;
+//! until then the verdict binds the exact validated bytes via the outer
+//! digest plus inventory set-equality.
 
 use std::path::Path;
 
 use crate::application::validate_package::{PackageValidator, ValidatedPackage, ValidationError};
+use crate::packages::archive::QuarantinedFile;
 use crate::packages::signature::PackageSignature;
 
 /// Runs the ingestion workflow end to end and returns the validation
 /// verdict: artifact identity, validated manifest, and authorizing signer.
 ///
 /// `archive_path` must be a private quarantine file the server wrote, not a
-/// client-supplied path. Stages and their order are fixed by
-/// [`PackageValidator`]; this function only sequences quarantine →
-/// validation and emits the audit record.
+/// client-supplied path. Opens one quarantine handle and sequences
+/// quarantine → validation → audit. Stages and their order are fixed by
+/// [`PackageValidator`].
 pub fn run_upload_workflow(
     validator: &PackageValidator,
     archive_path: &Path,
     signature: &PackageSignature,
 ) -> Result<ValidatedPackage, ValidationError> {
-    let verdict = validator.validate(archive_path, signature)?;
+    let mut quarantined =
+        QuarantinedFile::open(archive_path).map_err(ValidationError::Archive)?;
+    let verdict = validator.validate(&mut quarantined, signature)?;
     tracing::info!(
         module_id = verdict.artifact().module_id(),
         version = verdict.artifact().version(),
@@ -91,9 +99,7 @@ mod tests {
 
         let digest: [u8; 32] = crate::packages::digest::Sha256DigestProvider
             .digest(&bytes)
-            .expect("hashing must succeed")
-            .try_into()
-            .expect("SHA-256 is 32 bytes");
+            .expect("hashing must succeed");
         let signature = signing.sign(&canonical_payload(&digest));
         let envelope = PackageSignature {
             format_version: SUPPORTED_SIGNATURE_FORMAT_VERSION,

@@ -36,15 +36,13 @@
 //! build a new immutable validator and publish it atomically so one
 //! validation never observes a policy halfway through a reload.
 
-use std::fs::File;
 use std::io::Seek as _;
-use std::path::Path;
 use thiserror::Error;
 
-use crate::packages::archive::{ArchiveError, ZipArchiveReader};
+use crate::packages::archive::{ArchiveError, QuarantinedFile, ZipArchiveReader};
 use crate::packages::artifact::{ArtifactDigest, ValidatedArtifact};
 use crate::packages::digest::{DigestError, Sha256DigestProvider};
-use crate::packages::inventory::{check_inventory, InventoryError};
+use crate::packages::inventory::{check_against_inspected, InventoryError};
 use crate::packages::manifest::{Manifest, ManifestError, MANIFEST_FILE_NAME};
 use crate::packages::policy::{PackageValidationPolicy, PolicyError};
 use crate::packages::signature::{
@@ -84,46 +82,55 @@ impl PackageValidator {
         &self.policy
     }
 
+    /// Test-only access to the signature verifier. Production code must go
+    /// through [`PackageValidator::validate`]; no caller may reassemble
+    /// stages out of order.
+    #[cfg(test)]
     #[must_use]
     pub fn signature_verifier(&self) -> &Ed25519Verifier {
         &self.signature_verifier
     }
 
+    /// Test-only access to the trust store.
+    #[cfg(test)]
     #[must_use]
     pub fn trusted_keys(&self) -> &ConfiguredTrustedKeys {
         &self.trusted_keys
     }
 
+    /// Test-only access to the digest backend.
+    #[cfg(test)]
     #[must_use]
     pub fn digest(&self) -> &Sha256DigestProvider {
         &self.digest
     }
 
-    /// Fixed-order validation over one open handle: policy gate →
-    /// hash-and-authenticate → inspect → manifest/inventory → promotion.
+    /// Fixed-order validation over one open quarantine handle: policy gate
+    /// → hash-and-authenticate → inspect → manifest/inventory → promotion.
     /// Returns the complete [`ValidatedPackage`] verdict on success.
+    ///
+    /// Takes `&mut QuarantinedFile` — not a path — so hashing, inspection,
+    /// and manifest reads are forced onto the same bytes. Open the handle
+    /// with [`QuarantinedFile::open`] in [`crate::application::upload_package::run_upload_workflow`].
     pub fn validate(
         &self,
-        archive: &Path,
+        file: &mut QuarantinedFile,
         signature: &PackageSignature,
     ) -> Result<ValidatedPackage, ValidationError> {
         self.policy.ensure_production_ingest()?;
-        let mut file = File::open(archive)
-            .map_err(|e| ValidationError::Archive(ArchiveError::Io(e.to_string())))?;
         // Bound the work before hashing: the on-disk length is the one
         // authoritative "compressed bytes" figure available without parsing,
         // so an oversized upload is rejected before any digest or signature
         // work. Inspection re-checks the exact per-entry totals later.
         let on_disk = file
-            .metadata()
-            .map_err(|e| ValidationError::Archive(ArchiveError::Io(e.to_string())))?
-            .len();
+            .len()
+            .map_err(|e| ValidationError::Archive(ArchiveError::Io(e.to_string())))?;
         if on_disk > self.policy.archive.max_compressed_bytes {
             return Err(ValidationError::Archive(ArchiveError::LimitExceeded(
                 "archive size exceeds bound",
             )));
         }
-        let digest = self.digest.digest_stream(&mut file)?;
+        let digest = self.digest.digest_stream(&mut *file)?;
         let signer = self.signature_verifier.authenticate(
             signature,
             &digest,
@@ -134,7 +141,7 @@ impl PackageValidator {
             .map_err(|e| ValidationError::Archive(ArchiveError::Io(e.to_string())))?;
         let inspected = self
             .archive_reader
-            .inspect_file(&mut file, &self.policy.scan_config())?;
+            .inspect_file(file, &self.policy.scan_config())?;
         if !inspected.files.iter().any(|f| f == MANIFEST_FILE_NAME) {
             return Err(ValidationError::Inventory(InventoryError::MissingFile(
                 MANIFEST_FILE_NAME.to_owned(),
@@ -144,11 +151,7 @@ impl PackageValidator {
             .map_err(|e| ValidationError::Archive(ArchiveError::Io(e.to_string())))?;
         let manifest_bytes = self
             .archive_reader
-            .read_file_from(
-                &mut file,
-                MANIFEST_FILE_NAME,
-                self.policy.max_manifest_bytes,
-            )
+            .read_file_from(file, MANIFEST_FILE_NAME, self.policy.max_manifest_bytes)
             .map_err(|e| match e {
                 // This call reads only the manifest, so a bound breach here
                 // is the manifest bound, not a generic archive limit.
@@ -157,17 +160,19 @@ impl PackageValidator {
                 }
                 other => ValidationError::Archive(other),
             })?;
-        let manifest = Manifest::parse_bounded(
-            &manifest_bytes,
-            self.policy.max_manifest_bytes,
-            &self.policy.allowed_manifest_versions,
-        )?;
-        let payload: Vec<String> = inspected
-            .files
-            .into_iter()
-            .filter(|f| f != MANIFEST_FILE_NAME)
-            .collect();
-        check_inventory(&manifest.declared_files(), &payload)?;
+        let manifest = Manifest::parse_with_policy(&manifest_bytes, &self.policy)?;
+        // Inventory compares declared payload files against the inspected
+        // listing minus the manifest itself (required separately above,
+        // never listed in `files`).
+        let payload = crate::packages::archive::InspectedArchive::new(
+            inspected.entry_count,
+            inspected
+                .files
+                .into_iter()
+                .filter(|f| f != MANIFEST_FILE_NAME)
+                .collect(),
+        );
+        check_against_inspected(&manifest.declared_files(), &payload)?;
         let artifact = ValidatedArtifact::new(
             ArtifactDigest::new(digest),
             manifest.module_id.clone(),
@@ -189,7 +194,9 @@ pub struct ValidatedPackage {
 }
 
 impl ValidatedPackage {
-    pub(crate) fn new(
+    /// Mints the promotion verdict. Private to this module so only
+    /// [`PackageValidator::validate`] can construct it.
+    fn new(
         artifact: ValidatedArtifact,
         manifest: Manifest,
         signer: TrustedSigningKey,
@@ -314,24 +321,23 @@ mod tests {
 
     #[test]
     fn missing_archive_fails_before_signature_stage() {
-        use crate::packages::signature::SUPPORTED_SIGNATURE_FORMAT_VERSION;
+        use crate::packages::archive::QuarantinedFile;
 
         let validator = test_validator(PackageValidationPolicy::production());
         assert!(validator.policy().require_signature);
         assert_eq!(validator.digest().algorithm(), DigestAlgorithm::Sha256);
-        let envelope = PackageSignature {
-            format_version: SUPPORTED_SIGNATURE_FORMAT_VERSION,
-            key_id: "k1".to_owned(),
-            signature: vec![0u8; 64],
-        };
-        let err = validator
-            .validate(Path::new("pkg.zip"), &envelope)
-            .unwrap_err();
-        assert!(matches!(err, ValidationError::Archive(_)));
+        // The quarantine handle itself fails to open — validation never
+        // reaches the signature stage.
+        let open = QuarantinedFile::open(std::path::Path::new("pkg.zip"));
+        assert!(matches!(
+            open,
+            Err(crate::packages::archive::ArchiveError::Io(_))
+        ));
     }
 
     #[test]
     fn unsigned_config_rejected_before_archive_stage() {
+        use crate::packages::archive::QuarantinedFile;
         use crate::packages::signature::SUPPORTED_SIGNATURE_FORMAT_VERSION;
 
         let mut policy = PackageValidationPolicy::production();
@@ -342,9 +348,18 @@ mod tests {
             key_id: "k1".to_owned(),
             signature: vec![0u8; 64],
         };
-        let err = validator
-            .validate(Path::new("pkg.zip"), &envelope)
-            .unwrap_err();
+        // Policy gate runs before any handle use; contents do not matter.
+        let dir = std::env::temp_dir().join(format!(
+            "conductor-validate-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir must be created");
+        let path = dir.join("empty.zip");
+        std::fs::write(&path, b"").expect("temp file must be writable");
+        let mut quarantined =
+            QuarantinedFile::open(&path).expect("temp quarantine must open");
+        let err = validator.validate(&mut quarantined, &envelope).unwrap_err();
+        let _ = std::fs::remove_file(&path);
         assert!(matches!(err, ValidationError::Policy(_)));
     }
 

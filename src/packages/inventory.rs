@@ -11,7 +11,7 @@
 
 use thiserror::Error;
 
-use super::archive::{check_entry_path, ArchiveError};
+use super::archive::{check_entry_path, ArchiveError, InspectedArchive};
 
 /// A file the manifest declares must be in the package. Sourced from
 /// manifest parsing once the schema lands; defined here because inventory
@@ -40,6 +40,18 @@ pub enum InventoryError {
     DuplicateDeclaration(String),
     #[error("invalid declared path: {0}")]
     DeclaredPath(#[from] ArchiveError),
+}
+
+/// Compares manifest-declared files against one inspection run. Takes the
+/// [`InspectedArchive`] itself — not a detached file list — so the
+/// inventory can only run against normalized output of the archive stage.
+/// Prefer this on the production path; [`check_inventory`] remains for
+/// unit tests over synthetic listings.
+pub fn check_against_inspected(
+    declared: &[DeclaredFile],
+    inspected: &InspectedArchive,
+) -> Result<(), InventoryError> {
+    check_inventory(declared, &inspected.files)
 }
 
 /// Compares manifest-declared files against normalized actual archive

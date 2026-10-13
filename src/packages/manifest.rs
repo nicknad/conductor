@@ -28,6 +28,7 @@
 use thiserror::Error;
 
 use crate::packages::inventory::DeclaredFile;
+use crate::packages::policy::PackageValidationPolicy;
 
 /// Name of the manifest file at the archive root. Required in every
 /// package; never listed in `files`.
@@ -60,6 +61,21 @@ struct RawManifest {
 }
 
 impl Manifest {
+    /// Parses bounded input against the validation policy: byte bound and
+    /// schema-version allowlist come from one policy snapshot so callers
+    /// cannot mix mismatched bounds. Prefer this over [`Manifest::parse_bounded`]
+    /// on the production path.
+    pub fn parse_with_policy(
+        bytes: &[u8],
+        policy: &PackageValidationPolicy,
+    ) -> Result<Self, ManifestError> {
+        Self::parse_bounded(
+            bytes,
+            policy.max_manifest_bytes,
+            &policy.allowed_manifest_versions,
+        )
+    }
+
     /// Parses bounded input, gates the schema version against the policy
     /// allowlist, and checks required-field shape. `module_id` and
     /// `version` are additionally constrained to path-safe identity

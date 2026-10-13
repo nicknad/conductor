@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use conductor::application::validate_package::{
     BuildError, PackageValidationBuilder, PackageValidator, ValidationError,
 };
-use conductor::packages::archive::ArchiveError;
+use conductor::packages::archive::{ArchiveError, QuarantinedFile};
 use conductor::packages::artifact::ArtifactDigest;
 use conductor::packages::digest::Sha256DigestProvider;
 use conductor::packages::manifest::{Manifest, ManifestError};
@@ -72,22 +72,28 @@ fn unsigned_config_rejected_before_archive_stage() {
         .trusted_keys(test_keys())
         .build()
         .expect("test validator must build");
+    // Policy gate runs before any handle use; write a dummy file so the
+    // handle opens, then expect the policy rejection.
+    let package = TempPackage::write(b"dummy", "unsigned");
+    let mut quarantined =
+        QuarantinedFile::open(package.path()).expect("temp quarantine must open");
     assert!(matches!(
-        validator.validate(Path::new("pkg.zip"), &dummy_envelope()),
+        validator.validate(&mut quarantined, &dummy_envelope()),
         Err(ValidationError::Policy(_))
     ));
 }
 
 #[test]
 fn missing_archive_fails_before_signature_stage() {
-    let validator = PackageValidationBuilder::new(PackageValidationPolicy::production())
+    let _validator = PackageValidationBuilder::new(PackageValidationPolicy::production())
         .trusted_keys(test_keys())
         .build()
         .expect("test validator must build");
-    assert!(validator.trusted_keys().key("k1").is_some());
+    // The quarantine handle itself fails to open — validation never reaches
+    // the signature stage. Trust is configured by value at build time.
     assert!(matches!(
-        validator.validate(Path::new("pkg.zip"), &dummy_envelope()),
-        Err(ValidationError::Archive(_))
+        QuarantinedFile::open(Path::new("pkg.zip")),
+        Err(ArchiveError::Io(_))
     ));
 }
 
@@ -108,7 +114,7 @@ fn oversized_archive_is_rejected_before_digest_and_signature() {
         signature: vec![0u8; 64],
     };
     assert!(matches!(
-        validator.validate(package.path(), &envelope),
+        validate_path(&validator, package.path(), &envelope),
         Err(ValidationError::Archive(ArchiveError::LimitExceeded(_)))
     ));
 }
@@ -165,6 +171,20 @@ impl Drop for TempPackage {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// Opens `path` as a quarantine handle and runs the fixed validation order.
+/// Every test threads one handle — never a bare path — mirroring production.
+fn validate_path(
+    validator: &PackageValidator,
+    path: &Path,
+    envelope: &PackageSignature,
+) -> Result<
+    conductor::application::validate_package::ValidatedPackage,
+    ValidationError,
+> {
+    let mut quarantined = QuarantinedFile::open(path).expect("temp quarantine must open");
+    validator.validate(&mut quarantined, envelope)
 }
 
 fn golden_package_bytes() -> Vec<u8> {
@@ -245,9 +265,7 @@ fn sign_package(signing: &ed25519_dalek::SigningKey, bytes: &[u8]) -> (PackageSi
 
     let digest: [u8; 32] = Sha256DigestProvider
         .digest(bytes)
-        .expect("hashing must succeed")
-        .try_into()
-        .expect("SHA-256 is 32 bytes");
+        .expect("hashing must succeed");
     let signature = signing.sign(&canonical_payload(&digest));
     (
         PackageSignature {
@@ -273,8 +291,7 @@ fn golden_setup() -> (PackageValidator, Vec<u8>, PackageSignature) {
 fn valid_signed_package_mints_artifact_bound_to_exact_bytes() {
     let (validator, bytes, envelope) = golden_setup();
     let package = TempPackage::write(&bytes, "valid");
-    let verdict = validator
-        .validate(package.path(), &envelope)
+    let verdict = validate_path(&validator, package.path(), &envelope)
         .expect("valid signed package must validate");
     assert_eq!(verdict.artifact().module_id(), "reporting-service");
     assert_eq!(verdict.artifact().version(), "1.2.0");
@@ -286,9 +303,7 @@ fn valid_signed_package_mints_artifact_bound_to_exact_bytes() {
     let expected = ArtifactDigest::new(
         Sha256DigestProvider
             .digest(&bytes)
-            .expect("hashing must succeed")
-            .try_into()
-            .expect("SHA-256 is 32 bytes"),
+            .expect("hashing must succeed"),
     );
     assert_eq!(verdict.artifact().digest(), &expected);
 }
@@ -302,7 +317,7 @@ fn tampered_bytes_fail_authentication_not_parsing() {
     // Authentication runs before inspection, so a one-bit flip is a
     // signature failure even though the ZIP is now also corrupt.
     assert!(matches!(
-        validator.validate(package.path(), &envelope),
+        validate_path(&validator, package.path(), &envelope),
         Err(ValidationError::Signature(_))
     ));
 }
@@ -317,7 +332,7 @@ fn unknown_signing_key_fails_before_crypto() {
         signature: vec![0u8; 64],
     };
     assert!(matches!(
-        validator.validate(package.path(), &envelope),
+        validate_path(&validator, package.path(), &envelope),
         Err(ValidationError::Signature(_))
     ));
 }
@@ -341,7 +356,7 @@ fn package_without_manifest_fails_inventory() {
     let (envelope, _) = sign_package(&signing, &bytes);
     let package = TempPackage::write(&bytes, "no-manifest");
     assert!(matches!(
-        validator.validate(package.path(), &envelope),
+        validate_path(&validator, package.path(), &envelope),
         Err(ValidationError::Inventory(_))
     ));
 }
@@ -357,7 +372,7 @@ fn inventory_mismatches_fail_in_both_directions() {
     let (envelope, _) = sign_package(&signing, &bytes);
     let package = TempPackage::write(&bytes, "missing-file");
     assert!(matches!(
-        validator.validate(package.path(), &envelope),
+        validate_path(&validator, package.path(), &envelope),
         Err(ValidationError::Inventory(_))
     ));
     // Archive contains a file the manifest does not declare.
@@ -371,7 +386,7 @@ fn inventory_mismatches_fail_in_both_directions() {
     let (envelope, _) = sign_package(&signing, &bytes);
     let package = TempPackage::write(&bytes, "extra-file");
     assert!(matches!(
-        validator.validate(package.path(), &envelope),
+        validate_path(&validator, package.path(), &envelope),
         Err(ValidationError::Inventory(_))
     ));
 }
@@ -385,7 +400,7 @@ fn oversized_manifest_maps_to_manifest_bound() {
     let (envelope, _) = sign_package(&signing, &bytes);
     let package = TempPackage::write(&bytes, "big-manifest");
     assert!(matches!(
-        validator.validate(package.path(), &envelope),
+        validate_path(&validator, package.path(), &envelope),
         Err(ValidationError::Manifest(_))
     ));
 }
@@ -399,7 +414,7 @@ fn disallowed_manifest_version_is_rejected() {
     let (envelope, _) = sign_package(&signing, &bytes);
     let package = TempPackage::write(&bytes, "bad-version");
     assert!(matches!(
-        validator.validate(package.path(), &envelope),
+        validate_path(&validator, package.path(), &envelope),
         Err(ValidationError::Manifest(_))
     ));
 }

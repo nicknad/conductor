@@ -39,8 +39,8 @@ impl Sha256DigestProvider {
 
     /// Hashes `bytes` and returns the 32-byte digest. Pure computation over
     /// caller-held bytes — no I/O, no time limits needed.
-    pub fn digest(&self, bytes: &[u8]) -> Result<Vec<u8>, DigestError> {
-        Ok(Sha256::digest(bytes).to_vec())
+    pub fn digest(&self, bytes: &[u8]) -> Result<[u8; 32], DigestError> {
+        Ok(Sha256::digest(bytes).into())
     }
 
     /// Streams `reader` into SHA-256 and returns the 32-byte digest without
