@@ -2,8 +2,6 @@
 //! or activates modules directly.
 
 pub mod errors;
-pub mod middleware;
-pub mod rejection;
 pub mod routes;
 pub mod uploads;
 

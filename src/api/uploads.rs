@@ -34,11 +34,10 @@
 //! (synchronous file I/O and registry state) under the configured request
 //! timeout.
 //!
-//! Every refusal is recorded exactly once as a structured
-//! [`RejectionEvent`](crate::audit::event::RejectionEvent): typed where the
-//! handler or middleware still owns the error, generic for responses
-//! produced by transport layers (timeouts, body limits, panics). Status
-//! codes and bodies are unchanged by recording.
+//! Every refusal is recorded once as a structured
+//! [`RejectionEvent`](crate::audit::event::RejectionEvent) via the
+//! tracing-only recorder. Status codes and bodies are unchanged by
+//! recording.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -55,10 +54,10 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::sync::Semaphore;
 
 use crate::api::errors::ApiError;
-use crate::api::rejection::{request_id, Rejection};
+use crate::audit::event::{RejectionEvent, RejectionStage};
 use crate::audit::recorder::RejectionRecorder;
 use crate::control_plane::upload_package::run_upload_workflow;
-use crate::control_plane::validate_package::PackageValidator;
+use crate::control_plane::validate_package::{PackageValidator, ValidationError};
 use crate::modules::registry::{ModuleRegistry, RegistryError};
 use crate::packages::signature::{PackageSignature, SUPPORTED_SIGNATURE_FORMAT_VERSION};
 use crate::storage::artifact_store::PromoteError;
@@ -122,10 +121,8 @@ pub struct AppState {
     /// Module registry: versions already accepted. A version re-registered
     /// with different bytes is a conflict, never an overwrite.
     pub registry: Arc<ModuleRegistry>,
-    /// Structured rejection recorder: every refused upload produces exactly
-    /// one tracing event plus, when a store is attached, at most one
-    /// `package_rejections` row (best-effort; store failures never alter
-    /// the response).
+    /// Structured rejection recorder: every refused upload produces one
+    /// tracing event (best-effort; never alters the response).
     pub recorder: Arc<RejectionRecorder>,
     pub request_timeout: Duration,
     pub api_token: ApiToken,
@@ -150,11 +147,92 @@ pub struct UploadResponse {
     pub signer_key_id: String,
 }
 
+/// Server-issued request id (`x-request-id`), for incident correlation.
+/// Absent when the request-id layer has not run (tests calling the handler
+/// directly).
+fn request_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// Pipeline stage for a validation failure, for audit attribution.
+fn validation_stage(err: &ValidationError) -> RejectionStage {
+    match err {
+        ValidationError::Policy(_) => RejectionStage::Policy,
+        ValidationError::Archive(_) => RejectionStage::Archive,
+        ValidationError::Digest(_) => RejectionStage::Digest,
+        ValidationError::Signature(_) => RejectionStage::Signature,
+        ValidationError::Manifest(_) => RejectionStage::Manifest,
+        ValidationError::Inventory(_) => RejectionStage::Inventory,
+    }
+}
+
+/// Records one rejection event and returns the caller-facing response.
+/// `detail` defaults to the caller message when no more specific internal
+/// reason exists (validation sites pass `err.to_string()` instead, so the
+/// event keeps e.g. the unknown key id while the body stays generic).
+fn reject(
+    recorder: &RejectionRecorder,
+    request_id: Option<String>,
+    stage: RejectionStage,
+    api: ApiError,
+    detail: Option<String>,
+    key_id: Option<&str>,
+    byte_count: Option<u64>,
+) -> Response {
+    let code = api.code();
+    let detail = detail.unwrap_or_else(|| api.message().to_owned());
+    recorder.record(
+        &RejectionEvent::new(stage, code, detail)
+            .with_request_id(request_id)
+            .with_key_id(key_id.map(str::to_owned))
+            .with_byte_count(byte_count),
+    );
+    api.into_response()
+}
+
+/// A failed upload: the caller-facing error plus the audit facts known at
+/// the failure site. Converted once into a recorded response by
+/// [`post_package`].
+struct UploadFailure {
+    api: ApiError,
+    stage: RejectionStage,
+    detail: String,
+    key_id: Option<String>,
+    byte_count: Option<u64>,
+}
+
+impl UploadFailure {
+    fn from_api(stage: RejectionStage, api: ApiError) -> Box<Self> {
+        let detail = api.message().to_owned();
+        Box::new(Self {
+            api,
+            stage,
+            detail,
+            key_id: None,
+            byte_count: None,
+        })
+    }
+
+    fn respond(self, recorder: &RejectionRecorder, request_id: Option<String>) -> Response {
+        reject(
+            recorder,
+            request_id,
+            self.stage,
+            self.api,
+            Some(self.detail),
+            self.key_id.as_deref(),
+            self.byte_count,
+        )
+    }
+}
+
 /// Transport authentication: every `/v1` request must carry the operator
 /// bearer token. Missing, malformed, and wrong tokens get the identical
 /// `401` — no oracle distinguishing them. Package-signature authentication
 /// happens later inside validation; this layer only decides who may ask.
-/// Rejections are recorded as typed transport events.
 pub async fn require_bearer(
     State(state): State<AppState>,
     request: Request,
@@ -174,7 +252,15 @@ pub async fn require_bearer(
                 message: "valid bearer token required".to_owned(),
                 challenge: "Bearer realm=\"package-upload\"",
             };
-            Rejection::from_api(api).into_recorded_response(&state.recorder, id)
+            reject(
+                &state.recorder,
+                id,
+                RejectionStage::Transport,
+                api,
+                None,
+                None,
+                None,
+            )
         }
     }
 }
@@ -219,8 +305,8 @@ impl RateFloor {
 
 /// Pure rate-floor predicate: true once past `grace` when `bytes` averages
 /// below `min_rate`. `u128` arithmetic cannot overflow (`u64` rate times
-/// nanosecond elapsed). Separated from the middleware so tests prove the
-/// exact boundary without sleeping.
+/// nanosecond elapsed). Separated out so tests prove the exact boundary
+/// without sleeping.
 fn rate_floor_tripped(bytes: u64, elapsed: Duration, min_rate: u64, grace: Duration) -> bool {
     if min_rate == 0 || elapsed < grace {
         return false;
@@ -232,8 +318,8 @@ fn rate_floor_tripped(bytes: u64, elapsed: Duration, min_rate: u64, grace: Durat
 /// registers the module version. See the module docs for field layout and
 /// limits.
 ///
-/// Returns the response directly: every failure becomes a [`Rejection`],
-/// so no path can escape unrecorded.
+/// Returns the response directly: every failure is recorded as a tracing
+/// event before responding.
 #[tracing::instrument(
     name = "upload_package",
     skip(state, headers, multipart),
@@ -247,20 +333,28 @@ pub async fn post_package(
     let id = request_id(&headers);
     match process_upload(&state, multipart).await {
         Ok(response) => response,
-        Err(rejection) => rejection.into_recorded_response(&state.recorder, id),
+        Err(failure) => (*failure).respond(&state.recorder, id),
     }
 }
 
-/// The upload pipeline. Every failure returns a [`Rejection`] carrying the
-/// caller-facing error plus the audit evidence; recording and response
+/// The upload pipeline. Every failure returns the caller-facing error plus
+/// the audit facts known at the failure site; recording and response
 /// conversion happen once in [`post_package`].
-async fn process_upload(state: &AppState, mut multipart: Multipart) -> Result<Response, Rejection> {
+async fn process_upload(
+    state: &AppState,
+    mut multipart: Multipart,
+) -> Result<Response, Box<UploadFailure>> {
     // Shed load before touching the body: no permit means the server is
     // already at its upload bound.
     let _permit = Arc::clone(&state.upload_slots)
         .try_acquire_owned()
         .map_err(|_| {
-            ApiError::Overloaded("server is at its concurrent-upload bound; retry later".to_owned())
+            UploadFailure::from_api(
+                RejectionStage::Transport,
+                ApiError::Overloaded(
+                    "server is at its concurrent-upload bound; retry later".to_owned(),
+                ),
+            )
         })?;
 
     let max_bytes = state.validator.policy().archive.max_compressed_bytes;
@@ -279,33 +373,51 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Result<Re
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| ApiError::BadRequest("invalid_multipart", e.to_string()))?
-    {
+        .map_err(|e| {
+            UploadFailure::from_api(
+                RejectionStage::Multipart,
+                ApiError::BadRequest("invalid_multipart", e.to_string()),
+            )
+        })? {
         field_count += 1;
         if field_count > MAX_FORM_FIELDS {
-            return Err(ApiError::BadRequest(
-                "too_many_fields",
-                format!("multipart body exceeds {MAX_FORM_FIELDS} fields"),
-            )
-            .into());
+            return Err(UploadFailure::from_api(
+                RejectionStage::Multipart,
+                ApiError::BadRequest(
+                    "too_many_fields",
+                    format!("multipart body exceeds {MAX_FORM_FIELDS} fields"),
+                ),
+            ));
         }
         let name = field.name().unwrap_or_default().to_owned();
         match name.as_str() {
             "package" => {
                 if quarantine.contains() {
-                    return Err(ApiError::BadRequest(
-                        "duplicate_package_field",
-                        "only one package field is accepted".to_owned(),
-                    )
-                    .into());
+                    return Err(UploadFailure::from_api(
+                        RejectionStage::Multipart,
+                        ApiError::BadRequest(
+                            "duplicate_package_field",
+                            "only one package field is accepted".to_owned(),
+                        ),
+                    ));
                 }
                 let (path, std_file) = tokio::task::spawn_blocking({
                     let dir = state.quarantine_dir.clone();
                     move || crate::storage::quarantine::create_file(&dir)
                 })
                 .await
-                .map_err(|e| ApiError::Internal(format!("quarantine join failed: {e}")))?
-                .map_err(|e| ApiError::Internal(format!("quarantine failed: {e}")))?;
+                .map_err(|e| {
+                    UploadFailure::from_api(
+                        RejectionStage::Internal,
+                        ApiError::Internal(format!("quarantine join failed: {e}")),
+                    )
+                })?
+                .map_err(|e| {
+                    UploadFailure::from_api(
+                        RejectionStage::Internal,
+                        ApiError::Internal(format!("quarantine failed: {e}")),
+                    )
+                })?;
                 let file = tokio::fs::File::from_std(std_file);
                 let mut field = field;
                 // Owned from creation: any error below — streaming,
@@ -314,19 +426,24 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Result<Re
                 // every failure path (Windows cannot remove an open
                 // file); deletion itself is the guard's job.
                 quarantine.store(path);
-                let received =
-                    stream_package_to_quarantine(&mut field, file, max_bytes, &mut rate).await?;
+                let received = stream_package_to_quarantine(&mut field, file, max_bytes, &mut rate)
+                    .await
+                    .map_err(|e| UploadFailure::from_api(RejectionStage::Streaming, e))?;
                 package_bytes = Some(received);
                 tracing::Span::current().record("package_bytes", received);
             }
             "key_id" => {
-                key_id =
-                    Some(read_text_capped(field, MAX_KEY_ID_BYTES, "key_id", &mut rate).await?);
+                key_id = Some(
+                    read_text_capped(field, MAX_KEY_ID_BYTES, "key_id", &mut rate)
+                        .await
+                        .map_err(|e| UploadFailure::from_api(RejectionStage::Multipart, e))?,
+                );
             }
             "signature" => {
                 signature_text = Some(
                     read_text_capped(field, MAX_SIGNATURE_TEXT_BYTES, "signature", &mut rate)
-                        .await?,
+                        .await
+                        .map_err(|e| UploadFailure::from_api(RejectionStage::Multipart, e))?,
                 );
             }
             "format_version" => {
@@ -336,11 +453,15 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Result<Re
                     "format_version",
                     &mut rate,
                 )
-                .await?;
+                .await
+                .map_err(|e| UploadFailure::from_api(RejectionStage::Multipart, e))?;
                 format_version = text.trim().parse::<u16>().map_err(|_| {
-                    ApiError::BadRequest(
-                        "invalid_format_version",
-                        format!("unsupported signature format version: {text:?}"),
+                    UploadFailure::from_api(
+                        RejectionStage::Multipart,
+                        ApiError::BadRequest(
+                            "invalid_format_version",
+                            format!("unsupported signature format version: {text:?}"),
+                        ),
                     )
                 })?;
             }
@@ -352,9 +473,16 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Result<Re
                 while let Some(chunk) = field
                     .chunk()
                     .await
-                    .map_err(|e| ApiError::BadRequest("invalid_multipart", e.to_string()))?
+                    .map_err(|e| {
+                        UploadFailure::from_api(
+                            RejectionStage::Multipart,
+                            ApiError::BadRequest("invalid_multipart", e.to_string()),
+                        )
+                    })?
                 {
-                    rate.note(chunk.len())?;
+                    rate.note(chunk.len()).map_err(|e| {
+                        UploadFailure::from_api(RejectionStage::Streaming, e)
+                    })?;
                 }
             }
         }
@@ -364,30 +492,42 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Result<Re
     // writer still attached. `keep` disarms the guard: from here on the
     // file is deleted explicitly on failure and kept on success.
     let path = quarantine.keep().ok_or_else(|| {
-        ApiError::BadRequest(
-            "missing_package",
-            "multipart field `package` is required".to_owned(),
+        UploadFailure::from_api(
+            RejectionStage::Multipart,
+            ApiError::BadRequest(
+                "missing_package",
+                "multipart field `package` is required".to_owned(),
+            ),
         )
     })?;
     let key_id = key_id
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            ApiError::BadRequest(
-                "missing_key_id",
-                "multipart field `key_id` is required".to_owned(),
+            UploadFailure::from_api(
+                RejectionStage::Multipart,
+                ApiError::BadRequest(
+                    "missing_key_id",
+                    "multipart field `key_id` is required".to_owned(),
+                ),
             )
         })?;
     let signature_text = signature_text.ok_or_else(|| {
-        ApiError::BadRequest(
-            "missing_signature",
-            "multipart field `signature` is required".to_owned(),
+        UploadFailure::from_api(
+            RejectionStage::Multipart,
+            ApiError::BadRequest(
+                "missing_signature",
+                "multipart field `signature` is required".to_owned(),
+            ),
         )
     })?;
     let signature_bytes = BASE64_STANDARD.decode(signature_text.trim()).map_err(|e| {
-        ApiError::BadRequest(
-            "invalid_signature_encoding",
-            format!("signature is not valid base64: {e}"),
+        UploadFailure::from_api(
+            RejectionStage::Multipart,
+            ApiError::BadRequest(
+                "invalid_signature_encoding",
+                format!("signature is not valid base64: {e}"),
+            ),
         )
     })?;
     let audit_key_id = key_id.clone();
@@ -406,11 +546,21 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Result<Re
     let audit_bytes = package_bytes;
     let outcome = tokio::time::timeout(
         timeout,
-        tokio::task::spawn_blocking(move || -> Result<_, Rejection> {
-            let verdict = run_upload_workflow(&validator, &blocking_path, &envelope)
-                .map_err(Rejection::from_validation)
-                .map_err(|rejection| {
-                    rejection.with_upload(Some(audit_key_id.as_str()), audit_bytes)
+        tokio::task::spawn_blocking(move || -> Result<_, Box<UploadFailure>> {
+            let audit_key = audit_key_id.clone();
+            let bytes = audit_bytes;
+            let verdict =
+                run_upload_workflow(&validator, &blocking_path, &envelope).map_err(|err| {
+                    let stage = validation_stage(&err);
+                    let detail = err.to_string();
+                    let api = ApiError::from(err);
+                    Box::new(UploadFailure {
+                        api,
+                        stage,
+                        detail,
+                        key_id: Some(audit_key.clone()),
+                        byte_count: bytes,
+                    })
                 })?;
             crate::storage::artifact_store::promote_quarantined(
                 &artifact_dir,
@@ -427,9 +577,14 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Result<Re
                         ApiError::Internal(format!("artifact promotion failed: {message}"))
                     }
                 };
-                Rejection::from_api(api)
-                    .with_upload(Some(audit_key_id.as_str()), audit_bytes)
-                    .with_artifact(verdict.artifact())
+                let detail = api.message().to_owned();
+                Box::new(UploadFailure {
+                    api,
+                    stage: RejectionStage::Promotion,
+                    detail,
+                    key_id: Some(audit_key.clone()),
+                    byte_count: bytes,
+                })
             })?;
             // The registry records the promoted artifact's relative address
             // for reconciliation; the layout is owned by the artifact store.
@@ -447,17 +602,24 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Result<Re
             ) {
                 Ok(_) => Ok(verdict),
                 Err(err) => {
-                    let api = match &err {
-                        RegistryError::VersionConflict { .. } => {
-                            ApiError::Conflict("version_conflict", err.to_string())
-                        }
-                        RegistryError::Storage(_) => {
-                            ApiError::Internal(format!("registry storage failed: {err}"))
-                        }
+                    let (stage, api) = match &err {
+                        RegistryError::VersionConflict { .. } => (
+                            RejectionStage::Registration,
+                            ApiError::Conflict("version_conflict", err.to_string()),
+                        ),
+                        RegistryError::Storage(_) => (
+                            RejectionStage::Internal,
+                            ApiError::Internal(format!("registry storage failed: {err}")),
+                        ),
                     };
-                    Err(Rejection::from_api(api)
-                        .with_upload(Some(audit_key_id.as_str()), audit_bytes)
-                        .with_artifact(verdict.artifact()))
+                    let detail = api.message().to_owned();
+                    Err(Box::new(UploadFailure {
+                        api,
+                        stage,
+                        detail,
+                        key_id: Some(audit_key.clone()),
+                        byte_count: bytes,
+                    }))
                 }
             }
         }),
@@ -465,12 +627,26 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Result<Re
     .await
     .map_err(|_| {
         crate::storage::quarantine::discard(&path);
-        Rejection::from_api(ApiError::Timeout)
-            .with_upload(Some(audit_key_id_outer.as_str()), audit_bytes)
+        let api = ApiError::Timeout;
+        let detail = api.message().to_owned();
+        Box::new(UploadFailure {
+            api,
+            stage: RejectionStage::Transport,
+            detail,
+            key_id: Some(audit_key_id_outer.clone()),
+            byte_count: audit_bytes,
+        })
     })?
     .map_err(|e| {
-        Rejection::from_api(ApiError::Internal(format!("validation task failed: {e}")))
-            .with_upload(Some(audit_key_id_outer.as_str()), audit_bytes)
+        let api = ApiError::Internal(format!("validation task failed: {e}"));
+        let detail = api.message().to_owned();
+        Box::new(UploadFailure {
+            api,
+            stage: RejectionStage::Internal,
+            detail,
+            key_id: Some(audit_key_id_outer.clone()),
+            byte_count: audit_bytes,
+        })
     })?;
 
     match outcome {
@@ -484,12 +660,12 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Result<Re
             }),
         )
             .into_response()),
-        Err(rejection) => {
-            // Validation failures preserve their internal reason for the
-            // audit record; promotion failures already discarded their
+        Err(failure) => {
+            // Validation failures already carry their internal reason for
+            // the audit record; promotion failures already discarded their
             // quarantine file. Best-effort discard covers both (idempotent).
             crate::storage::quarantine::discard(&path);
-            Err(rejection)
+            Err(failure)
         }
     }
 }

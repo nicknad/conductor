@@ -47,8 +47,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// Serves `router` over TLS-only HTTP/1 until Ctrl-C or SIGTERM. There is
 /// deliberately no plaintext listener: `bind_rustls` is the only bind, and
 /// HSTS is emitted on every response (see the route table). Socket-level
-/// header bounds (`max_headers`, `max_buf_size`) back the middleware
-/// header caps so oversized head sections are rejected before buffering.
+/// header bounds (`max_headers`, `max_buf_size`) reject oversized head
+/// sections before buffering.
 pub async fn serve(
     router: axum::Router,
     bind: &str,
@@ -66,18 +66,12 @@ pub async fn serve(
         shutdown_handle.graceful_shutdown(Some(Duration::from_secs(30)));
     });
     tracing::info!(%addr, "conductor listening (TLS only, HTTP/1)");
-    // Socket-level header bounds back the middleware caps: oversized head
-    // sections get hyper's own 431 before buffering. `max_buf_size` panics
-    // below 8 KiB; ours is 16 KiB.
+    // Socket-level header bounds: oversized head sections get hyper's own
+    // 431 before buffering. `max_buf_size` panics below 8 KiB; ours is
+    // 16 KiB.
     let mut server = axum_server::bind_rustls(addr, tls);
-    server
-        .http_builder()
-        .http1()
-        .max_headers(crate::api::middleware::MAX_REQUEST_HEADERS);
-    server
-        .http_builder()
-        .http1()
-        .max_buf_size(crate::api::middleware::MAX_HEADER_BYTES * 2);
+    server.http_builder().http1().max_headers(32);
+    server.http_builder().http1().max_buf_size(16 * 1024);
     server
         .handle(handle)
         .http1_only()

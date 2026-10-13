@@ -7,10 +7,9 @@
 //! `tests/package_validation.rs`): it cannot drift from the schema.
 //!
 //! One test per hardening effort: bearer auth (missing/wrong), security
-//! response headers plus absent server identity, header-count and
-//! header-byte caps, form-field cap, concurrency bound, minimum upload
-//! speed, and TLS-only serving (see `tests/tls_only.rs` for the socket
-//! proof; HSTS is asserted here).
+//! response headers plus absent server identity, form-field cap,
+//! concurrency bound, minimum upload speed, and TLS-only serving (see
+//! `tests/tls_only.rs` for the socket proof; HSTS is asserted here).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -23,7 +22,6 @@ use bytes::Bytes;
 use conductor::api::routes::router;
 use conductor::api::uploads::{ApiToken, AppState};
 use conductor::audit::recorder::RejectionRecorder;
-use conductor::audit::store::RejectionStore;
 use conductor::control_plane::validate_package::PackageValidationBuilder;
 use conductor::modules::registry::ModuleRegistry;
 use conductor::packages::artifact::ArtifactDigest;
@@ -69,17 +67,12 @@ fn test_state(policy: PackageValidationPolicy, tag: &str) -> AppState {
     ));
     std::fs::create_dir_all(&quarantine_dir).expect("quarantine dir must be created");
     std::fs::create_dir_all(&artifact_dir).expect("artifact dir must be created");
-    // Durable rejection sink: a private in-memory store per test so rows
-    // can be asserted without sharing state. Recorder failures stay
-    // invisible to the response path by contract.
-    let rejection_store =
-        Arc::new(RejectionStore::open_in_memory().expect("rejection store must open"));
     AppState {
         validator: Arc::new(validator),
         quarantine_dir,
         artifact_dir,
         registry: Arc::new(ModuleRegistry::new()),
-        recorder: Arc::new(RejectionRecorder::with_store(rejection_store)),
+        recorder: Arc::new(RejectionRecorder::new()),
         request_timeout: Duration::from_secs(10),
         api_token: ApiToken::new("test-bearer-upload"),
         upload_slots: Arc::new(Semaphore::new(8)),
@@ -585,43 +578,6 @@ fn assert_security_headers(headers: &HeaderMap) {
 }
 
 #[tokio::test]
-async fn too_many_headers_rejected_with_431() {
-    let state = test_state(PackageValidationPolicy::production(), "many-headers");
-    // HeaderMap merges duplicates, so distinct names are needed to grow
-    // the count: 40 plus content-type and authorization exceeds the cap.
-    let distinct: Vec<(String, String)> = (0..40)
-        .map(|i| (format!("x-dummy-{i}"), "v".to_owned()))
-        .collect();
-    let leaked: Vec<(&str, String)> = distinct
-        .iter()
-        .map(|(name, value)| (name.as_str(), value.clone()))
-        .collect();
-    let (status, _, bytes) =
-        send_upload(&state, Body::empty(), Some("test-bearer-upload"), &leaked).await;
-    assert_eq!(status, StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
-    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("body must be JSON");
-    assert_eq!(json["code"], "headers_too_large");
-    cleanup(&state.quarantine_dir);
-}
-
-#[tokio::test]
-async fn oversized_headers_rejected_with_431() {
-    let state = test_state(PackageValidationPolicy::production(), "big-headers");
-    let big = "v".repeat(9_000);
-    let (status, _, bytes) = send_upload(
-        &state,
-        Body::empty(),
-        Some("test-bearer-upload"),
-        &[("x-big", big)],
-    )
-    .await;
-    assert_eq!(status, StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
-    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("body must be JSON");
-    assert_eq!(json["code"], "headers_too_large");
-    cleanup(&state.quarantine_dir);
-}
-
-#[tokio::test]
 async fn too_many_form_fields_rejected() {
     let state = test_state(PackageValidationPolicy::production(), "many-fields");
     let package = golden_package_bytes();
@@ -763,94 +719,4 @@ async fn malformed_multipart_body_records_one_typed_event() {
     assert!(events.contains("stage=\"multipart\""), "{events}");
     assert!(events.contains("code=\"invalid_multipart\""), "{events}");
     cleanup(&state.quarantine_dir);
-}
-
-#[tokio::test]
-async fn non_multipart_content_type_records_one_generic_event() {
-    let state = test_state(PackageValidationPolicy::production(), "audit-fallback");
-    let (buffer, guard) = capture_rejection_events();
-    // The multipart extractor rejects before the handler runs, so no typed
-    // error exists; the transport fallback must record exactly one event.
-    let request = Request::builder()
-        .method("POST")
-        .uri("/v1/packages")
-        .header("content-type", "application/json")
-        .header("authorization", "Bearer test-bearer-upload")
-        .body(Body::from("{}"))
-        .expect("request must build");
-    let response = router(state.clone())
-        .oneshot(request)
-        .await
-        .expect("router must respond");
-    let status = response.status();
-    drop(guard);
-    assert!(status.is_client_error(), "unexpected status {status}");
-    let events = captured_events(&buffer);
-    assert_eq!(events.matches("package rejected").count(), 1, "{events}");
-    assert!(events.contains("stage=\"transport\""), "{events}");
-    assert!(
-        events.contains("code=\"unclassified_rejection\""),
-        "{events}"
-    );
-    cleanup(&state.quarantine_dir);
-}
-
-fn rejection_rows(state: &AppState) -> Vec<conductor::audit::store::StoredRejection> {
-    state
-        .recorder
-        .store()
-        .expect("test state must attach a rejection store")
-        .list()
-        .expect("rejection rows must read")
-}
-
-#[tokio::test]
-async fn version_conflict_persists_one_row_with_stage_code_and_attribution() {
-    let state = test_state(PackageValidationPolicy::production(), "rejection-row");
-    let package = golden_package_bytes();
-    let (first, _, _) = post_multipart(state.clone(), golden_body(&package)).await;
-    assert_eq!(first, StatusCode::CREATED);
-    // Same module_id+version, different payload: the version already means
-    // different bytes, so the upload is a 409 with an unchanged body.
-    let other = package_bytes_with_payload(b"different executable");
-    let (conflict, json, _) = post_multipart(state.clone(), golden_body(&other)).await;
-    assert_eq!(conflict, StatusCode::CONFLICT);
-    assert_eq!(json["code"], "version_conflict");
-    let rows = rejection_rows(&state);
-    assert_eq!(rows.len(), 1, "one rejection must persist exactly one row");
-    let row = &rows[0];
-    assert_eq!(row.stage, "registration");
-    assert_eq!(row.code, "version_conflict");
-    assert_eq!(row.module_id.as_deref(), Some("reporting-service"));
-    assert_eq!(row.version.as_deref(), Some("1.2.0"));
-    assert_eq!(row.key_id.as_deref(), Some("k1"));
-    assert_eq!(
-        row.digest.as_deref().map(str::len),
-        Some(64),
-        "digest attribution must survive once the digest stage was reached"
-    );
-    assert!(
-        row.byte_count.is_some(),
-        "streamed byte count must be attributed"
-    );
-    assert!(
-        !row.detail.is_empty(),
-        "the internal reason must be persisted"
-    );
-    cleanup(&state.quarantine_dir);
-    cleanup(&state.artifact_dir);
-}
-
-#[tokio::test]
-async fn accepted_upload_persists_no_rejection_row() {
-    let state = test_state(PackageValidationPolicy::production(), "accepted-no-row");
-    let package = golden_package_bytes();
-    let (status, _, _) = post_multipart(state.clone(), golden_body(&package)).await;
-    assert_eq!(status, StatusCode::CREATED);
-    assert!(
-        rejection_rows(&state).is_empty(),
-        "an accepted upload must leave the rejection table empty"
-    );
-    cleanup(&state.quarantine_dir);
-    cleanup(&state.artifact_dir);
 }

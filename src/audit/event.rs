@@ -58,8 +58,7 @@ impl RejectionStage {
 }
 
 /// One refusal of one upload. Built at the rejection site and recorded once
-/// (see `crate::api::rejection`); the same shape becomes a durable row in
-/// the persistence phase.
+/// via the tracing-only recorder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RejectionEvent {
     pub event_version: u16,
