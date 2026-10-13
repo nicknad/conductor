@@ -273,11 +273,16 @@ fn golden_setup() -> (PackageValidator, Vec<u8>, PackageSignature) {
 fn valid_signed_package_mints_artifact_bound_to_exact_bytes() {
     let (validator, bytes, envelope) = golden_setup();
     let package = TempPackage::write(&bytes, "valid");
-    let artifact = validator
+    let verdict = validator
         .validate(package.path(), &envelope)
         .expect("valid signed package must validate");
-    assert_eq!(artifact.module_id(), "reporting-service");
-    assert_eq!(artifact.version(), "1.2.0");
+    assert_eq!(verdict.artifact().module_id(), "reporting-service");
+    assert_eq!(verdict.artifact().version(), "1.2.0");
+    // The verdict carries the validated manifest and authorizing signer so
+    // registry/audit consumers never re-open or re-parse the archive.
+    assert_eq!(verdict.manifest().entrypoint, "payload/reporting-service");
+    assert_eq!(verdict.manifest().module_id, "reporting-service");
+    assert_eq!(verdict.signer().key_id, "k1");
     let expected = ArtifactDigest::new(
         Sha256DigestProvider
             .digest(&bytes)
@@ -285,7 +290,7 @@ fn valid_signed_package_mints_artifact_bound_to_exact_bytes() {
             .try_into()
             .expect("SHA-256 is 32 bytes"),
     );
-    assert_eq!(artifact.digest(), &expected);
+    assert_eq!(verdict.artifact().digest(), &expected);
 }
 
 #[test]

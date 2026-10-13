@@ -13,7 +13,8 @@
 //! 3. archive inspection of the same bytes under
 //!    [`PackageValidationPolicy::scan_config`](crate::packages::policy::PackageValidationPolicy::scan_config),
 //! 4. manifest parsing (bounded, version-gated) and inventory validation,
-//! 5. promotion verdict minting a [`ValidatedArtifact`](crate::packages::artifact::ValidatedArtifact).
+//! 5. promotion verdict minting a [`ValidatedPackage`] carrying the
+//!    artifact identity, the validated manifest, and the authorizing signer.
 //!
 //! Authentication precedes parsing: nothing inside the archive is trusted
 //! before the outer bytes verify. Hashing, inspection, and the manifest
@@ -22,8 +23,9 @@
 //! byte agreement during staged extraction lands with `storage::staging`;
 //! until then the outer digest plus inventory set-equality bind the bytes.
 //!
-//! The authorizing signer established by authentication is returned to the
-//! caller alongside the artifact for audit attribution.
+//! The verdict carries everything registry, audit, and activation consume:
+//! no downstream stage re-opens or re-parses the archive to recover the
+//! manifest or attribute the signer.
 //!
 //! Callers cannot omit stages or build a production validator without a
 //! trust store — [`build`](PackageValidationBuilder::build) fails closed
@@ -46,7 +48,7 @@ use crate::packages::inventory::{check_inventory, InventoryError};
 use crate::packages::manifest::{Manifest, ManifestError, MANIFEST_FILE_NAME};
 use crate::packages::policy::{PackageValidationPolicy, PolicyError};
 use crate::packages::signature::{
-    ConfiguredTrustedKeys, Ed25519Verifier, PackageSignature, SignatureError,
+    ConfiguredTrustedKeys, Ed25519Verifier, PackageSignature, SignatureError, TrustedSigningKey,
 };
 
 /// Runs the mandatory stages in a fixed order and returns a verdict or a
@@ -99,34 +101,12 @@ impl PackageValidator {
 
     /// Fixed-order validation over one open handle: policy gate →
     /// hash-and-authenticate → inspect → manifest/inventory → promotion.
-    /// Returns the minted [`ValidatedArtifact`] on success; success is now
-    /// reachable, unlike the scaffold era where every path failed closed.
-    /// The authorizing signer is discarded here; use
-    /// [`validate_with_signer`](Self::validate_with_signer) when the caller
-    /// must attribute the verdict (audit log, HTTP response).
+    /// Returns the complete [`ValidatedPackage`] verdict on success.
     pub fn validate(
         &self,
         archive: &Path,
         signature: &PackageSignature,
-    ) -> Result<ValidatedArtifact, ValidationError> {
-        self.validate_with_signer(archive, signature)
-            .map(|(artifact, _signer)| artifact)
-    }
-
-    /// Same fixed-order validation, additionally returning the authorizing
-    /// [`TrustedSigningKey`] established by authentication so callers can
-    /// attribute the package to its signer in the audit log.
-    pub fn validate_with_signer(
-        &self,
-        archive: &Path,
-        signature: &PackageSignature,
-    ) -> Result<
-        (
-            ValidatedArtifact,
-            crate::packages::signature::TrustedSigningKey,
-        ),
-        ValidationError,
-    > {
+    ) -> Result<ValidatedPackage, ValidationError> {
         self.policy.ensure_production_ingest()?;
         let mut file = File::open(archive)
             .map_err(|e| ValidationError::Archive(ArchiveError::Io(e.to_string())))?;
@@ -190,10 +170,50 @@ impl PackageValidator {
         check_inventory(&manifest.declared_files(), &payload)?;
         let artifact = ValidatedArtifact::new(
             ArtifactDigest::new(digest),
-            manifest.module_id,
-            manifest.version,
+            manifest.module_id.clone(),
+            manifest.version.clone(),
         );
-        Ok((artifact, signer))
+        Ok(ValidatedPackage::new(artifact, manifest, signer))
+    }
+}
+
+/// Complete promotion verdict: artifact identity, validated manifest, and
+/// the authorizing signer. Minted only by [`PackageValidator::validate`];
+/// registry, audit, and activation consume it without touching the archive
+/// again.
+#[derive(Debug)]
+pub struct ValidatedPackage {
+    artifact: ValidatedArtifact,
+    manifest: Manifest,
+    signer: TrustedSigningKey,
+}
+
+impl ValidatedPackage {
+    pub(crate) fn new(
+        artifact: ValidatedArtifact,
+        manifest: Manifest,
+        signer: TrustedSigningKey,
+    ) -> Self {
+        Self {
+            artifact,
+            manifest,
+            signer,
+        }
+    }
+
+    #[must_use]
+    pub fn artifact(&self) -> &ValidatedArtifact {
+        &self.artifact
+    }
+
+    #[must_use]
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    #[must_use]
+    pub fn signer(&self) -> &TrustedSigningKey {
+        &self.signer
     }
 }
 

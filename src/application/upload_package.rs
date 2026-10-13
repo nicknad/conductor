@@ -9,19 +9,11 @@
 
 use std::path::Path;
 
-use crate::application::validate_package::{PackageValidator, ValidationError};
-use crate::packages::artifact::ValidatedArtifact;
-use crate::packages::signature::{PackageSignature, TrustedSigningKey};
+use crate::application::validate_package::{PackageValidator, ValidatedPackage, ValidationError};
+use crate::packages::signature::PackageSignature;
 
-/// A validated upload: the promoted artifact identity plus the authorizing
-/// signer for audit attribution.
-#[derive(Debug)]
-pub struct UploadOutcome {
-    pub artifact: ValidatedArtifact,
-    pub signer: TrustedSigningKey,
-}
-
-/// Runs the ingestion workflow end to end and returns the promoted artifact.
+/// Runs the ingestion workflow end to end and returns the validation
+/// verdict: artifact identity, validated manifest, and authorizing signer.
 ///
 /// `archive_path` must be a private quarantine file the server wrote, not a
 /// client-supplied path. Stages and their order are fixed by
@@ -31,16 +23,16 @@ pub fn run_upload_workflow(
     validator: &PackageValidator,
     archive_path: &Path,
     signature: &PackageSignature,
-) -> Result<UploadOutcome, ValidationError> {
-    let (artifact, signer) = validator.validate_with_signer(archive_path, signature)?;
+) -> Result<ValidatedPackage, ValidationError> {
+    let verdict = validator.validate(archive_path, signature)?;
     tracing::info!(
-        module_id = artifact.module_id(),
-        version = artifact.version(),
-        digest = artifact.digest().to_hex(),
-        signer_key_id = signer.key_id,
+        module_id = verdict.artifact().module_id(),
+        version = verdict.artifact().version(),
+        digest = verdict.artifact().digest().to_hex(),
+        signer_key_id = verdict.signer().key_id.as_str(),
         "package validated"
     );
-    Ok(UploadOutcome { artifact, signer })
+    Ok(verdict)
 }
 
 #[cfg(test)]
@@ -49,7 +41,7 @@ mod tests {
     use crate::application::validate_package::PackageValidationBuilder;
     use crate::packages::policy::PackageValidationPolicy;
     use crate::packages::signature::{
-        canonical_payload, ConfiguredTrustedKeys, SignatureAlgorithm,
+        canonical_payload, ConfiguredTrustedKeys, SignatureAlgorithm, TrustedSigningKey,
         SUPPORTED_SIGNATURE_FORMAT_VERSION,
     };
     use std::io::Write as _;
@@ -116,8 +108,9 @@ mod tests {
 
         let outcome =
             run_upload_workflow(&validator, &path, &envelope).expect("valid package must validate");
-        assert_eq!(outcome.artifact.module_id(), "reporting-service");
-        assert_eq!(outcome.signer.key_id, "k1");
+        assert_eq!(outcome.artifact().module_id(), "reporting-service");
+        assert_eq!(outcome.signer().key_id, "k1");
+        assert_eq!(outcome.manifest().entrypoint, "payload/reporting-service");
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);

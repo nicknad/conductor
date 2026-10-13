@@ -369,10 +369,10 @@ pub async fn post_package(
         Ok(outcome) => Ok((
             StatusCode::CREATED,
             Json(UploadResponse {
-                module_id: outcome.artifact.module_id().to_owned(),
-                version: outcome.artifact.version().to_owned(),
-                digest: outcome.artifact.digest().to_hex(),
-                signer_key_id: outcome.signer.key_id.clone(),
+                module_id: outcome.artifact().module_id().to_owned(),
+                version: outcome.artifact().version().to_owned(),
+                digest: outcome.artifact().digest().to_hex(),
+                signer_key_id: outcome.signer().key_id.clone(),
             }),
         )),
         Err(validation_err) => {

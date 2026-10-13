@@ -28,7 +28,8 @@ backend per stage (`ZipArchiveReader`, `Ed25519Verifier`,
 `build()` fails with `BuildError::MissingTrustStore` when trust is absent.
 `validate(archive, signature)` runs the fixed stage order over one open
 file handle — policy gate → hash-and-authenticate → inspect →
-manifest/inventory → promotion minting `ValidatedArtifact`. Stages cannot
+manifest/inventory → promotion minting `ValidatedPackage` (artifact
+identity + validated manifest + authorizing signer). Stages cannot
 be omitted; there is no skip-verification switch. Tests configure trust by
 value; fake verifier/reader backends arrive as `#[cfg(test)]` seams with
 their real counterparts.
