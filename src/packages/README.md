@@ -10,7 +10,7 @@ next (that is `application`).
 
 | File | Owns | Must not |
 |---|---|---|
-| `archive.rs` | Real `ZipArchiveReader`: EOCD record-count cross-check (duplicate collapse), path/symlink/compression/size/ratio/depth enforcement, bounded single-entry reads | Decide validation outcomes |
+| `archive.rs` | Real `ZipArchiveReader`: entry-count bound enforced before the central directory is parsed, EOCD record-count cross-check (duplicate collapse), path/symlink/compression/size/ratio/depth enforcement, bounded single-entry reads | Decide validation outcomes |
 | `manifest.rs` | Real schema-v1 parsing: byte bound, version gating, required-field shape, `entrypoint ∈ files`, `deny_unknown_fields` | Trust hashes without checking file bytes |
 | `signature.rs` | Real `Ed25519Verifier` + `ConfiguredTrustedKeys`, closed `SignatureAlgorithm` enum, key-owned algorithm records, `PackageSignature` detached envelope, `canonical_payload` + `authenticate` | Load or execute plugin code |
 | `digest.rs` | Real SHA-256 `Sha256DigestProvider`, buffered and streaming | Decide activation policy |

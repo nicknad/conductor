@@ -11,7 +11,7 @@
 //! The hostile `tests/testdata/*.zip` corpus exercises these against the
 //! real reader (see `tests/testdata/README.md`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use conductor::packages::archive::{
     check_entry_path, check_no_duplicate_paths, ArchiveError, ArchiveLimits, InspectedArchive,
@@ -33,6 +33,32 @@ fn inspect_fixture(name: &str) -> Result<InspectedArchive, ArchiveError> {
     with_production(|config| {
         ZipArchiveReader.inspect(&Path::new("tests/testdata").join(name), config)
     })
+}
+
+/// Writes crafted bytes to a process-unique temp path; removed on drop.
+struct TempArchive(PathBuf);
+
+impl TempArchive {
+    fn write(bytes: &[u8], tag: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "conductor-archive-test-{}-{}-{}.zip",
+            std::process::id(),
+            tag,
+            bytes.len()
+        ));
+        std::fs::write(&path, bytes).expect("temp archive must be writable");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempArchive {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 #[test]
@@ -58,6 +84,46 @@ fn limits_are_checked_before_backend_touches_disk() {
         reader.inspect(missing, &policy.scan_config()),
         Err(ArchiveError::Io(_))
     ));
+}
+
+/// The entry-count bound is a *pre-parse* gate: an archive whose EOCD
+/// declares more entries than the limit must be rejected as a limit
+/// violation even though the central directory itself is garbage. If the
+/// count check ran after the backend parsed, the verdict would be a parse
+/// error instead — and, on a well-formed archive, the backend would have
+/// already allocated for every declared entry.
+#[test]
+fn entry_count_limit_is_checked_before_backend_parses() {
+    let mut bytes = vec![0xAAu8; 64]; // junk where the central directory should be
+    bytes.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06]); // EOCD magic
+    bytes.extend_from_slice(&[0, 0]); // disk number
+    bytes.extend_from_slice(&[0, 0]); // central-directory disk
+    bytes.extend_from_slice(&2u16.to_le_bytes()); // entries on this disk
+    bytes.extend_from_slice(&2u16.to_le_bytes()); // total entries
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // central-directory size
+    bytes.extend_from_slice(&64u32.to_le_bytes()); // central-directory offset (junk)
+    bytes.extend_from_slice(&[0, 0]); // comment length
+    let archive = TempArchive::write(&bytes, "eocd-count-over-limit");
+
+    let policy = PackageValidationPolicy::production();
+    let limits = ArchiveLimits {
+        max_entries: 1,
+        ..policy.archive
+    };
+    limits.validate().expect("test limits must stay valid");
+    let config = ScanConfig {
+        limits: &limits,
+        allowed_methods: &policy.allowed_compression_methods,
+        max_compression_ratio: policy.max_compression_ratio,
+        max_nesting_depth: policy.max_nesting_depth,
+    };
+    assert!(
+        matches!(
+            ZipArchiveReader.inspect(archive.path(), &config),
+            Err(ArchiveError::LimitExceeded(_))
+        ),
+        "count bound must reject before the backend parses the directory"
+    );
 }
 
 #[test]

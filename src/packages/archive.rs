@@ -158,6 +158,15 @@ impl ZipArchiveReader {
         // records. Cross-check its view against the authoritative EOCD
         // record count first: any disagreement means ambiguous names.
         let records = Self::central_directory_count(file)?;
+        // Enforce the count bound *before* the backend parses: parsing
+        // allocates per-record data for every declared entry, so a crafted
+        // archive could force memory proportional to the declared (not the
+        // allowed) entry count. Limits are cheap; backend work is not.
+        if records > config.limits.max_entries {
+            return Err(ArchiveError::LimitExceeded(
+                "archive entry count exceeds bound",
+            ));
+        }
         let mut zip =
             zip::ZipArchive::new(file).map_err(|e| ArchiveError::InvalidArchive(e.to_string()))?;
         if zip.len() != records {
