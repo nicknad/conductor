@@ -12,7 +12,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write as _};
 use std::path::Path;
 use thiserror::Error;
-use unicode_normalization::UnicodeNormalization;
 
 /// Hard implementation ceilings. Operator-configured [`ArchiveLimits`] must
 /// fit inside these; raising them requires a code change, not a config edit.
@@ -645,15 +644,20 @@ impl ZipArchiveReader {
 pub const MAX_ENTRY_PATH_LEN: usize = 1_024;
 
 /// Pure entry-path policy: the fixed archive-safety invariant, testable
-/// without I/O. Rejects absolute paths, any colon (drive prefixes and NTFS
-/// alternate data streams), ASCII control characters, `.` / `..`
-/// components, empty segments, backslashes, over-long names, components
-/// with trailing dots or spaces (Windows strips them, collapsing distinct
-/// entries), Windows reserved device names, and symlink entries. A single
-/// trailing `/` (explicit directory entry) is stripped — directories carry
-/// no payload and are recreated from file parents during extraction.
-/// Returns the relative path normalized to Unicode NFC, confined by
-/// construction: no caller can obtain an escaping path from this function.
+/// without I/O. Rejects absolute paths, ASCII control characters (log and
+/// tooling hygiene — entry names surface in audit detail), `.` / `..`
+/// components, empty segments, backslashes, over-long names, and symlink
+/// entries. A single trailing `/` (explicit directory entry) is stripped —
+/// directories carry no payload and are recreated from file parents during
+/// extraction. Returns the confined relative path unchanged: what
+/// validation approves is byte-identical to what extraction writes, so
+/// inventory agreement needs no normalization step.
+/// Deliberately Linux-scoped: Windows reserved device names (`CON`,
+/// `COM1`, …), drive/ADS colons, trailing dots/spaces, and Unicode
+/// NFC/case equivalences are NOT rejected — staging runs on Linux temp
+/// dirs, where those names are ordinary distinct files. Do not extract
+/// archives validated by this function on Windows or case-insensitive
+/// filesystems without re-adding that layer.
 pub fn check_entry_path(entry: &str, is_symlink: bool) -> Result<String, ArchiveError> {
     if is_symlink {
         return Err(ArchiveError::PathRejected(
@@ -675,11 +679,6 @@ pub fn check_entry_path(entry: &str, is_symlink: bool) -> Result<String, Archive
     }
     if entry.starts_with('/') {
         return Err(ArchiveError::PathRejected("absolute paths are rejected"));
-    }
-    if entry.contains(':') {
-        return Err(ArchiveError::PathRejected(
-            "colon-bearing names are rejected (drive prefixes, NTFS data streams)",
-        ));
     }
     if entry.bytes().any(|b| b.is_ascii_control()) {
         return Err(ArchiveError::PathRejected(
@@ -703,52 +702,23 @@ pub fn check_entry_path(entry: &str, is_symlink: bool) -> Result<String, Archive
             }
             _ => {}
         }
-        if component.ends_with(['.', ' ']) {
-            return Err(ArchiveError::PathRejected(
-                "components with trailing dots or spaces are rejected",
-            ));
-        }
-        if is_windows_reserved_name(component) {
-            return Err(ArchiveError::PathRejected(
-                "Windows reserved device names are rejected",
-            ));
-        }
         normalized.push(component);
     }
-    Ok(normalized.join("/").nfc().collect())
+    Ok(normalized.join("/"))
 }
 
-/// Windows treats `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, and
-/// `LPT1`-`LPT9` as reserved device names in every directory, with the
-/// extension ignored: `CON.txt` names the console just like `CON`. A
-/// cross-platform package must never contain one.
-fn is_windows_reserved_name(component: &str) -> bool {
-    const RESERVED: [&str; 22] = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-    let stem = component.split('.').next().unwrap_or_default();
-    RESERVED.iter().any(|name| stem.eq_ignore_ascii_case(name))
-}
-
-/// Rejects exact-duplicate paths and collisions under Unicode NFC
-/// normalization plus case folding within one archive listing. Both
-/// matter because staging may sit on a case-insensitive and/or
-/// normalization-insensitive filesystem, where `Bin/x` / `bin/x` or
-/// NFC/NFD forms of the same name would collapse into a single file and
-/// break inventory accounting.
+/// Rejects exact-duplicate paths within one archive listing. Exactness is
+/// sufficient because staging runs on Linux: `Bin/x` and `bin/x` (or
+/// NFC/NFD equivalents) are distinct files there, and extraction uses
+/// `create_new`, so a second colliding write fails rather than
+/// overwriting. Case-insensitive staging would need fold-key detection
+/// re-added here.
 pub fn check_no_duplicate_paths(paths: &[impl AsRef<str>]) -> Result<(), ArchiveError> {
     use std::collections::HashSet;
     let mut seen: HashSet<&str> = HashSet::new();
-    let mut folded: HashSet<String> = HashSet::new();
     for path in paths {
-        let entry = path.as_ref();
-        if !seen.insert(entry) {
+        if !seen.insert(path.as_ref()) {
             return Err(ArchiveError::PathRejected("duplicate archive paths"));
-        }
-        let fold_key: String = entry.nfc().collect::<String>().to_lowercase();
-        if !folded.insert(fold_key) {
-            return Err(ArchiveError::PathRejected("case-colliding archive paths"));
         }
     }
     Ok(())
@@ -1114,6 +1084,24 @@ mod tests {
 
     #[test]
     fn confined_paths_normalize() {
+        for accepted in [
+            "manifest.json",
+            "bin/plugin.dll",
+            "docs/",
+            // Linux-scoped by design: Windows-hostile names that are
+            // ordinary distinct files on Linux staging must stay accepted.
+            "C:/windows/evil",
+            "payload/file:stream",
+            "aux",
+            "nul.log",
+            "trailing. ",
+            "conifer.txt",
+        ] {
+            assert!(
+                check_entry_path(accepted, false).is_ok(),
+                "must accept {accepted:?}"
+            );
+        }
         assert_eq!(
             check_entry_path("manifest.json", false).expect("plain file"),
             "manifest.json"
@@ -1131,8 +1119,6 @@ mod tests {
             "",
             "/",
             "/etc/passwd",
-            "C:/windows/evil",
-            "c:evil",
             "..",
             "../evil",
             "a/../../b",
@@ -1143,6 +1129,9 @@ mod tests {
             "/a/b",
             "a\\b",
             "..\\evil",
+            "with\nnewline",
+            "with\ttab",
+            "\u{7f}",
         ] {
             assert!(
                 matches!(
@@ -1195,81 +1184,88 @@ mod tests {
     }
 
     #[test]
-    fn windows_unsafe_names_rejected() {
-        for hostile in [
-            "C:/windows/evil",
-            "c:evil",
-            "payload/file:stream",
-            "stream:name",
-            "aux",
-            "AUX.txt",
-            "con",
-            "nul.log",
-            "COM1",
-            "lpt9.bin",
-            "dir/COM1.txt",
-            "trailing.",
-            "trailing ",
-            "dir/trailing. ",
-            "with\nnewline",
-            "with\ttab",
-            "\u{7f}",
-        ] {
-            assert!(
-                matches!(
-                    check_entry_path(hostile, false),
-                    Err(ArchiveError::PathRejected(_))
-                ),
-                "must reject {hostile:?}"
-            );
-        }
-        for accepted in [
-            "conifer.txt",
-            "console/err.log",
-            "com10.txt",
-            "lpt0.dat",
-            "nulled/readme",
-            ".gitignore",
-            "internal space.txt",
-            "payload/report.2024",
-        ] {
-            assert!(
-                check_entry_path(accepted, false).is_ok(),
-                "must accept {accepted:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn unicode_equivalents_normalize_and_collide() {
+    fn unicode_forms_are_distinct_accepted_paths() {
+        // No normalization step: NFC and NFD forms are distinct byte
+        // strings and distinct files on Linux staging. They must both be
+        // accepted and must NOT collide as duplicates.
         let nfc = "caf\u{e9}/r\u{e9}sum\u{e9}.txt";
         let nfd = "cafe\u{301}/re\u{301}sume\u{301}.txt";
         assert_eq!(
             check_entry_path(nfc, false).expect("NFC must be accepted"),
-            check_entry_path(nfd, false).expect("NFD must be accepted"),
-            "equivalent forms must normalize to one canonical path"
+            nfc,
+            "accepted paths must round-trip unchanged"
         );
-        assert!(matches!(
-            check_no_duplicate_paths(&[nfc.to_owned(), nfd.to_owned()]),
-            Err(ArchiveError::PathRejected(_))
-        ));
-        assert!(matches!(
-            check_no_duplicate_paths(&["CAF\u{c9}.TXT".to_owned(), "caf\u{e9}.txt".to_owned()]),
-            Err(ArchiveError::PathRejected(_))
-        ));
+        assert_eq!(
+            check_entry_path(nfd, false).expect("NFD must be accepted"),
+            nfd,
+            "accepted paths must round-trip unchanged"
+        );
+        assert!(check_no_duplicate_paths(&[nfc.to_owned(), nfd.to_owned()]).is_ok());
+        assert!(check_no_duplicate_paths(&["Bin/x".to_owned(), "bin/x".to_owned()]).is_ok());
     }
 
     #[test]
-    fn duplicate_and_colliding_paths_rejected() {
+    fn duplicate_paths_rejected() {
         assert!(check_no_duplicate_paths(&["a".to_owned(), "b".to_owned()]).is_ok());
         assert!(matches!(
             check_no_duplicate_paths(&["a".to_owned(), "a".to_owned()]),
             Err(ArchiveError::PathRejected(_))
         ));
-        assert!(matches!(
-            check_no_duplicate_paths(&["Bin/x".to_owned(), "bin/x".to_owned()]),
-            Err(ArchiveError::PathRejected(_))
-        ));
+    }
+
+    #[test]
+    fn accepted_paths_agree_with_zip_enclosed_name() {
+        // Parity with the established crate: every path this policy
+        // accepts must also pass `zip`'s own `enclosed_name` confinement
+        // check when read through a real archive. If `zip` ever tightens
+        // its rules, this test goes red and the policy gets a review.
+        use std::io::Cursor;
+        use zip::write::SimpleFileOptions;
+
+        let accepted = [
+            "manifest.json",
+            "bin/plugin.dll",
+            "payload/reporting-service",
+            "a/b/c/deep.dat",
+            "com10.txt",
+            "console/err.log",
+            "conifer.txt",
+            "internal space.txt",
+            ".gitignore",
+            "C:/windows/evil",
+            "payload/file:stream",
+            "trailing. ",
+        ];
+        let mut cursor = Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for name in accepted {
+            writer
+                .start_file(name, options)
+                .expect("test zip must accept the entry name");
+            writer.write_all(b"x").expect("test zip must build");
+        }
+        writer.finish().expect("test zip must finalize");
+        let mut archive =
+            zip::ZipArchive::new(Cursor::new(cursor.into_inner())).expect("zip must open");
+        assert_eq!(archive.len(), accepted.len());
+        for i in 0..archive.len() {
+            let file = archive.by_index(i).expect("entry must read");
+            let raw = file.name().to_owned();
+            assert!(
+                check_entry_path(&raw, false).is_ok(),
+                "policy must accept {raw:?}"
+            );
+            let enclosed = file
+                .enclosed_name()
+                .expect("zip enclosed_name must accept every policy-accepted path");
+            assert_eq!(
+                enclosed.to_string_lossy().replace('\\', "/"),
+                raw,
+                "enclosed path must match the validated name for {raw:?}"
+            );
+        }
     }
 
     fn classic_eocd(count: u16) -> Vec<u8> {

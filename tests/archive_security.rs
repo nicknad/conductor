@@ -2,10 +2,12 @@
 //!
 //! What must hold (none of this is operator-configurable):
 //! - limits are validated before the backend touches the archive;
-//! - entry paths can never escape staging (no absolute, colon-bearing,
-//!   dot-segment, empty-segment, backslash, control-character, trailing
-//!   dot/space, reserved-device, or over-long names);
-//! - symlinks are never extracted; duplicates and case collisions rejected;
+//! - entry paths can never escape staging (no absolute, dot-segment,
+//!   empty-segment, backslash, control-character, or over-long names);
+//!   Windows-only hazards (drive/ADS colons, reserved device names,
+//!   trailing dots/spaces) and Unicode/case equivalences are ordinary
+//!   distinct Linux names and are accepted: staging is Linux-only;
+//! - symlinks are never extracted; exact duplicate paths rejected;
 //! - unexpected compression is rejected, never attempted opportunistically;
 //! - entry-count, byte, ratio, and depth bounds are enforced independently.
 //!
@@ -140,6 +142,16 @@ fn entry_path_policy_accepts_only_confined_relative_paths() {
         "docs/",
         "com10.txt",
         "console/err.log",
+        // Linux-scoped: accepted here, ordinary files on Linux staging.
+        // Never extract policy-accepted archives on Windows without the
+        // reserved-name/colon layer re-added.
+        "C:/windows/evil",
+        "payload/file:stream",
+        "aux",
+        "nul.log",
+        "trailing.",
+        "trailing ",
+        "manifest.json ",
     ] {
         assert!(
             check_entry_path(accepted, false).is_ok(),
@@ -150,20 +162,14 @@ fn entry_path_policy_accepts_only_confined_relative_paths() {
         "",
         "/",
         "/etc/passwd",
-        "C:/windows/evil",
         "..",
         "../evil",
         "a/../../b",
         "a/./b",
         "a//b",
         "a\\b",
-        "manifest.json ",
-        "payload/file:stream",
-        "aux",
-        "nul.log",
-        "trailing.",
-        "trailing ",
         "with\ttab",
+        "with\nnewline",
     ] {
         assert!(
             matches!(
@@ -188,7 +194,7 @@ fn symlinks_and_overlong_names_rejected_at_the_boundary() {
 }
 
 #[test]
-fn duplicate_and_case_colliding_listings_rejected() {
+fn duplicate_listings_rejected_case_variants_accepted() {
     let unique = ["manifest.json".to_owned(), "bin/plugin.dll".to_owned()];
     assert!(check_no_duplicate_paths(&unique).is_ok());
     let duplicated = ["a.txt".to_owned(), "a.txt".to_owned()];
@@ -196,20 +202,12 @@ fn duplicate_and_case_colliding_listings_rejected() {
         check_no_duplicate_paths(&duplicated),
         Err(ArchiveError::PathRejected(_))
     ));
-    let colliding = ["Bin/tool".to_owned(), "bin/tool".to_owned()];
-    assert!(matches!(
-        check_no_duplicate_paths(&colliding),
-        Err(ArchiveError::PathRejected(_))
-    ));
-    // Unicode equivalents collide too: NFC and NFD names map to one
-    // filesystem entry on normalization-insensitive filesystems.
-    let composed = ["caf\u{e9}.txt".to_owned(), "other.txt".to_owned()];
-    assert!(check_no_duplicate_paths(&composed).is_ok());
+    // Linux staging: case and normalization variants are distinct files,
+    // so only exact duplicates are rejected.
+    let case_variants = ["Bin/tool".to_owned(), "bin/tool".to_owned()];
+    assert!(check_no_duplicate_paths(&case_variants).is_ok());
     let equivalent = ["cafe\u{301}.txt".to_owned(), "caf\u{e9}.txt".to_owned()];
-    assert!(matches!(
-        check_no_duplicate_paths(&equivalent),
-        Err(ArchiveError::PathRejected(_))
-    ));
+    assert!(check_no_duplicate_paths(&equivalent).is_ok());
 }
 
 #[test]

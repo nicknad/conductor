@@ -252,9 +252,11 @@ verify with `unzip -l` or the inspection snippet in the previous section.
 - `lying-size.zip`: central-directory `file_size` fields understating
   actual payloads — regression case for "count actual decompressed bytes,
   not ZIP metadata".
-- `case-collision.zip`: `Bin/tool` + `bin/tool` as real entries — the
-  on-disk counterpart of the `check_no_duplicate_paths` case-fold rule,
-  aimed at case-insensitive staging filesystems.
+- `case-collision.zip`: `Bin/tool` + `bin/tool` as real entries — only
+  relevant if staging ever moves to a case-insensitive filesystem. The
+  current policy accepts case variants as distinct Linux files, so do not
+  build this fixture until that layer is re-added (see `check_entry_path`
+  docs).
 - `deep-nesting.zip`: ~200 levels of nesting with total path length near
   `MAX_ENTRY_PATH_LEN` — boundary case for the length bound and for
   staging path-length limits.
