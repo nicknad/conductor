@@ -44,10 +44,59 @@ impl TrustedSigningKey {
     }
 }
 
+/// Supported detached-signature envelope versions. The envelope format is
+/// versioned so signature parsing can evolve without ambiguous
+/// interpretation; verifiers accept only listed versions.
+pub const SUPPORTED_SIGNATURE_FORMAT_VERSION: u16 = 1;
+
+/// Parsed detached-signature envelope: proves the exact package bytes match
+/// what the holder of `key_id` signed. The envelope itself is validated —
+/// arbitrary bytes are never treated as a signature.
+///
+/// The signature covers a canonical payload the signer and verifier must
+/// construct byte-identically: a domain-separation prefix, the package
+/// format/version, the digest-algorithm identifier, and the SHA-256 digest
+/// of the exact archive bytes. Ed25519 ordinary signing and Ed25519ph are
+/// not interchangeable here. If certificate-based interoperability is ever
+/// required, prefer a standard detached format such as CMS over extending
+/// this envelope.
+#[derive(Clone, Debug)]
+pub struct PackageSignature {
+    pub format_version: u16,
+    pub key_id: String,
+    pub signature: Vec<u8>,
+}
+
+impl PackageSignature {
+    /// Rejects unknown envelope versions and empty key/signature fields
+    /// before any cryptographic work or key lookup happens.
+    pub fn check_envelope(&self) -> Result<(), SignatureError> {
+        if self.format_version != SUPPORTED_SIGNATURE_FORMAT_VERSION {
+            return Err(SignatureError::InvalidEnvelope(format!(
+                "unsupported signature format version: {}",
+                self.format_version
+            )));
+        }
+        if self.key_id.is_empty() {
+            return Err(SignatureError::InvalidEnvelope(
+                "signature envelope has empty key id".to_owned(),
+            ));
+        }
+        if self.signature.is_empty() {
+            return Err(SignatureError::InvalidEnvelope(
+                "signature envelope has empty signature".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Signature verification failures. No silent fallback: every variant is an
 /// error, never a downgrade to unsigned.
 #[derive(Debug, Error)]
 pub enum SignatureError {
+    #[error("invalid signature envelope: {0}")]
+    InvalidEnvelope(String),
     #[error("unknown signing key: {0}")]
     UnknownKey(String),
     #[error("signature algorithm not allowlisted")]
@@ -137,5 +186,47 @@ mod tests {
         )]);
         assert!(provider.key("k1").is_some());
         assert!(provider.key("nope").is_none());
+    }
+
+    fn valid_envelope() -> PackageSignature {
+        PackageSignature {
+            format_version: SUPPORTED_SIGNATURE_FORMAT_VERSION,
+            key_id: "k1".to_owned(),
+            signature: vec![0u8; 64],
+        }
+    }
+
+    #[test]
+    fn well_formed_envelope_passes_precheck() {
+        valid_envelope()
+            .check_envelope()
+            .expect("supported version with key and signature must pass");
+    }
+
+    #[test]
+    fn envelope_rejects_unknown_version_and_empty_fields() {
+        let bad_version = PackageSignature {
+            format_version: SUPPORTED_SIGNATURE_FORMAT_VERSION + 1,
+            ..valid_envelope()
+        };
+        assert!(matches!(
+            bad_version.check_envelope(),
+            Err(SignatureError::InvalidEnvelope(_))
+        ));
+        for bad in [
+            PackageSignature {
+                key_id: String::new(),
+                ..valid_envelope()
+            },
+            PackageSignature {
+                signature: Vec::new(),
+                ..valid_envelope()
+            },
+        ] {
+            assert!(matches!(
+                bad.check_envelope(),
+                Err(SignatureError::InvalidEnvelope(_))
+            ));
+        }
     }
 }

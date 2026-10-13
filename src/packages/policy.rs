@@ -22,11 +22,25 @@ pub struct PackageValidationPolicy {
     pub allowed_compression_methods: Vec<CompressionMethod>,
     pub allowed_manifest_versions: Vec<u32>,
     pub max_manifest_bytes: u64,
+    /// Maximum accepted ratio of uncompressed to compressed bytes across
+    /// the archive. Caps decompression-bomb amplification even when both
+    /// byte totals sit inside their own bounds.
+    pub max_compression_ratio: u32,
+    /// Maximum accepted entry-path nesting depth (component count).
+    /// Complements `MAX_ENTRY_PATH_LEN`, which bounds total length.
+    pub max_nesting_depth: usize,
     pub require_signature: bool,
 }
 
 /// Hard ceiling for any single manifest read: bounded before parsing.
 pub const HARD_MAX_MANIFEST_BYTES: u64 = 16 << 20;
+
+/// Hard ceiling for the compression-ratio policy: raising it is a code
+/// change, not a config edit.
+pub const HARD_MAX_COMPRESSION_RATIO: u32 = 1_000;
+
+/// Hard ceiling for the nesting-depth policy.
+pub const HARD_MAX_NESTING_DEPTH: usize = 256;
 
 impl PackageValidationPolicy {
     /// Secure initial defaults. Signature is required; allowlists are
@@ -47,6 +61,8 @@ impl PackageValidationPolicy {
             ],
             allowed_manifest_versions: vec![1],
             max_manifest_bytes: 1 << 20,
+            max_compression_ratio: 100,
+            max_nesting_depth: 32,
             require_signature: true,
         }
     }
@@ -67,6 +83,14 @@ impl PackageValidationPolicy {
         }
         if self.max_manifest_bytes == 0 || self.max_manifest_bytes > HARD_MAX_MANIFEST_BYTES {
             return Err(PolicyError::BadManifestBound);
+        }
+        if self.max_compression_ratio == 0
+            || self.max_compression_ratio > HARD_MAX_COMPRESSION_RATIO
+        {
+            return Err(PolicyError::BadCompressionRatio);
+        }
+        if self.max_nesting_depth == 0 || self.max_nesting_depth > HARD_MAX_NESTING_DEPTH {
+            return Err(PolicyError::BadNestingDepth);
         }
         Ok(())
     }
@@ -98,6 +122,10 @@ pub enum PolicyError {
     EmptyAllowlist(&'static str),
     #[error("manifest byte bound out of range")]
     BadManifestBound,
+    #[error("compression ratio bound out of range")]
+    BadCompressionRatio,
+    #[error("nesting depth bound out of range")]
+    BadNestingDepth,
     #[error("production ingest requires require_signature = true")]
     SignatureNotRequired,
 }
@@ -140,6 +168,33 @@ mod tests {
         assert!(matches!(
             policy.validate(),
             Err(PolicyError::BadManifestBound)
+        ));
+    }
+
+    #[test]
+    fn zero_or_excessive_ratio_and_depth_rejected() {
+        let mut policy = PackageValidationPolicy::production();
+        policy.max_compression_ratio = 0;
+        assert!(matches!(
+            policy.validate(),
+            Err(PolicyError::BadCompressionRatio)
+        ));
+        policy = PackageValidationPolicy::production();
+        policy.max_compression_ratio = HARD_MAX_COMPRESSION_RATIO + 1;
+        assert!(matches!(
+            policy.validate(),
+            Err(PolicyError::BadCompressionRatio)
+        ));
+        policy = PackageValidationPolicy::production();
+        policy.max_nesting_depth = 0;
+        assert!(matches!(
+            policy.validate(),
+            Err(PolicyError::BadNestingDepth)
+        ));
+        policy.max_nesting_depth = HARD_MAX_NESTING_DEPTH + 1;
+        assert!(matches!(
+            policy.validate(),
+            Err(PolicyError::BadNestingDepth)
         ));
     }
 }

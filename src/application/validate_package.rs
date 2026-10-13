@@ -5,11 +5,19 @@
 //! defaults; [`PackageValidator`] owns the fixed stage order:
 //!
 //! 1. policy gate (production ingest requires a signature),
-//! 2. archive inspection under [`ArchiveLimits`](crate::packages::archive::ArchiveLimits),
-//! 3. manifest/signature authentication (not wired yet),
-//! 4. inventory + staged extraction with hashing (not wired yet),
-//! 5. module/runtime policy (not wired yet),
-//! 6. promotion verdict.
+//! 2. authenticate the exact package bytes: stream the upload into
+//!    quarantine while hashing SHA-256, then verify the detached
+//!    [`PackageSignature`](crate::packages::signature::PackageSignature)
+//!    against the trust store (not wired yet),
+//! 3. archive inspection under [`ArchiveLimits`](crate::packages::archive::ArchiveLimits),
+//! 4. manifest parsing and inventory validation (not wired yet),
+//! 5. staged extraction with hashing plus module/runtime policy (not wired yet),
+//! 6. promotion verdict minting a [`ValidatedArtifact`](crate::packages::artifact::ValidatedArtifact).
+//!
+//! Authentication precedes parsing: nothing inside the archive is trusted
+//! before the outer bytes verify. Hashing and inspection operate on the
+//! same private quarantined file — never hash one file and reopen an
+//! attacker-controlled path for extraction (TOCTOU).
 //!
 //! Callers cannot omit stages or build a production validator without a
 //! verifier and key provider — there is no `skip_signature_verification`

@@ -16,6 +16,7 @@ next (that is `application`).
 | `digest.rs` | `DigestProvider` seam, pinned SHA-256 default | Decide activation policy |
 | `inventory.rs` | Declared-files vs. archive-entries comparison | Persist lifecycle state |
 | `policy.rs` | `PackageValidationPolicy`: runtime allowlists and bounds, `production()` defaults, startup `validate()` / `ensure_production_ingest()` gates | Filesystem writes |
+| `artifact.rs` | `ArtifactDigest` + `ValidatedArtifact`: capability-like identity minted only by the validation/promotion path | Trust decisions at use time (host must still check registration and authorization) |
 
 ## Wiring
 
@@ -23,9 +24,19 @@ The pipeline is assembled by `PackageValidationBuilder` and run by
 `PackageValidator` in `application/validate_package.rs`: dependencies are
 injected as `Arc<dyn Trait>` with secure defaults (`ZipArchiveReader`,
 `Ed25519Verifier`, `ConfiguredTrustedKeys`, `Sha256DigestProvider`), and the
-validator owns the fixed stage order — policy gate → inspect → authenticate →
-inventory/extract+hash → module policy → promote. Stages cannot be omitted;
-there is no skip-verification switch.
+validator owns the fixed stage order — policy gate → authenticate exact
+bytes → inspect → manifest/inventory → extract+hash/policy →
+promotion. Stages cannot be omitted; there is no skip-verification switch.
+
+Two ordering rules are load-bearing:
+
+- **Authenticate before parsing.** The detached `PackageSignature`
+  envelope is verified against the trust store before anything inside the
+  archive is trusted. A signature establishes the bytes match what the
+  signer signed — not that the code is safe to execute.
+- **No TOCTOU.** Hashing and inspection operate on the same private
+  quarantined file; the implementation must never hash one file and reopen
+  an attacker-controlled path for extraction.
 
 ## What is flexible vs. fixed
 
