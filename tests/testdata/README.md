@@ -150,10 +150,13 @@ Policy is an allowlist: anything not in
 `PackageValidationPolicy::allowed_compression_methods` is rejected, never
 attempted opportunistically — even when a backend library *could* decode
 it.
-Expected verdict: `Err(ArchiveError::UnsupportedCompression(_))` from
-`inspect`. The future test must also cover the ordering: with production
-policy the bzip2 entry is rejected *even though* BZIP2 support may exist in
-the dependency — capability must not imply permission.
+Expected verdict: rejected by `inspect`, fail-closed at the earliest
+layer. BZIP2 is deliberately not compiled into the zip backend
+(`default-features = false`), so parsing rejects it as
+`Err(ArchiveError::InvalidArchive(_))` before any policy check. If a codec
+is ever compiled but not allowlisted, the policy rejects it as
+`Err(ArchiveError::UnsupportedCompression(_))` (covered by the
+stored-only/Deflate unit case): capability never implies permission.
 
 ## What the reader tests prove (checklist)
 

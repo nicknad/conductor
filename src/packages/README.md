@@ -46,8 +46,11 @@ Two ordering rules are load-bearing:
 ## What is configurable vs. fixed
 
 - **Fixed backends**: one concrete implementation per stage — no provider
-  traits, nothing to swap. Fake backends for tests arrive as `#[cfg(test)]`
-  seams alongside their real counterparts.
+  traits, nothing to swap. Compression codecs are compiled to match the
+  allowlist: only deflate is built, so uncompiled methods fail at backend
+  parse and compiled-but-disallowed methods fail at the policy allowlist.
+  Fake backends for tests arrive as `#[cfg(test)]` seams alongside their real
+  counterparts.
 - **Configurable values**: trust store contents (`ConfiguredTrustedKeys`,
   supplied by value) and runtime policy (`PackageValidationPolicy`,
   validated at startup): size/entry bounds, compression ratio, nesting

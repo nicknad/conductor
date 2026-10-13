@@ -288,8 +288,13 @@ fn entry_bomb_trips_the_count_limit_not_byte_limits() {
 
 #[test]
 fn out_of_allowlist_compression_is_rejected() {
+    // BZIP2 is deliberately not compiled into the zip backend (default
+    // features off), so the backend refuses during parse — fail-closed
+    // even before the policy allowlist runs. A compiled codec that is not
+    // allowlisted (Deflate under a stored-only policy) still fails at the
+    // allowlist, covered by the archive unit tests.
     assert!(matches!(
         inspect_fixture("odd-compression.zip"),
-        Err(ArchiveError::UnsupportedCompression(_))
+        Err(ArchiveError::InvalidArchive(_))
     ));
 }

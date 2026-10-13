@@ -559,6 +559,24 @@ mod tests {
         bytes
     }
 
+    /// Sets the general-purpose "encrypted" flag (bit 0) in both the local
+    /// and central headers of a single-entry archive.
+    fn set_encryption_flag(mut bytes: Vec<u8>) -> Vec<u8> {
+        let local = bytes
+            .windows(4)
+            .position(|w| w == [0x50, 0x4b, 0x03, 0x04])
+            .expect("local header must exist");
+        let central = bytes
+            .windows(4)
+            .position(|w| w == [0x50, 0x4b, 0x01, 0x02])
+            .expect("central header must exist");
+        let local_flags = u16::from_le_bytes([bytes[local + 6], bytes[local + 7]]) | 1;
+        bytes[local + 6..local + 8].copy_from_slice(&local_flags.to_le_bytes());
+        let central_flags = u16::from_le_bytes([bytes[central + 8], bytes[central + 9]]) | 1;
+        bytes[central + 8..central + 10].copy_from_slice(&central_flags.to_le_bytes());
+        bytes
+    }
+
     fn scan_bytes(bytes: &[u8], config: &ScanConfig<'_>) -> Result<InspectedArchive, ArchiveError> {
         let mut cursor = std::io::Cursor::new(bytes);
         let mut zip = zip::ZipArchive::new(&mut cursor).expect("test zip must parse");
@@ -788,22 +806,14 @@ mod tests {
             Err(ArchiveError::UnsupportedCompression(_))
         ));
 
-        // Encrypted entries are rejected before any payload handling.
-        let mut cursor = std::io::Cursor::new(Vec::new());
-        let mut writer = zip::ZipWriter::new(&mut cursor);
-        writer
-            .start_file(
-                "secret.dat",
-                zip::write::SimpleFileOptions::default()
-                    .compression_method(zip::CompressionMethod::Stored)
-                    .with_aes_encryption(zip::AesMode::Aes256, "password"),
-            )
-            .expect("test zip must build");
-        writer.write_all(b"data").expect("test zip must build");
-        writer.finish().expect("test zip must finalize");
+        // Encrypted entries are rejected before any payload handling. The
+        // writer cannot emit encrypted entries without the (deliberately
+        // uncompiled) AES feature, so set the general-purpose encryption
+        // bit at the byte level — exactly what a hostile producer emits.
+        let encrypted = set_encryption_flag(stored_zip(&[("secret.dat", b"data")]));
         let config = sane_config(&limits);
         assert!(matches!(
-            scan_bytes(&cursor.into_inner(), &config),
+            scan_bytes(&encrypted, &config),
             Err(ArchiveError::InvalidArchive(_))
         ));
 
