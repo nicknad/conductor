@@ -55,7 +55,8 @@ fn minimal_state(tag: &str) -> (AppState, PathBuf) {
         "k1",
         SignatureAlgorithm::Ed25519,
         vec![0u8; 32],
-    )]);
+    )])
+    .expect("distinct test keys must build");
     let validator = PackageValidationBuilder::new(PackageValidationPolicy::production())
         .trusted_keys(keys)
         .build()

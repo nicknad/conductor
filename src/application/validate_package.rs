@@ -276,6 +276,7 @@ mod tests {
             SignatureAlgorithm::Ed25519,
             vec![],
         )])
+        .expect("distinct test keys must build")
     }
 
     fn test_validator(policy: PackageValidationPolicy) -> PackageValidator {

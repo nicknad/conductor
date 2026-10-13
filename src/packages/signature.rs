@@ -208,18 +208,41 @@ impl Ed25519Verifier {
 }
 
 /// In-memory key set, typically loaded from operator configuration at
-/// startup. Each validation captures one immutable snapshot. Tests
-/// construct instances directly with test keys — the value, not a trait
-/// object, is the test seam.
+/// startup. Each validation captures one immutable snapshot. Construction
+/// fails closed on empty or duplicate key ids, so a lookup always resolves
+/// to exactly one record and a config mistake can never silently shadow a
+/// key. Tests construct instances directly with test keys — the value, not
+/// a trait object, is the test seam.
 #[derive(Debug)]
 pub struct ConfiguredTrustedKeys {
     keys: Vec<TrustedSigningKey>,
 }
 
+/// Trust-store construction failures. The store is built once from
+/// operator configuration; a malformed store is a startup error, not a
+/// runtime ambiguity resolved by ordering.
+#[derive(Debug, Error)]
+pub enum TrustStoreError {
+    #[error("duplicate trusted key id: {0}")]
+    DuplicateKeyId(String),
+    #[error("trusted key id must not be empty")]
+    EmptyKeyId,
+}
+
 impl ConfiguredTrustedKeys {
-    #[must_use]
-    pub fn new(keys: Vec<TrustedSigningKey>) -> Self {
-        Self { keys }
+    /// Builds the key set, rejecting empty and duplicate key ids: `key()`
+    /// must have exactly one answer per id.
+    pub fn new(keys: Vec<TrustedSigningKey>) -> Result<Self, TrustStoreError> {
+        let mut seen = std::collections::HashSet::new();
+        for key in &keys {
+            if key.key_id.is_empty() {
+                return Err(TrustStoreError::EmptyKeyId);
+            }
+            if !seen.insert(key.key_id.as_str()) {
+                return Err(TrustStoreError::DuplicateKeyId(key.key_id.clone()));
+            }
+        }
+        Ok(Self { keys })
     }
 
     #[must_use]
@@ -318,7 +341,8 @@ mod tests {
             "k1",
             SignatureAlgorithm::Ed25519,
             signing.verifying_key().to_bytes().to_vec(),
-        )]);
+        )])
+        .expect("distinct test keys must build");
         let envelope = PackageSignature {
             format_version: SUPPORTED_SIGNATURE_FORMAT_VERSION,
             key_id: "k1".to_owned(),
@@ -341,7 +365,8 @@ mod tests {
             "k1",
             SignatureAlgorithm::Ed25519,
             signing.verifying_key().to_bytes().to_vec(),
-        )]);
+        )])
+        .expect("distinct test keys must build");
         let envelope = PackageSignature {
             format_version: SUPPORTED_SIGNATURE_FORMAT_VERSION,
             key_id: "k1".to_owned(),
@@ -380,9 +405,35 @@ mod tests {
             "k1",
             SignatureAlgorithm::Ed25519,
             vec![],
-        )]);
+        )])
+        .expect("distinct test keys must build");
         assert!(provider.key("k1").is_some());
         assert!(provider.key("nope").is_none());
+    }
+
+    #[test]
+    fn duplicate_and_empty_key_ids_rejected_at_construction() {
+        let duplicate = ConfiguredTrustedKeys::new(vec![
+            TrustedSigningKey::new("k1", SignatureAlgorithm::Ed25519, vec![1u8; 32]),
+            TrustedSigningKey::new("k1", SignatureAlgorithm::Ed25519, vec![2u8; 32]),
+        ]);
+        assert!(matches!(
+            duplicate,
+            Err(TrustStoreError::DuplicateKeyId(id)) if id == "k1"
+        ));
+
+        let empty = ConfiguredTrustedKeys::new(vec![TrustedSigningKey::new(
+            "",
+            SignatureAlgorithm::Ed25519,
+            vec![1u8; 32],
+        )]);
+        assert!(matches!(empty, Err(TrustStoreError::EmptyKeyId)));
+
+        ConfiguredTrustedKeys::new(vec![
+            TrustedSigningKey::new("k1", SignatureAlgorithm::Ed25519, vec![1u8; 32]),
+            TrustedSigningKey::new("k2", SignatureAlgorithm::Ed25519, vec![2u8; 32]),
+        ])
+        .expect("distinct ids must build");
     }
 
     fn valid_envelope() -> PackageSignature {

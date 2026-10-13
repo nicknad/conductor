@@ -63,7 +63,8 @@ mod tests {
             "k1",
             SignatureAlgorithm::Ed25519,
             signing.verifying_key().to_bytes().to_vec(),
-        )]);
+        )])
+        .expect("distinct test keys must build");
         let validator = PackageValidationBuilder::new(PackageValidationPolicy::production())
             .trusted_keys(keys)
             .build()

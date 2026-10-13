@@ -33,6 +33,7 @@ fn test_keys() -> ConfiguredTrustedKeys {
         SignatureAlgorithm::Ed25519,
         vec![],
     )])
+    .expect("distinct test keys must build")
 }
 
 fn dummy_envelope() -> PackageSignature {
@@ -230,7 +231,8 @@ fn real_key_validator(
         "k1",
         SignatureAlgorithm::Ed25519,
         signing.verifying_key().to_bytes().to_vec(),
-    )]);
+    )])
+    .expect("distinct test keys must build");
     let validator = PackageValidationBuilder::new(policy)
         .trusted_keys(keys)
         .build()

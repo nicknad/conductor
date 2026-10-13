@@ -43,7 +43,8 @@ fn test_state(policy: PackageValidationPolicy, tag: &str) -> AppState {
         "k1",
         SignatureAlgorithm::Ed25519,
         signing.verifying_key().to_bytes().to_vec(),
-    )]);
+    )])
+    .expect("distinct test keys must build");
     let validator = PackageValidationBuilder::new(policy)
         .trusted_keys(keys)
         .build()
