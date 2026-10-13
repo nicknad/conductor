@@ -1,20 +1,20 @@
 #!/bin/sh
-# Pre-commit gate: formatting must be clean and the build must compile with
-# warnings treated as errors. Run `dotnet format` to fix formatting issues.
+# Pre-commit gate: formatting must be clean and the workspace must compile
+# lint-clean. Run `cargo fmt --all` to fix formatting issues.
 set -e
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
-echo "[pre-commit] dotnet format --verify-no-changes"
-dotnet format JobScheduler.slnx --verify-no-changes || {
-  echo "[pre-commit] FAILED: formatting is not clean. Run 'dotnet format JobScheduler.slnx' and re-stage." >&2
+echo "[pre-commit] cargo fmt --all --check"
+cargo fmt --all --check || {
+  echo "[pre-commit] FAILED: formatting is not clean. Run 'cargo fmt --all' and re-stage." >&2
   exit 1
 }
 
-echo "[pre-commit] dotnet build (warnings as errors)"
-dotnet build JobScheduler.slnx -c Release || {
-  echo "[pre-commit] FAILED: build or analyzers reported errors." >&2
+echo "[pre-commit] cargo clippy (warnings denied)"
+cargo clippy --workspace --all-targets -- -D warnings || {
+  echo "[pre-commit] FAILED: clippy reported lints." >&2
   exit 1
 }
 
