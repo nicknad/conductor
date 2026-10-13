@@ -2,9 +2,12 @@
 //! activation policy.
 //!
 //! One concrete backend ([`Sha256DigestProvider`]) behind the closed
-//! [`DigestAlgorithm`] enum — no digest provider trait. Prefer streaming
-//! interfaces for large files once real hashing lands — the current
-//! `&[u8]` form is illustrative, not the final large-file contract.
+//! [`DigestAlgorithm`] enum — no digest provider trait. Both entry points
+//! hash exact bytes: [`Sha256DigestProvider::digest`] for caller-held
+//! buffers, [`Sha256DigestProvider::digest_stream`] for files, so large
+//! archives are never fully buffered to be hashed.
+
+use std::io::Read;
 
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -41,6 +44,16 @@ impl Sha256DigestProvider {
     pub fn digest(&self, bytes: &[u8]) -> Result<Vec<u8>, DigestError> {
         Ok(Sha256::digest(bytes).to_vec())
     }
+
+    /// Streams `reader` into SHA-256 and returns the 32-byte digest without
+    /// buffering the whole input. This is the large-file entry point: the
+    /// validator hashes the quarantined package through this while the
+    /// archive is inspected from the same bytes.
+    pub fn digest_stream(&self, mut reader: impl Read) -> Result<[u8; 32], DigestError> {
+        let mut hasher = Sha256::new();
+        std::io::copy(&mut reader, &mut hasher).map_err(|e| DigestError::Failure(e.to_string()))?;
+        Ok(hasher.finalize().into())
+    }
 }
 
 #[cfg(test)]
@@ -75,5 +88,46 @@ mod tests {
             .expect("hashing must succeed");
         assert_eq!(one.len(), 32);
         assert_ne!(one, two);
+    }
+
+    #[test]
+    fn stream_matches_buffered_over_chunks() {
+        use std::io::Cursor;
+
+        // Capped reader proves no whole-input buffering assumption.
+        struct Capped<'a> {
+            inner: &'a [u8],
+            cap: usize,
+        }
+        impl Read for Capped<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.inner.len().min(buf.len()).min(self.cap);
+                if n == 0 {
+                    return Ok(0);
+                }
+                buf[..n].copy_from_slice(&self.inner[..n]);
+                self.inner = &self.inner[n..];
+                Ok(n)
+            }
+        }
+
+        let bytes = b"package bytes over many chunks";
+        let buffered = Sha256DigestProvider
+            .digest(bytes)
+            .expect("hashing must succeed");
+        let streamed = Sha256DigestProvider
+            .digest_stream(Capped {
+                inner: bytes,
+                cap: 7,
+            })
+            .expect("streaming must succeed");
+        assert_eq!(buffered, streamed);
+        let empty = Sha256DigestProvider
+            .digest_stream(Cursor::new([]))
+            .expect("empty stream must hash");
+        assert_eq!(
+            Sha256DigestProvider.digest(&[]).expect("empty digest"),
+            empty
+        );
     }
 }
