@@ -1,15 +1,17 @@
 //! Verifies manifest signatures against configured trust keys. Never
 //! loads or executes plugin code.
 //!
+//! Ed25519 verification is strict: small-order public keys and `R` values
+//! are rejected, so a malformed trusted-key record cannot become a
+//! universal forgery.
+//!
 //! One concrete verifier ([`Ed25519Verifier`]) and one concrete key source
 //! ([`ConfiguredTrustedKeys`], typically loaded from operator configuration
 //! at startup) — no cryptographic provider traits. The accepted algorithm
 //! set stays a closed [`SignatureAlgorithm`] enum gated by policy — never
 //! whatever string the uploaded package declares.
 
-use ed25519_dalek::{
-    Signature as Ed25519Signature, Verifier as _, VerifyingKey as Ed25519VerifyingKey,
-};
+use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
 use thiserror::Error;
 
 /// Closed set of accepted signature algorithms.
@@ -149,6 +151,11 @@ pub struct Ed25519Verifier;
 impl Ed25519Verifier {
     /// Verifies `signature` over `message` with `key`. Pure computation —
     /// no I/O, no time limits needed.
+    ///
+    /// Strict Ed25519 verification: small-order (weak) public keys and
+    /// small-order `R` values are rejected, so a malformed trusted-key
+    /// record cannot be turned into a signature that verifies for every
+    /// message.
     pub fn verify(
         &self,
         key: &TrustedSigningKey,
@@ -169,7 +176,7 @@ impl Ed25519Verifier {
             .try_into()
             .map_err(|_| SignatureError::VerificationFailed)?;
         verifying
-            .verify(message, &Ed25519Signature::from_bytes(&bytes))
+            .verify_strict(message, &Ed25519Signature::from_bytes(&bytes))
             .map_err(|_| SignatureError::VerificationFailed)
     }
 
@@ -266,6 +273,23 @@ mod tests {
         let short_key = TrustedSigningKey::new("k1", SignatureAlgorithm::Ed25519, vec![1u8; 4]);
         assert!(matches!(
             Ed25519Verifier.verify(&short_key, b"m", &signature.to_bytes()),
+            Err(SignatureError::VerificationFailed)
+        ));
+    }
+
+    #[test]
+    fn small_order_trusted_key_cannot_universally_forge() {
+        // Identity as both public key and R, with S = 0, satisfies the
+        // verification equation `[S]B = R + [k]A` for *any* message.
+        // Ordinary `verify` (which tolerates small-order keys and R)
+        // accepts this forgery; strict verification must reject it.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut forged = [0u8; 64];
+        forged[0] = 1;
+        let weak = TrustedSigningKey::new("weak", SignatureAlgorithm::Ed25519, identity.to_vec());
+        assert!(matches!(
+            Ed25519Verifier.verify(&weak, b"anything the attacker wants", &forged),
             Err(SignatureError::VerificationFailed)
         ));
     }
