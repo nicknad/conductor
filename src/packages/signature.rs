@@ -1,11 +1,11 @@
 //! Verifies manifest signatures against configured trust keys. Never
 //! loads or executes plugin code.
 //!
-//! [`SignatureVerifier`] and [`TrustedKeyProvider`] are the injectable
-//! seams: key sourcing (config file, database, KMS) and verification
-//! backends vary by deployment. The accepted algorithm set stays a closed
-//! [`SignatureAlgorithm`] enum gated by policy — never whatever string the
-//! uploaded package declares.
+//! One concrete verifier ([`Ed25519Verifier`]) and one concrete key source
+//! ([`ConfiguredTrustedKeys`], typically loaded from operator configuration
+//! at startup) — no cryptographic provider traits. The accepted algorithm
+//! set stays a closed [`SignatureAlgorithm`] enum gated by policy — never
+//! whatever string the uploaded package declares.
 
 use thiserror::Error;
 
@@ -109,33 +109,19 @@ pub enum SignatureError {
     NotImplemented,
 }
 
-/// Injectable signature backend. Implementations vary (portable Rust,
-/// HSM/KMS wrappers); the validator only sees this contract.
-pub trait SignatureVerifier: Send + Sync {
-    /// Verifies `signature` over `message` with `key`.
-    /// Implementations must reject algorithm mismatches against
-    /// `key.algorithm` rather than trusting package-declared metadata.
-    fn verify(
-        &self,
-        key: &TrustedSigningKey,
-        message: &[u8],
-        signature: &[u8],
-    ) -> Result<(), SignatureError>;
-}
-
-/// Injectable trusted-key source: local config, database, or key-management
-/// service. Runtime-configurable; the production validator requires one.
-pub trait TrustedKeyProvider: Send + Sync {
-    fn key(&self, key_id: &str) -> Option<TrustedSigningKey>;
-}
-
-/// Initial production verifier. Crypto is not wired yet, so verification
-/// fails closed until a real Ed25519 backend lands.
+/// The concrete signature verifier. Must reject algorithm mismatches
+/// against `key.algorithm` rather than trusting package-declared metadata.
+///
+/// Crypto is not wired yet, so verification fails closed until a real
+/// Ed25519 backend lands. When positive-path tests need an accepting
+/// verifier, the seam will be a `#[cfg(test)]` constructor here — never a
+/// production `skip_verification` switch.
 #[derive(Debug, Default)]
 pub struct Ed25519Verifier;
 
-impl SignatureVerifier for Ed25519Verifier {
-    fn verify(
+impl Ed25519Verifier {
+    /// Verifies `signature` over `message` with `key`.
+    pub fn verify(
         &self,
         _key: &TrustedSigningKey,
         _message: &[u8],
@@ -146,7 +132,9 @@ impl SignatureVerifier for Ed25519Verifier {
 }
 
 /// In-memory key set, typically loaded from operator configuration at
-/// startup. Each validation captures one immutable snapshot.
+/// startup. Each validation captures one immutable snapshot. Tests
+/// construct instances directly with test keys — the value, not a trait
+/// object, is the test seam.
 #[derive(Debug, Default)]
 pub struct ConfiguredTrustedKeys {
     keys: Vec<TrustedSigningKey>,
@@ -157,10 +145,9 @@ impl ConfiguredTrustedKeys {
     pub fn new(keys: Vec<TrustedSigningKey>) -> Self {
         Self { keys }
     }
-}
 
-impl TrustedKeyProvider for ConfiguredTrustedKeys {
-    fn key(&self, key_id: &str) -> Option<TrustedSigningKey> {
+    #[must_use]
+    pub fn key(&self, key_id: &str) -> Option<TrustedSigningKey> {
         self.keys.iter().find(|k| k.key_id == key_id).cloned()
     }
 }

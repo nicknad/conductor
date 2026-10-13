@@ -13,8 +13,8 @@
 use std::path::Path;
 
 use conductor::packages::archive::{
-    check_entry_path, check_no_duplicate_paths, ArchiveError, ArchiveLimits, ArchiveReader,
-    ZipArchiveReader, MAX_ENTRY_PATH_LEN,
+    check_entry_path, check_no_duplicate_paths, ArchiveError, ArchiveLimits, ZipArchiveReader,
+    MAX_ENTRY_PATH_LEN,
 };
 use conductor::packages::policy::PackageValidationPolicy;
 

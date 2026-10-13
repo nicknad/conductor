@@ -1,6 +1,7 @@
 # Hostile archive corpus
 
-Evil-but-harmless ZIP fixtures for the future real `ArchiveReader` backend.
+Evil-but-harmless ZIP fixtures for the future real `ZipArchiveReader`
+backend.
 Each file encodes one threat against the archive-safety invariants in
 `src/packages/archive.rs`. Payloads are inert text (`not a real plugin`,
 `x`, `{}`); the threat is always in entry **names, counts, metadata, or

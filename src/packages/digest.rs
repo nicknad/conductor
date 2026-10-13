@@ -1,9 +1,8 @@
 //! Calculates and compares cryptographic hashes. Decides no
 //! activation policy.
 //!
-//! [`DigestProvider`] is injectable so tests can substitute vectors and
-//! deployments could swap backends; the production algorithm stays
-//! SHA-256 behind the closed [`DigestAlgorithm`] enum. Prefer streaming
+//! One concrete backend ([`Sha256DigestProvider`]) behind the closed
+//! [`DigestAlgorithm`] enum — no digest provider trait. Prefer streaming
 //! interfaces for large files once real hashing lands — the current
 //! `&[u8]` form is illustrative, not the final large-file contract.
 
@@ -28,24 +27,19 @@ pub enum DigestError {
     NotImplemented,
 }
 
-/// Injectable hash backend.
-pub trait DigestProvider: Send + Sync {
-    fn algorithm(&self) -> DigestAlgorithm;
-
-    fn digest(&self, bytes: &[u8]) -> Result<Vec<u8>, DigestError>;
-}
-
-/// Initial production digest backend. Hashing is not wired yet, so it
-/// reports [`DigestAlgorithm::Sha256`] but fails closed on use.
+/// The concrete digest backend. Reports [`DigestAlgorithm::Sha256`] but
+/// fails closed on use until real hashing lands.
 #[derive(Debug, Default)]
 pub struct Sha256DigestProvider;
 
-impl DigestProvider for Sha256DigestProvider {
-    fn algorithm(&self) -> DigestAlgorithm {
+impl Sha256DigestProvider {
+    #[must_use]
+    pub fn algorithm(&self) -> DigestAlgorithm {
         DigestAlgorithm::Sha256
     }
 
-    fn digest(&self, _bytes: &[u8]) -> Result<Vec<u8>, DigestError> {
+    /// Hashes `bytes`. Fails closed until the backend lands.
+    pub fn digest(&self, _bytes: &[u8]) -> Result<Vec<u8>, DigestError> {
         Err(DigestError::NotImplemented)
     }
 }

@@ -2,8 +2,8 @@
 //! bounded extraction into a controlled staging directory while hashing.
 //! Decides no validation outcome on its own.
 //!
-//! [`ArchiveReader`] is the injectable seam (real ZIP backend vs. test
-//! doubles). [`ArchiveLimits`] and [`CompressionMethod`] are runtime policy,
+//! One concrete reader ([`ZipArchiveReader`]); no pluggable archive-engine
+//! trait. [`ArchiveLimits`] and [`CompressionMethod`] are runtime policy,
 //! bounded by hard implementation maxima. Path-traversal, duplicate-path,
 //! and symlink rejection are fixed invariants — never operator options.
 
@@ -97,24 +97,19 @@ pub enum ArchiveError {
     NotImplemented,
 }
 
-/// Injectable archive backend. The validator drives inspection first;
-/// extraction (directed by `storage::staging`) only runs against a verified
-/// inventory — never as a casual `unzip(path, destination)` utility.
-pub trait ArchiveReader: Send + Sync {
-    fn inspect(
-        &self,
-        archive: &Path,
-        limits: &ArchiveLimits,
-    ) -> Result<InspectedArchive, ArchiveError>;
-}
-
-/// Initial production reader. The ZIP backend is not wired yet, so
-/// inspection validates limits then fails closed.
+/// The concrete archive backend. Inspection first; extraction (directed
+/// by `storage::staging`) only runs against a verified inventory — never
+/// as a casual `unzip(path, destination)` utility.
 #[derive(Debug, Default)]
 pub struct ZipArchiveReader;
 
-impl ArchiveReader for ZipArchiveReader {
-    fn inspect(
+impl ZipArchiveReader {
+    /// Inspects ZIP structure and entry limits without trusting payload
+    /// bytes. Validates limits before touching the archive.
+    ///
+    /// The ZIP backend is not wired yet, so inspection validates limits
+    /// then fails closed.
+    pub fn inspect(
         &self,
         _archive: &Path,
         limits: &ArchiveLimits,

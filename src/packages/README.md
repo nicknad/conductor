@@ -10,10 +10,10 @@ next (that is `application`).
 
 | File | Owns | Must not |
 |---|---|---|
-| `archive.rs` | ZIP mechanics: `ArchiveLimits`, `CompressionMethod` allowlist, `ArchiveReader` seam, pure `check_entry_path` / `check_no_duplicate_paths` confinement policy | Decide validation outcomes |
+| `archive.rs` | ZIP mechanics: `ArchiveLimits`, `CompressionMethod` allowlist, concrete `ZipArchiveReader`, pure `check_entry_path` / `check_no_duplicate_paths` confinement policy | Decide validation outcomes |
 | `manifest.rs` | Bounded manifest parsing, schema-version gating | Trust hashes without checking file bytes |
-| `signature.rs` | `SignatureVerifier` + `TrustedKeyProvider` seams, closed `SignatureAlgorithm` enum, key-owned algorithm records | Load or execute plugin code |
-| `digest.rs` | `DigestProvider` seam, pinned SHA-256 default | Decide activation policy |
+| `signature.rs` | Concrete `Ed25519Verifier` + `ConfiguredTrustedKeys`, closed `SignatureAlgorithm` enum, key-owned algorithm records, `PackageSignature` detached envelope | Load or execute plugin code |
+| `digest.rs` | Concrete `Sha256DigestProvider`, pinned SHA-256 default | Decide activation policy |
 | `inventory.rs` | Declared-files vs. archive-entries comparison | Persist lifecycle state |
 | `policy.rs` | `PackageValidationPolicy`: runtime allowlists and bounds, `production()` defaults, startup `validate()` / `ensure_production_ingest()` gates | Filesystem writes |
 | `artifact.rs` | `ArtifactDigest` + `ValidatedArtifact`: capability-like identity minted only by the validation/promotion path | Trust decisions at use time (host must still check registration and authorization) |
@@ -21,12 +21,16 @@ next (that is `application`).
 ## Wiring
 
 The pipeline is assembled by `PackageValidationBuilder` and run by
-`PackageValidator` in `application/validate_package.rs`: dependencies are
-injected as `Arc<dyn Trait>` with secure defaults (`ZipArchiveReader`,
-`Ed25519Verifier`, `ConfiguredTrustedKeys`, `Sha256DigestProvider`), and the
-validator owns the fixed stage order — policy gate → authenticate exact
-bytes → inspect → manifest/inventory → extract+hash/policy →
+`PackageValidator` in `application/validate_package.rs`: one concrete
+backend per stage (`ZipArchiveReader`, `Ed25519Verifier`,
+`ConfiguredTrustedKeys`, `Sha256DigestProvider`), with the policy
+(constructor) and trust store (setter) as the configurable inputs.
+`build()` fails with `BuildError::MissingTrustStore` when trust is absent.
+The validator owns the fixed stage order — policy gate → authenticate
+exact bytes → inspect → manifest/inventory → extract+hash/policy →
 promotion. Stages cannot be omitted; there is no skip-verification switch.
+Tests configure trust by value; fake verifier/reader backends arrive as
+`#[cfg(test)]` seams with their real counterparts.
 
 Two ordering rules are load-bearing:
 

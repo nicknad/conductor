@@ -20,39 +20,38 @@
 //! attacker-controlled path for extraction (TOCTOU).
 //!
 //! Callers cannot omit stages or build a production validator without a
-//! verifier and key provider — there is no `skip_signature_verification`
-//! switch. Tests inject doubles explicitly. Configure the builder once at
-//! startup; to reconfigure, build a new immutable validator and publish it
-//! atomically so one validation never observes a policy halfway through a
-//! reload.
+//! trust store — [`build`](PackageValidationBuilder::build) fails closed
+//! when it is missing, and there is no `skip_signature_verification`
+//! switch. Tests configure trust by value (`ConfiguredTrustedKeys`); fake
+//! verifier/reader backends arrive as `#[cfg(test)]` seams with their real
+//! counterparts. Configure the builder once at startup; to reconfigure,
+//! build a new immutable validator and publish it atomically so one
+//! validation never observes a policy halfway through a reload.
 
 use std::path::Path;
-use std::sync::Arc;
 use thiserror::Error;
 
-use crate::packages::archive::{ArchiveError, ArchiveReader, ZipArchiveReader};
-use crate::packages::digest::{DigestProvider, Sha256DigestProvider};
+use crate::packages::archive::{ArchiveError, ZipArchiveReader};
+use crate::packages::digest::Sha256DigestProvider;
 use crate::packages::policy::{PackageValidationPolicy, PolicyError};
-use crate::packages::signature::{
-    ConfiguredTrustedKeys, Ed25519Verifier, SignatureVerifier, TrustedKeyProvider,
-};
+use crate::packages::signature::{ConfiguredTrustedKeys, Ed25519Verifier};
 
 /// Runs the mandatory stages in a fixed order and returns a verdict or a
 /// typed error. Holds one immutable policy snapshot per instance.
 pub struct PackageValidator {
-    archive_reader: Arc<dyn ArchiveReader>,
-    signature_verifier: Arc<dyn SignatureVerifier>,
-    trusted_keys: Arc<dyn TrustedKeyProvider>,
-    digest: Arc<dyn DigestProvider>,
+    archive_reader: ZipArchiveReader,
+    signature_verifier: Ed25519Verifier,
+    trusted_keys: ConfiguredTrustedKeys,
+    digest: Sha256DigestProvider,
     policy: PackageValidationPolicy,
 }
 
 impl PackageValidator {
     fn new(
-        archive_reader: Arc<dyn ArchiveReader>,
-        signature_verifier: Arc<dyn SignatureVerifier>,
-        trusted_keys: Arc<dyn TrustedKeyProvider>,
-        digest: Arc<dyn DigestProvider>,
+        archive_reader: ZipArchiveReader,
+        signature_verifier: Ed25519Verifier,
+        trusted_keys: ConfiguredTrustedKeys,
+        digest: Sha256DigestProvider,
         policy: PackageValidationPolicy,
     ) -> Self {
         Self {
@@ -70,22 +69,22 @@ impl PackageValidator {
     }
 
     #[must_use]
-    pub fn archive_reader(&self) -> &Arc<dyn ArchiveReader> {
+    pub fn archive_reader(&self) -> &ZipArchiveReader {
         &self.archive_reader
     }
 
     #[must_use]
-    pub fn signature_verifier(&self) -> &Arc<dyn SignatureVerifier> {
+    pub fn signature_verifier(&self) -> &Ed25519Verifier {
         &self.signature_verifier
     }
 
     #[must_use]
-    pub fn trusted_keys(&self) -> &Arc<dyn TrustedKeyProvider> {
+    pub fn trusted_keys(&self) -> &ConfiguredTrustedKeys {
         &self.trusted_keys
     }
 
     #[must_use]
-    pub fn digest(&self) -> &Arc<dyn DigestProvider> {
+    pub fn digest(&self) -> &Sha256DigestProvider {
         &self.digest
     }
 
@@ -111,15 +110,24 @@ pub enum ValidationError {
     NotImplemented(&'static str),
 }
 
-/// Assembles a [`PackageValidator`]. Required security dependencies are
-/// always present: construction starts from secure defaults and each
-/// `with_*` setter only swaps one implementation — none can be omitted or
-/// disabled.
+/// Builder failure: required configuration missing. There is no
+/// skip-verification switch; the only way to obtain a validator is to
+/// supply a trust store.
+#[derive(Debug, Error)]
+pub enum BuildError {
+    #[error("cannot build validator without a trust store: supply trusted keys")]
+    MissingTrustStore,
+}
+
+/// Assembles a [`PackageValidator`] from concrete components. Backends are
+/// fixed single implementations; the configurable inputs are the policy
+/// (constructor) and the trust store (setter). [`build`](Self::build)
+/// fails if the trust store is missing.
 pub struct PackageValidationBuilder {
-    archive_reader: Arc<dyn ArchiveReader>,
-    signature_verifier: Arc<dyn SignatureVerifier>,
-    trusted_keys: Arc<dyn TrustedKeyProvider>,
-    digest: Arc<dyn DigestProvider>,
+    archive_reader: ZipArchiveReader,
+    signature_verifier: Ed25519Verifier,
+    trusted_keys: Option<ConfiguredTrustedKeys>,
+    digest: Sha256DigestProvider,
     policy: PackageValidationPolicy,
 }
 
@@ -127,85 +135,62 @@ impl PackageValidationBuilder {
     #[must_use]
     pub fn new(policy: PackageValidationPolicy) -> Self {
         Self {
-            archive_reader: Arc::new(ZipArchiveReader),
-            signature_verifier: Arc::new(Ed25519Verifier),
-            trusted_keys: Arc::new(ConfiguredTrustedKeys::default()),
-            digest: Arc::new(Sha256DigestProvider),
+            archive_reader: ZipArchiveReader,
+            signature_verifier: Ed25519Verifier,
+            trusted_keys: None,
+            digest: Sha256DigestProvider,
             policy,
         }
     }
 
     #[must_use]
-    pub fn archive_reader(mut self, reader: Arc<dyn ArchiveReader>) -> Self {
-        self.archive_reader = reader;
+    pub fn trusted_keys(mut self, keys: ConfiguredTrustedKeys) -> Self {
+        self.trusted_keys = Some(keys);
         self
     }
 
-    #[must_use]
-    pub fn signature_verifier(mut self, verifier: Arc<dyn SignatureVerifier>) -> Self {
-        self.signature_verifier = verifier;
-        self
-    }
-
-    #[must_use]
-    pub fn trusted_keys(mut self, keys: Arc<dyn TrustedKeyProvider>) -> Self {
-        self.trusted_keys = keys;
-        self
-    }
-
-    #[must_use]
-    pub fn digest_provider(mut self, digest: Arc<dyn DigestProvider>) -> Self {
-        self.digest = digest;
-        self
-    }
-
-    #[must_use]
-    pub fn build(self) -> PackageValidator {
-        PackageValidator::new(
+    /// Builds the validator, failing closed when the trust store is absent.
+    pub fn build(self) -> Result<PackageValidator, BuildError> {
+        Ok(PackageValidator::new(
             self.archive_reader,
             self.signature_verifier,
-            self.trusted_keys,
+            self.trusted_keys.ok_or(BuildError::MissingTrustStore)?,
             self.digest,
             self.policy,
-        )
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packages::archive::{ArchiveLimits, InspectedArchive};
-    use crate::packages::digest::{DigestAlgorithm, DigestError};
+    use crate::packages::digest::DigestAlgorithm;
     use crate::packages::signature::{SignatureAlgorithm, SignatureError, TrustedSigningKey};
 
-    struct OkArchiveReader;
-
-    impl ArchiveReader for OkArchiveReader {
-        fn inspect(
-            &self,
-            _archive: &Path,
-            _limits: &ArchiveLimits,
-        ) -> Result<InspectedArchive, ArchiveError> {
-            Ok(InspectedArchive::new(1))
-        }
+    fn test_keys() -> ConfiguredTrustedKeys {
+        ConfiguredTrustedKeys::new(vec![TrustedSigningKey::new(
+            "k1",
+            SignatureAlgorithm::Ed25519,
+            vec![],
+        )])
     }
 
-    struct OkDigest;
+    fn test_validator(policy: PackageValidationPolicy) -> PackageValidator {
+        PackageValidationBuilder::new(policy)
+            .trusted_keys(test_keys())
+            .build()
+            .expect("test validator must build")
+    }
 
-    impl DigestProvider for OkDigest {
-        fn algorithm(&self) -> DigestAlgorithm {
-            DigestAlgorithm::Sha256
-        }
-
-        fn digest(&self, _bytes: &[u8]) -> Result<Vec<u8>, DigestError> {
-            Ok(vec![0u8; 32])
-        }
+    #[test]
+    fn build_fails_without_trust_store() {
+        let result = PackageValidationBuilder::new(PackageValidationPolicy::production()).build();
+        assert!(matches!(result, Err(BuildError::MissingTrustStore)));
     }
 
     #[test]
     fn defaults_fail_closed_after_policy_gate() {
-        let validator =
-            PackageValidationBuilder::new(PackageValidationPolicy::production()).build();
+        let validator = test_validator(PackageValidationPolicy::production());
         assert!(validator.policy().require_signature);
         assert_eq!(validator.digest().algorithm(), DigestAlgorithm::Sha256);
         let err = validator.validate(Path::new("pkg.zip")).unwrap_err();
@@ -216,30 +201,21 @@ mod tests {
     fn unsigned_config_rejected_before_archive_stage() {
         let mut policy = PackageValidationPolicy::production();
         policy.require_signature = false;
-        let validator = PackageValidationBuilder::new(policy)
-            .archive_reader(Arc::new(OkArchiveReader))
-            .build();
+        let validator = test_validator(policy);
         let err = validator.validate(Path::new("pkg.zip")).unwrap_err();
         assert!(matches!(err, ValidationError::Policy(_)));
     }
 
     #[test]
-    fn injected_doubles_reach_pending_signature_stage() {
-        let validator = PackageValidationBuilder::new(PackageValidationPolicy::production())
-            .archive_reader(Arc::new(OkArchiveReader))
-            .digest_provider(Arc::new(OkDigest))
-            .trusted_keys(Arc::new(ConfiguredTrustedKeys::new(vec![
-                TrustedSigningKey::new("k1", SignatureAlgorithm::Ed25519, vec![]),
-            ])))
-            .build();
+    fn trust_store_is_configured_by_value() {
+        let validator = test_validator(PackageValidationPolicy::production());
         assert!(validator.trusted_keys().key("k1").is_some());
+        assert!(validator.trusted_keys().key("unknown").is_none());
         let verify = validator.signature_verifier().verify(
             &TrustedSigningKey::new("k1", SignatureAlgorithm::Ed25519, vec![]),
             b"m",
             b"s",
         );
         assert!(matches!(verify, Err(SignatureError::NotImplemented)));
-        let err = validator.validate(Path::new("pkg.zip")).unwrap_err();
-        assert!(matches!(err, ValidationError::NotImplemented(_)));
     }
 }

@@ -1,4 +1,4 @@
-# JobScheduler
+# Conductor
 
 > **Unstable:** this repository is being rewritten in Rust. Nothing here is stable yet —
 > no API, no storage format, no CLI contract should be relied upon.
@@ -6,6 +6,36 @@
 A single-machine job execution platform supporting installing, validating, activating,
 updating, disabling, removing, and rolling back job plugin implementations **without
 restarting the scheduler host**.
+
+## Service Packages
+
+Services are distributed as versioned ZIP archives containing a manifest, compiled code, and required dependencies.
+
+**.NET service**
+```text
+reporting-service-1.2.0.zip
+├── manifest.json
+└── payload/
+    ├── ReportingService.dll
+    ├── ReportingService.deps.json
+    └── ReportingService.runtimeconfig.json
+```
+
+**Rust service**
+```text
+reporting-service-1.2.0.zip
+├── manifest.json
+└── payload/
+    └── reporting-service
+```
+
+The Rust executable is built for the target platform and architecture. Any required external runtime libraries must be available in the execution environment or included as permitted dependencies.
+
+The manifest declares the module ID, version, runtime, entry point, and exposed functions. Each package is accompanied by a detached digital signature.
+
+Conductor verifies the signature against trusted publishers, validates the archive and manifest, and stores accepted packages as immutable artifacts before activation.
+
+**Package contents define what can run; Conductor controls whether, where, and under which permissions it runs.**
 
 ## Status
 
