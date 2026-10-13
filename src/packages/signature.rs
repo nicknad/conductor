@@ -137,8 +137,6 @@ pub enum SignatureError {
     UnsupportedAlgorithm,
     #[error("signature verification failed")]
     VerificationFailed,
-    #[error("key provider failure: {0}")]
-    ProviderFailure(String),
 }
 
 /// The concrete signature verifier. Rejects algorithm mismatches against

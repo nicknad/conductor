@@ -23,8 +23,6 @@ pub enum DigestAlgorithm {
 
 #[derive(Debug, Error)]
 pub enum DigestError {
-    #[error("digest algorithm not supported")]
-    Unsupported,
     #[error("digest failure: {0}")]
     Failure(String),
 }

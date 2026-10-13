@@ -10,7 +10,7 @@ compression methods** — never in payload bytes.
 
 Every fixture below is opened by a test in
 `tests/archive_security.rs` asserting its documented verdict, and
-`hostile_corpus_is_present_for_the_future_reader` pins the corpus
+`hostile_corpus_is_present` pins the corpus
 contract: every fixture documented here must be checked in, or the suite
 fails. The pure confinement policy (`check_entry_path`,
 `check_no_duplicate_paths`) is additionally tested against equivalent

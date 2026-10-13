@@ -118,12 +118,6 @@ impl PackageValidationPolicy {
             max_nesting_depth: self.max_nesting_depth,
         }
     }
-
-    /// Records the policy alongside the validation audit record so verdicts
-    /// stay attributable to the rules that produced them. Placeholder until
-    /// audit logging lands.
-    #[allow(dead_code)]
-    fn audit_digest_placeholder() {}
 }
 
 #[derive(Debug, Error)]

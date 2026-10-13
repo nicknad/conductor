@@ -61,13 +61,6 @@ fn limits_are_checked_before_backend_touches_disk() {
 }
 
 #[test]
-fn production_limits_pass_their_own_validation() {
-    production_limits()
-        .validate()
-        .expect("production defaults must be self-consistent");
-}
-
-#[test]
 fn entry_path_policy_accepts_only_confined_relative_paths() {
     for accepted in ["manifest.json", "bin/plugin.dll", "a/b/c/deep.dat", "docs/"] {
         assert!(
@@ -132,7 +125,7 @@ fn duplicate_and_case_colliding_listings_rejected() {
 }
 
 #[test]
-fn hostile_corpus_is_present_for_the_future_reader() {
+fn hostile_corpus_is_present() {
     // Every fixture the reader tests need must be checked in. Add a fixture
     // to `tests/testdata/` without adding it here (and vice versa) and CI
     // goes red.

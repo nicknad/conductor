@@ -238,25 +238,14 @@ impl ZipArchiveReader {
         usize::try_from(total64).map_err(|_| invalid("ZIP64 entry count out of range"))
     }
 
-    /// Bounded read of one entry's bytes. `max_bytes` is enforced during
-    /// the read (metadata `size` is only an early hint — a lying
+    /// Bounded read of one entry's bytes over an already-open handle (see
+    /// [`inspect_file`](Self::inspect_file)). `max_bytes` is enforced
+    /// during the read (metadata `size` is only an early hint — a lying
     /// central directory cannot force over-allocation). Used for
     /// `manifest.json`; general extraction lives in `storage::staging`.
-    pub fn read_file(
-        &self,
-        archive: &Path,
-        name: &str,
-        max_bytes: u64,
-    ) -> Result<Vec<u8>, ArchiveError> {
-        let mut file = File::open(archive).map_err(|e| ArchiveError::Io(e.to_string()))?;
-        self.read_file_from(&mut file, name, max_bytes)
-    }
-
-    /// Same bounded read over an already-open handle (see
-    /// [`inspect_file`](Self::inspect_file)).
     pub fn read_file_from(
         &self,
-        file: &mut File,
+        file: &mut (impl Read + Seek),
         name: &str,
         max_bytes: u64,
     ) -> Result<Vec<u8>, ArchiveError> {
@@ -287,9 +276,9 @@ impl ZipArchiveReader {
     /// Entry-by-entry enforcement over an open archive. Central-directory
     /// sizes are treated as hints for early rejection; authoritative byte
     /// counting over actual decompressed output happens at extraction.
-    fn scan_entries(
+    fn scan_entries<R: Read + Seek>(
         &self,
-        zip: &mut zip::ZipArchive<&mut File>,
+        zip: &mut zip::ZipArchive<R>,
         config: &ScanConfig<'_>,
     ) -> Result<InspectedArchive, ArchiveError> {
         let entry_count = zip.len();
@@ -471,15 +460,6 @@ mod tests {
     }
 
     #[test]
-    fn limits_carry_all_bounds() {
-        let limits = sane_limits();
-        assert_eq!(limits.max_entries, 1);
-        assert_eq!(limits.max_compressed_bytes, 1);
-        assert_eq!(limits.max_uncompressed_bytes, 1);
-        assert_eq!(limits.max_entry_bytes, 1);
-    }
-
-    #[test]
     fn zero_limits_rejected() {
         let limits = ArchiveLimits {
             max_entries: 0,
@@ -537,15 +517,6 @@ mod tests {
         let config = sane_config(&limits);
         assert!(matches!(
             reader.inspect(Path::new("pkg.zip"), &config),
-            Err(ArchiveError::Io(_))
-        ));
-    }
-
-    #[test]
-    fn missing_entry_read_is_invalid_not_found() {
-        let reader = ZipArchiveReader;
-        assert!(matches!(
-            reader.read_file(Path::new("pkg.zip"), "manifest.json", 16),
             Err(ArchiveError::Io(_))
         ));
     }

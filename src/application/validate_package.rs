@@ -81,11 +81,6 @@ impl PackageValidator {
     }
 
     #[must_use]
-    pub fn archive_reader(&self) -> &ZipArchiveReader {
-        &self.archive_reader
-    }
-
-    #[must_use]
     pub fn signature_verifier(&self) -> &Ed25519Verifier {
         &self.signature_verifier
     }
