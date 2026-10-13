@@ -5,21 +5,34 @@
 //! - entry paths can never escape staging (no absolute, drive-prefixed,
 //!   dot-segment, empty-segment, backslash, or over-long names);
 //! - symlinks are never extracted; duplicates and case collisions rejected;
-//! - unsupported compression is rejected, never attempted opportunistically.
+//! - unexpected compression is rejected, never attempted opportunistically;
+//! - entry-count, byte, ratio, and depth bounds are enforced independently.
 //!
 //! The hostile `tests/testdata/*.zip` corpus exercises these against the
-//! real reader once the ZIP backend lands (see `tests/testdata/README.md`).
+//! real reader (see `tests/testdata/README.md`).
 
 use std::path::Path;
 
 use conductor::packages::archive::{
-    check_entry_path, check_no_duplicate_paths, ArchiveError, ArchiveLimits, ScanConfig,
-    ZipArchiveReader, MAX_ENTRY_PATH_LEN,
+    check_entry_path, check_no_duplicate_paths, ArchiveError, ArchiveLimits, InspectedArchive,
+    ScanConfig, ZipArchiveReader, MAX_ENTRY_PATH_LEN,
 };
 use conductor::packages::policy::PackageValidationPolicy;
 
 fn production_limits() -> ArchiveLimits {
     PackageValidationPolicy::production().archive
+}
+
+/// Runs `f` against the production scan configuration.
+fn with_production<R>(f: impl FnOnce(&ScanConfig<'_>) -> R) -> R {
+    let policy = PackageValidationPolicy::production();
+    f(&policy.scan_config())
+}
+
+fn inspect_fixture(name: &str) -> Result<InspectedArchive, ArchiveError> {
+    with_production(|config| {
+        ZipArchiveReader.inspect(&Path::new("tests/testdata").join(name), config)
+    })
 }
 
 #[test]
@@ -120,9 +133,9 @@ fn duplicate_and_case_colliding_listings_rejected() {
 
 #[test]
 fn hostile_corpus_is_present_for_the_future_reader() {
-    // The real backend does not exist yet, so these fixtures are not opened
-    // here. This test pins the corpus contract: every file the future
-    // reader tests need must already be checked in.
+    // Every fixture the reader tests need must be checked in. Add a fixture
+    // to `tests/testdata/` without adding it here (and vice versa) and CI
+    // goes red.
     for fixture in [
         "traversal.zip",
         "absolute.zip",
@@ -138,4 +151,68 @@ fn hostile_corpus_is_present_for_the_future_reader() {
             path.display()
         );
     }
+}
+
+#[test]
+fn traversal_and_absolute_entries_poison_the_package() {
+    for fixture in ["traversal.zip", "absolute.zip"] {
+        assert!(
+            matches!(inspect_fixture(fixture), Err(ArchiveError::PathRejected(_))),
+            "{fixture} must fail path policy even though ok.txt is benign"
+        );
+    }
+}
+
+#[test]
+fn duplicate_entries_fail_before_payload_reads() {
+    assert!(matches!(
+        inspect_fixture("duplicate.zip"),
+        Err(ArchiveError::PathRejected(_))
+    ));
+}
+
+#[test]
+fn symlink_entries_are_rejected_by_metadata_not_name() {
+    // `link` passes the name policy; the Unix file-type bits condemn it.
+    assert!(matches!(
+        inspect_fixture("symlink.zip"),
+        Err(ArchiveError::PathRejected(_))
+    ));
+}
+
+#[test]
+fn entry_bomb_trips_the_count_limit_not_byte_limits() {
+    assert!(matches!(
+        inspect_fixture("entry-bomb.zip"),
+        Err(ArchiveError::LimitExceeded(_))
+    ));
+    // Companion proof: the count limit — not a parse failure — is what
+    // rejects it. Raised limits (still under the hard maxima) get through.
+    let policy = PackageValidationPolicy::production();
+    let raised = ArchiveLimits {
+        max_entries: 6_000,
+        ..policy.archive
+    };
+    raised
+        .validate()
+        .expect("raised limits must stay under hard maxima");
+    let config = ScanConfig {
+        limits: &raised,
+        allowed_methods: &policy.allowed_compression_methods,
+        max_compression_ratio: policy.max_compression_ratio,
+        max_nesting_depth: policy.max_nesting_depth,
+    };
+    let inspected = ZipArchiveReader
+        .inspect(Path::new("tests/testdata/entry-bomb.zip"), &config)
+        .expect("raised count limit must accept the bomb");
+    assert_eq!(inspected.entry_count, 5_000);
+    assert_eq!(inspected.files.len(), 5_000);
+}
+
+#[test]
+fn out_of_allowlist_compression_is_rejected() {
+    assert!(matches!(
+        inspect_fixture("odd-compression.zip"),
+        Err(ArchiveError::UnsupportedCompression(_))
+    ));
 }

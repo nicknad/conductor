@@ -8,7 +8,7 @@
 //! and symlink rejection are fixed invariants — never operator options.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::Path;
 use thiserror::Error;
 
@@ -116,6 +116,15 @@ pub enum ArchiveError {
 const UNIX_SYMLINK_MASK: u32 = 0o170_000;
 const UNIX_SYMLINK_TYPE: u32 = 0o120_000;
 
+/// End-of-central-directory magic (`PK\x05\x06`), ZIP64 locator magic
+/// (`PK\x06\x07`), and ZIP64 end magic (`PK\x06\x06`).
+const EOCD_MAGIC: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
+const ZIP64_LOCATOR_MAGIC: [u8; 4] = [0x50, 0x4b, 0x06, 0x07];
+const ZIP64_EOCD_MAGIC: [u8; 4] = [0x50, 0x4b, 0x06, 0x06];
+/// Fixed EOCD size without comment; comments cap at 64 KiB.
+const EOCD_FIXED_LEN: u64 = 22;
+const EOCD_MAX_COMMENT: u64 = 0xFFFF;
+
 /// The concrete archive backend. Inspection first; extraction (directed
 /// by `storage::staging`) only runs against a verified inventory — never
 /// as a casual `unzip(path, destination)` utility.
@@ -145,9 +154,88 @@ impl ZipArchiveReader {
         config: &ScanConfig<'_>,
     ) -> Result<InspectedArchive, ArchiveError> {
         config.limits.validate()?;
+        // The backend indexes entries by name, silently collapsing duplicate
+        // records. Cross-check its view against the authoritative EOCD
+        // record count first: any disagreement means ambiguous names.
+        let records = Self::central_directory_count(file)?;
         let mut zip =
             zip::ZipArchive::new(file).map_err(|e| ArchiveError::InvalidArchive(e.to_string()))?;
+        if zip.len() != records {
+            return Err(ArchiveError::PathRejected("duplicate archive paths"));
+        }
         self.scan_entries(&mut zip, config)
+    }
+
+    /// Reads the authoritative central-directory record count from the
+    /// End-of-Central-Directory (classic or ZIP64) record. Independent of
+    /// the name-indexed view the backend builds, so duplicates the backend
+    /// collapses are still caught. Fails closed whenever the EOCD cannot be
+    /// located and verified.
+    fn central_directory_count(file: &mut (impl Read + Seek)) -> Result<usize, ArchiveError> {
+        use std::io::SeekFrom;
+
+        let invalid = |msg: &str| ArchiveError::InvalidArchive(msg.to_owned());
+        let len = file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| ArchiveError::Io(e.to_string()))?;
+        if len < EOCD_FIXED_LEN {
+            return Err(invalid("file too small to be a ZIP archive"));
+        }
+        let tail_len = len.min(EOCD_FIXED_LEN + EOCD_MAX_COMMENT);
+        file.seek(SeekFrom::Start(len - tail_len))
+            .map_err(|e| ArchiveError::Io(e.to_string()))?;
+        let mut tail = vec![0u8; tail_len as usize];
+        file.read_exact(&mut tail)
+            .map_err(|e| ArchiveError::Io(e.to_string()))?;
+        // The EOCD is the last structure; a comment may follow it. Scan
+        // backwards and accept the candidate whose comment length lands
+        // exactly on EOF, so magic bytes inside payloads cannot spoof it.
+        let mut eocd_at = None;
+        for i in (0..=tail.len() - EOCD_FIXED_LEN as usize).rev() {
+            if tail[i..i + 4] == EOCD_MAGIC {
+                let comment = u16::from_le_bytes([tail[i + 20], tail[i + 21]]) as usize;
+                if i + EOCD_FIXED_LEN as usize + comment == tail.len() {
+                    eocd_at = Some(i);
+                    break;
+                }
+            }
+        }
+        let at = eocd_at.ok_or_else(|| invalid("end-of-central-directory not found"))?;
+        let u16_at = |off: usize| u16::from_le_bytes([tail[at + off], tail[at + off + 1]]);
+        if u16_at(4) != 0 || u16_at(6) != 0 {
+            return Err(invalid("multi-disk archives are not accepted"));
+        }
+        if u16_at(8) != u16_at(10) {
+            return Err(invalid("central-directory disk counts disagree"));
+        }
+        let total = u16_at(10);
+        if total != 0xFFFF {
+            return Ok(usize::from(total));
+        }
+        // ZIP64: the locator sits immediately before the EOCD and points at
+        // the ZIP64 end record holding the real 64-bit counts.
+        if at < 20 || tail[at - 20..at - 16] != ZIP64_LOCATOR_MAGIC {
+            return Err(invalid("ZIP64 end locator not found"));
+        }
+        let cd_offset = u64::from_le_bytes(
+            tail[at - 12..at - 4]
+                .try_into()
+                .map_err(|_| invalid("truncated ZIP64 locator"))?,
+        );
+        file.seek(SeekFrom::Start(cd_offset))
+            .map_err(|e| ArchiveError::Io(e.to_string()))?;
+        let mut header = [0u8; 40];
+        file.read_exact(&mut header)
+            .map_err(|_| invalid("truncated ZIP64 end record"))?;
+        if header[0..4] != ZIP64_EOCD_MAGIC {
+            return Err(invalid("ZIP64 end record not found"));
+        }
+        let total64 = u64::from_le_bytes(
+            header[32..40]
+                .try_into()
+                .map_err(|_| invalid("truncated ZIP64 end record"))?,
+        );
+        usize::try_from(total64).map_err(|_| invalid("ZIP64 entry count out of range"))
     }
 
     /// Bounded read of one entry's bytes. `max_bytes` is enforced during
@@ -528,6 +616,84 @@ mod tests {
         assert!(matches!(
             check_no_duplicate_paths(&["Bin/x".to_owned(), "bin/x".to_owned()]),
             Err(ArchiveError::PathRejected(_))
+        ));
+    }
+
+    fn classic_eocd(count: u16) -> Vec<u8> {
+        // Decoy magic up front: the scanner must skip it because its
+        // comment length does not land on EOF.
+        let mut buf = vec![0xAAu8; 6];
+        buf.extend_from_slice(&EOCD_MAGIC);
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(&EOCD_MAGIC);
+        buf.extend_from_slice(&[0, 0]); // disk
+        buf.extend_from_slice(&[0, 0]); // cd disk
+        buf.extend_from_slice(&count.to_le_bytes()); // this disk
+        buf.extend_from_slice(&count.to_le_bytes()); // total
+        buf.extend_from_slice(&[0; 8]); // sizes
+        buf.extend_from_slice(&[0, 0]); // comment len
+        buf
+    }
+
+    #[test]
+    fn eocd_count_reads_classic_records() {
+        use std::io::Cursor;
+
+        let mut cursor = Cursor::new(classic_eocd(3));
+        assert_eq!(
+            ZipArchiveReader::central_directory_count(&mut cursor).expect("classic EOCD"),
+            3
+        );
+        let mut empty = Cursor::new(b"too small".to_vec());
+        assert!(matches!(
+            ZipArchiveReader::central_directory_count(&mut empty),
+            Err(ArchiveError::InvalidArchive(_))
+        ));
+    }
+
+    #[test]
+    fn eocd_count_follows_zip64_locator() {
+        use std::io::Cursor;
+
+        let mut buf = vec![0xBBu8; 8];
+        let zip64_at = buf.len() as u64;
+        // Minimal ZIP64 end record: magic + 44-byte size + fields, with the
+        // total-entries u64 at offset 32.
+        buf.extend_from_slice(&ZIP64_EOCD_MAGIC);
+        buf.extend_from_slice(&44u64.to_le_bytes());
+        buf.extend_from_slice(&[0; 20]);
+        buf.extend_from_slice(&7u64.to_le_bytes()); // entries this disk
+        buf.extend_from_slice(&7u64.to_le_bytes()); // total entries
+        buf.extend_from_slice(&[0; 12]);
+        // Locator immediately before the classic EOCD.
+        buf.extend_from_slice(&ZIP64_LOCATOR_MAGIC);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&zip64_at.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        // Classic EOCD with placeholder counts.
+        buf.extend_from_slice(&EOCD_MAGIC);
+        buf.extend_from_slice(&[0, 0, 0, 0]);
+        buf.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        buf.extend_from_slice(&[0xFF; 8]);
+        buf.extend_from_slice(&[0, 0]);
+        let mut cursor = Cursor::new(buf);
+        assert_eq!(
+            ZipArchiveReader::central_directory_count(&mut cursor).expect("ZIP64 EOCD"),
+            7
+        );
+    }
+
+    #[test]
+    fn eocd_count_rejects_multidisk() {
+        use std::io::Cursor;
+
+        let mut buf = classic_eocd(1);
+        let disk_off = buf.len() - 22 + 4;
+        buf[disk_off] = 1; // nonzero disk number
+        let mut cursor = Cursor::new(buf);
+        assert!(matches!(
+            ZipArchiveReader::central_directory_count(&mut cursor),
+            Err(ArchiveError::InvalidArchive(_))
         ));
     }
 }

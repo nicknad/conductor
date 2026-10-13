@@ -1,30 +1,21 @@
 # Hostile archive corpus
 
-Evil-but-harmless ZIP fixtures for the future real `ZipArchiveReader`
-backend.
+Evil-but-harmless ZIP fixtures for the real `ZipArchiveReader` backend.
 Each file encodes one threat against the archive-safety invariants in
 `src/packages/archive.rs`. Payloads are inert text (`not a real plugin`,
 `x`, `{}`); the threat is always in entry **names, counts, metadata, or
 compression methods** — never in payload bytes.
 
-## Status: staged, not yet consumed
+## Status: consumed by reader tests
 
-`ZipArchiveReader::inspect` currently fails closed with
-`ArchiveError::NotImplemented` until a ZIP backend lands, so no test opens
-these files yet. What *does* run today:
-
-- `tests/archive_security.rs::hostile_corpus_is_present_for_the_future_reader`
-  pins the corpus contract: every fixture documented below must be checked
-  in, or the suite fails. Add a fixture here without adding it there (and
-  vice versa) and CI goes red.
-- The pure confinement policy (`check_entry_path`,
-  `check_no_duplicate_paths`) is tested against equivalent hostile *names*
-  in unit and integration tests. The fixtures below are the same threats in
-  real ZIP encoding, waiting for a backend that can parse them.
-
-When the backend lands, each fixture gets a reader test asserting the
-verdict in its section. Nothing about the fixtures themselves should need
-to change.
+Every fixture below is opened by a test in
+`tests/archive_security.rs` asserting its documented verdict, and
+`hostile_corpus_is_present_for_the_future_reader` pins the corpus
+contract: every fixture documented here must be checked in, or the suite
+fails. The pure confinement policy (`check_entry_path`,
+`check_no_duplicate_paths`) is additionally tested against equivalent
+hostile *names* in unit and integration tests — fixtures test encoding,
+unit tests test logic; both layers know about every threat class.
 
 Pipeline context: the validation stages these fixtures feed are defined in
 [src/packages/README.md](../../src/packages/README.md); the package format
@@ -95,9 +86,14 @@ reader that hashes the first record but extracts the last (or vice versa)
 breaks the hash↔bytes agreement the digest stage depends on. This is why
 the contract says "create new files without overwriting existing ones" and
 "hash bytes as they are extracted" — the *same* byte stream must feed both.
+Implementation note: the `zip` backend indexes entries by name and silently
+collapses duplicate records, so `inspect` cross-checks its entry view
+against the authoritative EOCD record count (`central_directory_count`)
+and rejects on any disagreement — duplicates cannot hide behind the
+library's index.
 Expected verdict: `Err(ArchiveError::PathRejected(_))` (duplicate paths)
-from `inspect`, before any payload byte is read. The future extraction test
-must additionally prove create-new semantics: if duplicates ever reach
+from `inspect`, before any payload byte is read. The extraction test must
+additionally prove create-new semantics: if duplicates ever reach
 extraction (defense in depth), the second write fails instead of replacing
 the first.
 
@@ -159,29 +155,31 @@ Expected verdict: `Err(ArchiveError::UnsupportedCompression(_))` from
 policy the bzip2 entry is rejected *even though* BZIP2 support may exist in
 the dependency — capability must not imply permission.
 
-## What the future reader tests must prove (checklist)
+## What the reader tests prove (checklist)
 
 Per fixture, and across the corpus:
 
 1. **Limits before reads.** `entry-bomb.zip` is rejected without reading
    5,000 payloads; a zeroed `ArchiveLimits` against a missing file yields
-   `LimitExceeded`, never I/O (already tested today in
-   `limits_are_checked_before_backend_touches_disk` — keep that test, add
-   the bomb as the realistic case).
+   `LimitExceeded`, never I/O. A companion assertion with a raised
+   `max_entries` gets past the count gate, proving the limit — not a parse
+   failure — is what rejects it under production policy.
 2. **Names through the pure policy.** Every entry name is routed through
    `check_entry_path` with the symlink bit from the entry metadata; raw
    names never reach path joins.
 3. **Duplicates across the whole listing.** `duplicate.zip` fails at
-   listing time, including the case-fold collision rule
-   (`check_no_duplicate_paths`).
+   listing time via the EOCD count cross-check, including the case-fold
+   collision rule (`check_no_duplicate_paths`) for backends that surface
+   both records.
 4. **Byte counting over actual output.** Decompressed bytes are counted as
    they stream out and checked against `max_uncompressed_bytes` /
    `max_entry_bytes` — central-directory `file_size` fields are hints, not
    authorities (a lying `file_size` is a future fixture candidate; see
-   below).
+   below). The manifest read already enforces its bound during streaming.
 5. **No overwrite, no escape, no residue.** Extraction creates new files
    only, inside staging only, and a failed validation leaves staging empty
-   (cleanup on failure — owned by `storage::staging`, exercised here).
+   (cleanup on failure — owned by `storage::staging`, exercised here once
+   extraction lands).
 6. **Digest agreement.** The bytes hashed during extraction are the bytes
    written — `duplicate.zip` is the regression case for split-brain
    hash-vs-write bugs.
@@ -257,10 +255,10 @@ verify with `unzip -l` or the inspection snippet in the previous section.
 - `deep-nesting.zip`: ~200 levels of nesting with total path length near
   `MAX_ENTRY_PATH_LEN` — boundary case for the length bound and for
   staging path-length limits.
-- `valid-minimal.zip`: a *benign* golden package (manifest, signature,
-  two files, all limits satisfied) — the first positive-path fixture,
-  consumed by the end-to-end validation test once manifest, signature, and
-  digest backends land.
+- `valid-minimal.zip`: deliberately **not** a checked-in fixture. The
+  benign golden package is built in-test (`tests/package_validation.rs`
+  `golden_package_bytes`) so it can never drift from the schema; a binary
+  golden would silently rot every time the manifest gains a field.
 
 ## Non-goals
 

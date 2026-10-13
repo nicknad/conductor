@@ -10,10 +10,10 @@ next (that is `application`).
 
 | File | Owns | Must not |
 |---|---|---|
-| `archive.rs` | ZIP mechanics: `ArchiveLimits`, `CompressionMethod` allowlist, concrete `ZipArchiveReader`, pure `check_entry_path` / `check_no_duplicate_paths` confinement policy | Decide validation outcomes |
-| `manifest.rs` | Bounded manifest parsing, schema-version gating | Trust hashes without checking file bytes |
-| `signature.rs` | Real `Ed25519Verifier` + `ConfiguredTrustedKeys`, closed `SignatureAlgorithm` enum, key-owned algorithm records, `PackageSignature` detached envelope | Load or execute plugin code |
-| `digest.rs` | Real SHA-256 `Sha256DigestProvider` | Decide activation policy |
+| `archive.rs` | Real `ZipArchiveReader`: EOCD record-count cross-check (duplicate collapse), path/symlink/compression/size/ratio/depth enforcement, bounded single-entry reads | Decide validation outcomes |
+| `manifest.rs` | Real schema-v1 parsing: byte bound, version gating, required-field shape, `entrypoint ∈ files`, `deny_unknown_fields` | Trust hashes without checking file bytes |
+| `signature.rs` | Real `Ed25519Verifier` + `ConfiguredTrustedKeys`, closed `SignatureAlgorithm` enum, key-owned algorithm records, `PackageSignature` detached envelope, `canonical_payload` + `authenticate` | Load or execute plugin code |
+| `digest.rs` | Real SHA-256 `Sha256DigestProvider`, buffered and streaming | Decide activation policy |
 | `inventory.rs` | `DeclaredFile` set comparison vs. actual entries (`MissingFile` / `UnexpectedFile` / `DuplicateDeclaration`), declared paths through the archive confinement policy | Persist lifecycle state; check byte agreement (extraction stage) |
 | `policy.rs` | `PackageValidationPolicy`: runtime allowlists and bounds, `production()` defaults, startup `validate()` / `ensure_production_ingest()` gates | Filesystem writes |
 | `artifact.rs` | `ArtifactDigest` + `ValidatedArtifact`: capability-like identity minted only by the validation/promotion path | Trust decisions at use time (host must still check registration and authorization) |
@@ -26,11 +26,12 @@ backend per stage (`ZipArchiveReader`, `Ed25519Verifier`,
 `ConfiguredTrustedKeys`, `Sha256DigestProvider`), with the policy
 (constructor) and trust store (setter) as the configurable inputs.
 `build()` fails with `BuildError::MissingTrustStore` when trust is absent.
-The validator owns the fixed stage order — policy gate → authenticate
-exact bytes → inspect → manifest/inventory → extract+hash/policy →
-promotion. Stages cannot be omitted; there is no skip-verification switch.
-Tests configure trust by value; fake verifier/reader backends arrive as
-`#[cfg(test)]` seams with their real counterparts.
+`validate(archive, signature)` runs the fixed stage order over one open
+file handle — policy gate → hash-and-authenticate → inspect →
+manifest/inventory → promotion minting `ValidatedArtifact`. Stages cannot
+be omitted; there is no skip-verification switch. Tests configure trust by
+value; fake verifier/reader backends arrive as `#[cfg(test)]` seams with
+their real counterparts.
 
 Two ordering rules are load-bearing:
 
@@ -60,20 +61,21 @@ Two ordering rules are load-bearing:
 ## Errors
 
 All error enums derive `Display` + `Error` via `thiserror`; messages are
-part of the observable contract. Backends that are not implemented yet
-(archive reader, manifest parsing) fail closed with `NotImplemented`
-variants — never silent success. Signature and digest backends are real:
-their failure variants indicate genuinely rejected input.
+part of the observable contract. Every backend is real and fails closed on
+rejected input — there are no `NotImplemented` variants left in this
+module. Still future: staged extraction with per-file byte agreement
+(`storage::staging`) and audit logging of the authorizing signer.
 
 ## Tests
 
-- Unit tests beside each module (bounds, path tables, fail-closed backends,
-  trust-by-value configuration).
+- Unit tests beside each module (bounds, path tables, EOCD parser vectors,
+  signature roundtrips, manifest shape cases).
 - `tests/archive_security.rs` — confinement invariants through the public
-  API, plus a presence check on the hostile corpus.
+  API, plus one reader test per hostile-corpus fixture asserting its
+  documented verdict.
 - `tests/package_validation.rs` — policy gates, mandatory trust store at
-  build, and validator stage order (unsigned configs are rejected before
-  the archive stage runs).
+  build, and end-to-end validation of a golden package built in-test
+  (in-test construction keeps it in sync with the schema; no binary golden
+  fixture to drift).
 - `tests/testdata/` — evil-but-inert ZIP fixtures; see [the corpus
-  reference](../../tests/testdata/README.md). Consumed by real-reader
-  tests once the ZIP backend lands.
+  reference](../../tests/testdata/README.md).
