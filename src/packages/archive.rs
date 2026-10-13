@@ -11,6 +11,7 @@ use std::fs::File;
 use std::io::{Read, Seek};
 use std::path::Path;
 use thiserror::Error;
+use unicode_normalization::UnicodeNormalization;
 
 /// Hard implementation ceilings. Operator-configured [`ArchiveLimits`] must
 /// fit inside these; raising them requires a code change, not a config edit.
@@ -388,8 +389,8 @@ pub const MAX_ENTRY_PATH_LEN: usize = 1_024;
 /// entries), Windows reserved device names, and symlink entries. A single
 /// trailing `/` (explicit directory entry) is stripped — directories carry
 /// no payload and are recreated from file parents during extraction.
-/// Returns the normalized relative path, confined by construction: no
-/// caller can obtain an escaping path from this function.
+/// Returns the relative path normalized to Unicode NFC, confined by
+/// construction: no caller can obtain an escaping path from this function.
 pub fn check_entry_path(entry: &str, is_symlink: bool) -> Result<String, ArchiveError> {
     if is_symlink {
         return Err(ArchiveError::PathRejected(
@@ -451,7 +452,7 @@ pub fn check_entry_path(entry: &str, is_symlink: bool) -> Result<String, Archive
         }
         normalized.push(component);
     }
-    Ok(normalized.join("/"))
+    Ok(normalized.join("/").nfc().collect())
 }
 
 /// Windows treats `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, and
@@ -467,10 +468,12 @@ fn is_windows_reserved_name(component: &str) -> bool {
     RESERVED.iter().any(|name| stem.eq_ignore_ascii_case(name))
 }
 
-/// Rejects exact-duplicate paths and case-fold collisions within one
-/// archive listing. The second check matters because staging may sit on a
-/// case-insensitive filesystem, where `Bin/x` and `bin/x` would collapse
-/// into a single file and break inventory accounting.
+/// Rejects exact-duplicate paths and collisions under Unicode NFC
+/// normalization plus case folding within one archive listing. Both
+/// matter because staging may sit on a case-insensitive and/or
+/// normalization-insensitive filesystem, where `Bin/x` / `bin/x` or
+/// NFC/NFD forms of the same name would collapse into a single file and
+/// break inventory accounting.
 pub fn check_no_duplicate_paths(paths: &[impl AsRef<str>]) -> Result<(), ArchiveError> {
     use std::collections::HashSet;
     let mut seen: HashSet<&str> = HashSet::new();
@@ -480,7 +483,8 @@ pub fn check_no_duplicate_paths(paths: &[impl AsRef<str>]) -> Result<(), Archive
         if !seen.insert(entry) {
             return Err(ArchiveError::PathRejected("duplicate archive paths"));
         }
-        if !folded.insert(entry.to_lowercase()) {
+        let fold_key: String = entry.nfc().collect::<String>().to_lowercase();
+        if !folded.insert(fold_key) {
             return Err(ArchiveError::PathRejected("case-colliding archive paths"));
         }
     }
@@ -954,6 +958,25 @@ mod tests {
                 "must accept {accepted:?}"
             );
         }
+    }
+
+    #[test]
+    fn unicode_equivalents_normalize_and_collide() {
+        let nfc = "caf\u{e9}/r\u{e9}sum\u{e9}.txt";
+        let nfd = "cafe\u{301}/re\u{301}sume\u{301}.txt";
+        assert_eq!(
+            check_entry_path(nfc, false).expect("NFC must be accepted"),
+            check_entry_path(nfd, false).expect("NFD must be accepted"),
+            "equivalent forms must normalize to one canonical path"
+        );
+        assert!(matches!(
+            check_no_duplicate_paths(&[nfc.to_owned(), nfd.to_owned()]),
+            Err(ArchiveError::PathRejected(_))
+        ));
+        assert!(matches!(
+            check_no_duplicate_paths(&["CAF\u{c9}.TXT".to_owned(), "caf\u{e9}.txt".to_owned()]),
+            Err(ArchiveError::PathRejected(_))
+        ));
     }
 
     #[test]

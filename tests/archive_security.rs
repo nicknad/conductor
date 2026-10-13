@@ -197,6 +197,15 @@ fn duplicate_and_case_colliding_listings_rejected() {
         check_no_duplicate_paths(&colliding),
         Err(ArchiveError::PathRejected(_))
     ));
+    // Unicode equivalents collide too: NFC and NFD names map to one
+    // filesystem entry on normalization-insensitive filesystems.
+    let composed = ["caf\u{e9}.txt".to_owned(), "other.txt".to_owned()];
+    assert!(check_no_duplicate_paths(&composed).is_ok());
+    let equivalent = ["cafe\u{301}.txt".to_owned(), "caf\u{e9}.txt".to_owned()];
+    assert!(matches!(
+        check_no_duplicate_paths(&equivalent),
+        Err(ArchiveError::PathRejected(_))
+    ));
 }
 
 #[test]
