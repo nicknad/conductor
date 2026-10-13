@@ -11,6 +11,7 @@ serde_json = "1"
 thiserror = "2"
 ed25519-dalek = "2"
 sha2 = "0.10"
+rusqlite = { version = "0.40", features = ["bundled"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 axum = { version = "0.8.9", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }

@@ -1,12 +1,12 @@
 # Persistence and Rejection Events — Design
 
-> **Status:** in progress — **PR1 (structured rejection events) implemented**:
-> taxonomy, `tracing` sink, typed recording sites, transport fallback. PR2
-> (SQLite persistence) and later phases are not yet implemented. Implements
-> audit items 7 and 8 from [storage-reconciliation.md](storage-reconciliation.md).
-> Decisions recorded here: **SQLite via `rusqlite` (bundled)** for the registry
-> and rejection records; rejections go to **structured `tracing` events and
-> `package_rejections` rows**; the promote-then-register order is unchanged.
+> **Status:** in progress — **PR1 (structured rejection events)** and
+> **PR2 (SQLite registry persistence)** implemented. Later phases are not yet
+> implemented. Implements audit items 7 and 8 from
+> [storage-reconciliation.md](storage-reconciliation.md). Decisions recorded
+> here: **SQLite via `rusqlite` (bundled)** for the registry and rejection
+> records; rejections go to **structured `tracing` events and `package_rejections`
+> rows**; the promote-then-register order is unchanged.
 
 ## 1. Scope
 
@@ -221,9 +221,8 @@ Notes:
    - different digest → `VersionConflict`;
    - absent → insert the full row → `Ok(already_registered = false)`.
 
-Additional read API for reconciliation and activation:
-`list_versions(module_id)`, `all_versions()`, `artifact_state(module_id,
-version)`.
+Additional read API: `list_versions(module_id)` (landed with PR2);
+`all_versions()` and `artifact_state()` land with reconciliation (PR4).
 
 ### 4.6 Upload ordering and crash windows
 
@@ -297,11 +296,13 @@ wait for the retention/GC work.
 1. **PR1 — taxonomy and structured tracing (implemented)** (`src/audit/`):
    typed recording sites, response-marker mechanism. No DB, no external
    behavior change.
-2. **PR2 — SQLite store**: dependency, `database.rs`, migrations,
-   `ModuleRegistry::open`, config paths, tests. Registration survives restart.
-   Repair the stale .NET CI at least enough to run
-   `cargo fmt --check`, `clippy -D warnings`, `test`, `deny check` for the new
-   dependency.
+2. **PR2 — SQLite store (implemented)**: `rusqlite` (bundled),
+   `storage/database.rs` with the WAL/pragma policy and forward-only
+   migrations, `ModuleRegistry::open` / `open_in_memory` whose records
+   survive a reopen, `Config::database_path`, and a Rust CI workflow
+   (`fmt`, `clippy`, `test`, `cargo deny`). Wiring the store into
+   `server::run` happens with startup assembly (still gated on trust-key
+   loading).
 3. **PR3 — rejection rows**: DB sink, request-id plumbing, bounded detail.
 4. **PR4 — reconciliation**: integrity states, staging sweep, startup wiring,
    `reconciliation_runs`.

@@ -15,7 +15,7 @@
 
 use thiserror::Error;
 
-use crate::modules::registry::ModuleRegistry;
+use crate::modules::registry::{ModuleRegistry, RegistryError};
 use crate::packages::artifact::ArtifactDigest;
 
 /// What activation is permitted to run. Built once at startup, held
@@ -60,6 +60,8 @@ pub enum ActivationError {
         version: String,
         runtime: String,
     },
+    #[error("registry lookup failed: {0}")]
+    Storage(#[from] RegistryError),
 }
 
 /// Activates a registered module version under policy.
@@ -71,7 +73,7 @@ pub fn activate(
 ) -> Result<ActivatedModule, ActivationError> {
     let record =
         registry
-            .get(module_id, version)
+            .get(module_id, version)?
             .ok_or_else(|| ActivationError::NotRegistered {
                 module_id: module_id.to_owned(),
                 version: version.to_owned(),
@@ -108,6 +110,10 @@ mod tests {
             digest: ArtifactDigest::new([7u8; 32]),
             signer_key_id: "k1".to_owned(),
             runtime: runtime.to_owned(),
+            manifest_version: 1,
+            manifest_json: "{}".to_owned(),
+            artifact_relpath: format!("{module}/{version}/pkg.zip"),
+            artifact_size: 0,
             registered_at: SystemTime::now(),
         }
     }

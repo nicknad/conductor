@@ -164,6 +164,14 @@ impl PackageValidator {
                 other => ValidationError::Archive(other),
             })?;
         let manifest = Manifest::parse_with_policy(&manifest_bytes, &self.policy)?;
+        // Keep the exact validated bytes for the registry: reserializing
+        // the parsed manifest would produce a different document, and the
+        // audit record wants the bytes the signature actually covered.
+        let manifest_json = String::from_utf8(manifest_bytes.clone()).map_err(|_| {
+            ValidationError::Manifest(ManifestError::Invalid(
+                "manifest is not valid UTF-8".to_owned(),
+            ))
+        })?;
         // Inventory compares declared payload files against the inspected
         // listing minus the manifest itself (required separately above,
         // never listed in `files`).
@@ -181,28 +189,47 @@ impl PackageValidator {
             manifest.module_id.clone(),
             manifest.version.clone(),
         );
-        Ok(ValidatedPackage::new(artifact, manifest, signer))
+        Ok(ValidatedPackage::new(
+            artifact,
+            manifest,
+            manifest_json,
+            on_disk,
+            signer,
+        ))
     }
 }
 
-/// Complete promotion verdict: artifact identity, validated manifest, and
-/// the authorizing signer. Minted only by [`PackageValidator::validate`];
-/// registry, audit, and activation consume it without touching the archive
-/// again.
+/// Complete promotion verdict: artifact identity, validated manifest, the
+/// exact manifest bytes, the archive size, and the authorizing signer.
+/// Minted only by [`PackageValidator::validate`]; registry, audit, and
+/// activation consume it without touching the archive again.
 #[derive(Debug)]
 pub struct ValidatedPackage {
     artifact: ValidatedArtifact,
     manifest: Manifest,
+    /// Exact validated manifest bytes, bounded by the manifest policy.
+    manifest_json: String,
+    /// Size in bytes of the validated archive, equal to the promoted
+    /// artifact's size.
+    artifact_size: u64,
     signer: TrustedSigningKey,
 }
 
 impl ValidatedPackage {
     /// Mints the promotion verdict. Private to this module so only
     /// [`PackageValidator::validate`] can construct it.
-    fn new(artifact: ValidatedArtifact, manifest: Manifest, signer: TrustedSigningKey) -> Self {
+    fn new(
+        artifact: ValidatedArtifact,
+        manifest: Manifest,
+        manifest_json: String,
+        artifact_size: u64,
+        signer: TrustedSigningKey,
+    ) -> Self {
         Self {
             artifact,
             manifest,
+            manifest_json,
+            artifact_size,
             signer,
         }
     }
@@ -215,6 +242,18 @@ impl ValidatedPackage {
     #[must_use]
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// Exact validated manifest bytes, as read from the archive.
+    #[must_use]
+    pub fn manifest_json(&self) -> &str {
+        &self.manifest_json
+    }
+
+    /// Size in bytes of the validated archive (and of the promoted artifact).
+    #[must_use]
+    pub fn artifact_size(&self) -> u64 {
+        self.artifact_size
     }
 
     #[must_use]

@@ -60,6 +60,15 @@ impl Config {
     pub fn artifact_dir(&self) -> PathBuf {
         Path::new(&self.storage_root).join("artifacts")
     }
+
+    /// SQLite database path. The parent directory is created on demand by
+    /// the database layer; migrations run at startup.
+    #[must_use]
+    pub fn database_path(&self) -> PathBuf {
+        Path::new(&self.storage_root)
+            .join("database")
+            .join("conductor.db")
+    }
 }
 
 /// Loads host configuration from file and environment.
@@ -87,6 +96,17 @@ mod tests {
     #[test]
     fn default_timeout_is_nonzero() {
         assert!(Config::default().request_timeout_secs > 0);
+    }
+
+    #[test]
+    fn database_lives_under_storage_root() {
+        let config = Config::default();
+        assert_eq!(
+            config.database_path(),
+            Path::new(&config.storage_root)
+                .join("database")
+                .join("conductor.db")
+        );
     }
 
     #[test]

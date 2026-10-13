@@ -35,6 +35,24 @@ impl ArtifactDigest {
         }
         out
     }
+
+    /// Parses exactly 64 hex characters (either case) back into a digest.
+    /// Returns `None` for any other shape, so stored records cannot smuggle
+    /// a malformed digest past a lookup.
+    #[must_use]
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        if hex.len() != 64 {
+            return None;
+        }
+        let digits = hex.as_bytes();
+        let mut bytes = [0u8; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            let high = char::from(digits[index * 2]).to_digit(16)?;
+            let low = char::from(digits[index * 2 + 1]).to_digit(16)?;
+            *byte = ((high << 4) | low) as u8;
+        }
+        Some(Self(bytes))
+    }
 }
 
 /// A validated, promoted artifact. Minted only by the validation workflow;
@@ -92,6 +110,18 @@ mod tests {
         assert!(hex.starts_with("0f"));
         assert!(hex.ends_with("a0"));
         assert_eq!(digest.as_bytes(), &bytes);
+    }
+
+    #[test]
+    fn digest_roundtrips_through_hex_and_rejects_bad_shapes() {
+        let digest = ArtifactDigest::new([0xAB; 32]);
+        let hex = digest.to_hex();
+        assert_eq!(ArtifactDigest::from_hex(&hex), Some(digest));
+        assert_eq!(ArtifactDigest::from_hex(&hex.to_uppercase()), Some(digest));
+        assert_eq!(ArtifactDigest::from_hex(""), None);
+        assert_eq!(ArtifactDigest::from_hex(&"0".repeat(63)), None);
+        assert_eq!(ArtifactDigest::from_hex(&"0".repeat(65)), None);
+        assert_eq!(ArtifactDigest::from_hex(&"z".repeat(64)), None);
     }
 
     #[test]

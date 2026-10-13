@@ -31,7 +31,7 @@
 //! digest, and authorizing signer. On validation or promotion failure the
 //! quarantine file is removed so hostile bytes cannot accumulate.
 //! Validation, promotion, and registration run on a blocking thread
-//! (synchronous file I/O and in-memory state) under the configured request
+//! (synchronous file I/O and registry state) under the configured request
 //! timeout.
 //!
 //! Every refusal is recorded exactly once as a structured
@@ -59,7 +59,7 @@ use crate::api::rejection::{request_id, Rejection};
 use crate::application::upload_package::run_upload_workflow;
 use crate::application::validate_package::PackageValidator;
 use crate::audit::recorder::RejectionRecorder;
-use crate::modules::registry::ModuleRegistry;
+use crate::modules::registry::{ModuleRegistry, RegistryError};
 use crate::packages::signature::{PackageSignature, SUPPORTED_SIGNATURE_FORMAT_VERSION};
 use crate::storage::artifact_store::PromoteError;
 
@@ -429,19 +429,34 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Result<Re
                     .with_upload(Some(audit_key_id.as_str()), audit_bytes)
                     .with_artifact(verdict.artifact())
             })?;
+            // The registry records the promoted artifact's relative address
+            // for reconciliation; the layout is owned by the artifact store.
+            let promoted_relpath = crate::storage::artifact_store::artifact_relative_path(&verdict);
             // Post-promotion binding: the digest is now durable, so the
             // registry learns which bytes this module version means. A
             // version conflict leaves the promoted blob unreferenced
             // (immutable, never the source of truth) and rejects the
-            // upload; an identical re-upload is idempotent.
-            match crate::application::register_package::register(&registry, &verdict) {
+            // upload; an identical re-upload is idempotent. Storage
+            // failures are server-side and never reported as conflicts.
+            match crate::application::register_package::register(
+                &registry,
+                &verdict,
+                &promoted_relpath,
+            ) {
                 Ok(_) => Ok(verdict),
-                Err(e) => Err(Rejection::from_api(ApiError::Conflict(
-                    "version_conflict",
-                    e.to_string(),
-                ))
-                .with_upload(Some(audit_key_id.as_str()), audit_bytes)
-                .with_artifact(verdict.artifact())),
+                Err(err) => {
+                    let api = match &err {
+                        RegistryError::VersionConflict { .. } => {
+                            ApiError::Conflict("version_conflict", err.to_string())
+                        }
+                        RegistryError::Storage(_) => {
+                            ApiError::Internal(format!("registry storage failed: {err}"))
+                        }
+                    };
+                    Err(Rejection::from_api(api)
+                        .with_upload(Some(audit_key_id.as_str()), audit_bytes)
+                        .with_artifact(verdict.artifact()))
+                }
             }
         }),
     )

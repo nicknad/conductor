@@ -23,9 +23,17 @@ use std::time::SystemTime;
 /// version; returns [`RegistryError::VersionConflict`] when a version would
 /// change meaning. Only the sealed verdict can mint the record, so `digest`
 /// and `signer_key_id` are trustworthy by construction.
+///
+/// `artifact_relpath` is the promoted artifact's address relative to the
+/// configured artifacts root (see
+/// [`artifact_relative_path`](crate::storage::artifact_store::artifact_relative_path)).
+/// The registry stores it as reconciliation bookkeeping; it is never used
+/// to load code. The artifact size comes from the verdict, which measured
+/// the exact validated bytes.
 pub fn register(
     registry: &ModuleRegistry,
     validated: &ValidatedPackage,
+    artifact_relpath: &str,
 ) -> Result<Registration, RegistryError> {
     registry.record(ModuleRecord {
         module_id: validated.artifact().module_id().to_owned(),
@@ -33,6 +41,10 @@ pub fn register(
         digest: *validated.artifact().digest(),
         signer_key_id: validated.signer().key_id.clone(),
         runtime: validated.manifest().runtime.clone(),
+        manifest_version: validated.manifest().manifest_version,
+        manifest_json: validated.manifest_json().to_owned(),
+        artifact_relpath: artifact_relpath.to_owned(),
+        artifact_size: validated.artifact_size(),
         registered_at: SystemTime::now(),
     })
 }
@@ -117,18 +129,32 @@ mod tests {
         (verdict, dir)
     }
 
+    fn relpath(verdict: &ValidatedPackage) -> String {
+        crate::storage::artifact_store::artifact_relative_path(verdict)
+    }
+
     #[test]
     fn registers_verdict_identity_and_provenance() {
         let bytes = package_bytes("1.2.0", b"bin");
         let (verdict, dir) = validated(&bytes, "ok");
         let registry = ModuleRegistry::new();
-        let outcome = register(&registry, &verdict).expect("register");
+        let relpath = relpath(&verdict);
+        let outcome = register(&registry, &verdict, &relpath).expect("register");
         assert!(!outcome.already_registered);
         assert_eq!(outcome.record.module_id, "reporting-service");
         assert_eq!(outcome.record.version, "1.2.0");
         assert_eq!(outcome.record.digest, *verdict.artifact().digest());
         assert_eq!(outcome.record.signer_key_id, "k1");
         assert_eq!(outcome.record.runtime, "rust");
+        assert_eq!(outcome.record.manifest_version, 1);
+        assert_eq!(outcome.record.artifact_relpath, relpath);
+        assert_eq!(outcome.record.artifact_size, bytes.len() as u64);
+        // The exact validated manifest bytes are preserved, not a
+        // reserialization.
+        let stored: serde_json::Value =
+            serde_json::from_str(&outcome.record.manifest_json).expect("stored manifest is JSON");
+        assert_eq!(stored["module_id"], "reporting-service");
+        assert_eq!(stored["manifest_version"].as_u64(), Some(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -137,10 +163,10 @@ mod tests {
         let bytes = package_bytes("1.2.0", b"bin");
         let (verdict, dir) = validated(&bytes, "idem");
         let registry = ModuleRegistry::new();
-        register(&registry, &verdict).expect("first");
-        let again = register(&registry, &verdict).expect("second");
+        register(&registry, &verdict, &relpath(&verdict)).expect("first");
+        let again = register(&registry, &verdict, &relpath(&verdict)).expect("second");
         assert!(again.already_registered);
-        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.len().expect("len"), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -151,12 +177,13 @@ mod tests {
         let (verdict_a, dir) = validated(&a, "conflict-a");
         let (verdict_b, _) = validated(&b, "conflict-b");
         let registry = ModuleRegistry::new();
-        register(&registry, &verdict_a).expect("first");
-        let err = register(&registry, &verdict_b).unwrap_err();
+        register(&registry, &verdict_a, &relpath(&verdict_a)).expect("first");
+        let err = register(&registry, &verdict_b, &relpath(&verdict_b)).unwrap_err();
         assert!(matches!(err, RegistryError::VersionConflict { .. }));
         assert_eq!(
             registry
                 .get("reporting-service", "1.2.0")
+                .expect("lookup")
                 .expect("kept")
                 .digest,
             *verdict_a.artifact().digest()

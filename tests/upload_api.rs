@@ -369,6 +369,7 @@ async fn same_version_different_bytes_conflicts_with_409() {
     let registered = state
         .registry
         .get("reporting-service", "1.2.0")
+        .expect("lookup must succeed")
         .expect("version must stay registered");
     let expected: [u8; 32] = Sha256DigestProvider.digest(&package).expect("hash");
     assert_eq!(registered.digest, ArtifactDigest::new(expected));

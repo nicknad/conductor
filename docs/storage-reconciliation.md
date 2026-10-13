@@ -149,7 +149,9 @@ are independently shippable unless noted. Items 7 and 8 are planned in detail in
    - durable audit and per-execution records.
 
    §6 items 1, 4, and 8 are gated on this workstream; item 2 (staging invariant)
-   and item 7 (dedup) are gated on the decisions below.
+   and item 7 (dedup) are gated on the decisions below. Registry persistence and
+   migrations landed (PR2 of [design-persistence.md](design-persistence.md));
+   startup reconciliation is PR4.
 
 ### Decide before more artifacts accumulate (order-dependent)
 

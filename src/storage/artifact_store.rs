@@ -33,13 +33,24 @@ pub enum PromoteError {
     Io(String),
 }
 
+/// Artifact address relative to the configured artifacts root:
+/// `{module_id}/{version}/{digest_hex}.zip`. The layout lives here and
+/// nowhere else; the registry stores this string so reconciliation does
+/// not re-derive it.
+#[must_use]
+pub fn artifact_relative_path(validated: &ValidatedPackage) -> String {
+    format!(
+        "{}/{}/{}.zip",
+        validated.artifact().module_id(),
+        validated.artifact().version(),
+        validated.artifact().digest().to_hex()
+    )
+}
+
 /// Destination address for a validated package.
 #[must_use]
 pub fn artifact_path(artifacts: &Path, validated: &ValidatedPackage) -> PathBuf {
-    artifacts
-        .join(validated.artifact().module_id())
-        .join(validated.artifact().version())
-        .join(format!("{}.zip", validated.artifact().digest().to_hex()))
+    artifacts.join(artifact_relative_path(validated))
 }
 
 /// Re-hashes the quarantine file, checks it still matches the validation
@@ -266,6 +277,23 @@ mod tests {
             promote_quarantined(&artifacts, &qpath, &verdict).unwrap_err(),
             PromoteError::DigestMismatch
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relative_path_pins_the_storage_layout() {
+        let bytes = package_bytes("reporting-service", "1.2.0", b"bin");
+        let (verdict, _, dir) = validated(&bytes, "relpath");
+        let expected = format!(
+            "reporting-service/1.2.0/{}.zip",
+            verdict.artifact().digest().to_hex()
+        );
+        assert_eq!(artifact_relative_path(&verdict), expected);
+        #[cfg(unix)]
+        assert_eq!(
+            artifact_path(Path::new("/root/artifacts"), &verdict),
+            Path::new(&format!("/root/artifacts/{expected}"))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

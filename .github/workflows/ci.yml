@@ -15,39 +15,31 @@ concurrency:
 
 jobs:
   verify:
-    name: verify (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ ubuntu-latest, windows-latest ]
+    name: verify
+    # Ubuntu only for now: one quarantine test backdates files through
+    # `touch -d`, which is not portable to Windows runners. Make that test
+    # portable before adding an OS matrix back.
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Set up .NET
-        uses: actions/setup-dotnet@v6
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          global-json-file: global.json
+          components: rustfmt, clippy
 
-      - name: Restore
-        run: dotnet restore JobScheduler.slnx
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
 
       - name: Format
-        run: dotnet format JobScheduler.slnx --verify-no-changes
+        run: cargo fmt --all --check
 
-      - name: Build
-        run: dotnet build JobScheduler.slnx -c Release --no-restore
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: dotnet test JobScheduler.slnx -c Release --no-build
+        run: cargo test
 
-      - name: Set up PackageGuard
-        run: dotnet tool install --global PackageGuard --version 2.9.1
-
-      - name: Add .NET tools to PATH
-        shell: pwsh
-        run: Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $HOME '.dotnet' 'tools')
-
-      - name: PackageGuard
-        run: PackageGuard
+      - name: Deny
+        uses: EmbarkStudios/cargo-deny-action@v2
