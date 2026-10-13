@@ -3,5 +3,17 @@
 version = 4
 
 [[package]]
-name = "scheduler"
+name = "conductor-contracts"
+version = "0.1.0"
+
+[[package]]
+name = "conductor-host"
+version = "0.1.0"
+
+[[package]]
+name = "conductor-package"
+version = "0.1.0"
+
+[[package]]
+name = "conductor-worker"
 version = "0.1.0"

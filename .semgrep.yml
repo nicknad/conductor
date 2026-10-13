@@ -85,6 +85,7 @@ rules:
     paths:
       include:
         - "crates/**"
+        - "apps/**"
     patterns:
       - pattern-either:
           - pattern: std::net::TcpStream::connect(...)

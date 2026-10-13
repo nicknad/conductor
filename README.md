@@ -23,7 +23,11 @@ restarting the scheduler host**.
 ```text
 Cargo.toml                  Rust workspace definition
 crates/
-  scheduler/                Placeholder crate; will grow into the ported implementation
+  conductor-contracts/      Stable API for job modules
+  conductor-package/        Manifest, signatures, archive validation
+  conductor-host/           HTTP API, workflow, storage, scheduler
+apps/
+  conductor-worker/         Optional isolated worker executable
 docs/                       Historical .NET-era specs (background only, not current spec)
 archive/
   dotnet-original/          Frozen .NET 10 implementation (reference only)
