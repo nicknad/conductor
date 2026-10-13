@@ -12,9 +12,9 @@ next (that is `application`).
 |---|---|---|
 | `archive.rs` | ZIP mechanics: `ArchiveLimits`, `CompressionMethod` allowlist, concrete `ZipArchiveReader`, pure `check_entry_path` / `check_no_duplicate_paths` confinement policy | Decide validation outcomes |
 | `manifest.rs` | Bounded manifest parsing, schema-version gating | Trust hashes without checking file bytes |
-| `signature.rs` | Concrete `Ed25519Verifier` + `ConfiguredTrustedKeys`, closed `SignatureAlgorithm` enum, key-owned algorithm records, `PackageSignature` detached envelope | Load or execute plugin code |
-| `digest.rs` | Concrete `Sha256DigestProvider`, pinned SHA-256 default | Decide activation policy |
-| `inventory.rs` | Declared-files vs. archive-entries comparison | Persist lifecycle state |
+| `signature.rs` | Real `Ed25519Verifier` + `ConfiguredTrustedKeys`, closed `SignatureAlgorithm` enum, key-owned algorithm records, `PackageSignature` detached envelope | Load or execute plugin code |
+| `digest.rs` | Real SHA-256 `Sha256DigestProvider` | Decide activation policy |
+| `inventory.rs` | `DeclaredFile` set comparison vs. actual entries (`MissingFile` / `UnexpectedFile` / `DuplicateDeclaration`), declared paths through the archive confinement policy | Persist lifecycle state; check byte agreement (extraction stage) |
 | `policy.rs` | `PackageValidationPolicy`: runtime allowlists and bounds, `production()` defaults, startup `validate()` / `ensure_production_ingest()` gates | Filesystem writes |
 | `artifact.rs` | `ArtifactDigest` + `ValidatedArtifact`: capability-like identity minted only by the validation/promotion path | Trust decisions at use time (host must still check registration and authorization) |
 
@@ -60,8 +60,10 @@ Two ordering rules are load-bearing:
 ## Errors
 
 All error enums derive `Display` + `Error` via `thiserror`; messages are
-part of the observable contract. Backends that are not implemented yet fail
-closed with `NotImplemented` variants — never silent success.
+part of the observable contract. Backends that are not implemented yet
+(archive reader, manifest parsing) fail closed with `NotImplemented`
+variants — never silent success. Signature and digest backends are real:
+their failure variants indicate genuinely rejected input.
 
 ## Tests
 

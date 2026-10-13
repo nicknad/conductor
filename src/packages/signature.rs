@@ -7,6 +7,9 @@
 //! set stays a closed [`SignatureAlgorithm`] enum gated by policy — never
 //! whatever string the uploaded package declares.
 
+use ed25519_dalek::{
+    Signature as Ed25519Signature, Verifier as _, VerifyingKey as Ed25519VerifyingKey,
+};
 use thiserror::Error;
 
 /// Closed set of accepted signature algorithms.
@@ -105,29 +108,40 @@ pub enum SignatureError {
     VerificationFailed,
     #[error("key provider failure: {0}")]
     ProviderFailure(String),
-    #[error("signature backend not implemented yet")]
-    NotImplemented,
 }
 
-/// The concrete signature verifier. Must reject algorithm mismatches
-/// against `key.algorithm` rather than trusting package-declared metadata.
-///
-/// Crypto is not wired yet, so verification fails closed until a real
-/// Ed25519 backend lands. When positive-path tests need an accepting
-/// verifier, the seam will be a `#[cfg(test)]` constructor here — never a
-/// production `skip_verification` switch.
+/// The concrete signature verifier. Rejects algorithm mismatches against
+/// `key.algorithm` rather than trusting package-declared metadata.
+/// Malformed keys and signatures fail closed as [`SignatureError::VerificationFailed`]:
+/// verification has exactly one success path and no diagnostic oracle.
 #[derive(Debug, Default)]
 pub struct Ed25519Verifier;
 
 impl Ed25519Verifier {
-    /// Verifies `signature` over `message` with `key`.
+    /// Verifies `signature` over `message` with `key`. Pure computation —
+    /// no I/O, no time limits needed.
     pub fn verify(
         &self,
-        _key: &TrustedSigningKey,
-        _message: &[u8],
-        _signature: &[u8],
+        key: &TrustedSigningKey,
+        message: &[u8],
+        signature: &[u8],
     ) -> Result<(), SignatureError> {
-        Err(SignatureError::NotImplemented)
+        if key.algorithm != SignatureAlgorithm::Ed25519 {
+            return Err(SignatureError::UnsupportedAlgorithm);
+        }
+        let public: [u8; 32] = key
+            .public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| SignatureError::VerificationFailed)?;
+        let verifying = Ed25519VerifyingKey::from_bytes(&public)
+            .map_err(|_| SignatureError::VerificationFailed)?;
+        let bytes: [u8; 64] = signature
+            .try_into()
+            .map_err(|_| SignatureError::VerificationFailed)?;
+        verifying
+            .verify(message, &Ed25519Signature::from_bytes(&bytes))
+            .map_err(|_| SignatureError::VerificationFailed)
     }
 }
 
@@ -157,11 +171,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn verifier_fails_closed_until_wired() {
-        let verifier = Ed25519Verifier;
-        let key = TrustedSigningKey::new("k1", SignatureAlgorithm::Ed25519, vec![0u8; 32]);
-        let err = verifier.verify(&key, b"msg", b"sig").unwrap_err();
-        assert!(matches!(err, SignatureError::NotImplemented));
+    fn verifier_accepts_genuine_signature() {
+        use ed25519_dalek::{Signer as _, SigningKey};
+
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let message = b"package bytes";
+        let signature = signing.sign(message);
+        let key = TrustedSigningKey::new(
+            "k1",
+            SignatureAlgorithm::Ed25519,
+            signing.verifying_key().to_bytes().to_vec(),
+        );
+        Ed25519Verifier
+            .verify(&key, message, &signature.to_bytes())
+            .expect("genuine signature must verify");
+    }
+
+    #[test]
+    fn verifier_rejects_tampering_and_malformed_inputs() {
+        use ed25519_dalek::{Signer as _, SigningKey};
+
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let key = TrustedSigningKey::new(
+            "k1",
+            SignatureAlgorithm::Ed25519,
+            signing.verifying_key().to_bytes().to_vec(),
+        );
+        let signature = signing.sign(b"package bytes");
+        for (message, sig) in [
+            (&b"tampered bytes"[..], &signature.to_bytes()[..]),
+            (&b"package bytes"[..], &b"too short"[..]),
+            (&b"package bytes"[..], &[0u8; 64][..]),
+        ] {
+            assert!(matches!(
+                Ed25519Verifier.verify(&key, message, sig),
+                Err(SignatureError::VerificationFailed)
+            ));
+        }
+        let short_key = TrustedSigningKey::new("k1", SignatureAlgorithm::Ed25519, vec![1u8; 4]);
+        assert!(matches!(
+            Ed25519Verifier.verify(&short_key, b"m", &signature.to_bytes()),
+            Err(SignatureError::VerificationFailed)
+        ));
     }
 
     #[test]

@@ -211,11 +211,12 @@ mod tests {
         let validator = test_validator(PackageValidationPolicy::production());
         assert!(validator.trusted_keys().key("k1").is_some());
         assert!(validator.trusted_keys().key("unknown").is_none());
+        // Empty public key and garbage signature fail closed.
         let verify = validator.signature_verifier().verify(
             &TrustedSigningKey::new("k1", SignatureAlgorithm::Ed25519, vec![]),
             b"m",
             b"s",
         );
-        assert!(matches!(verify, Err(SignatureError::NotImplemented)));
+        assert!(matches!(verify, Err(SignatureError::VerificationFailed)));
     }
 }

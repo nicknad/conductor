@@ -8,3 +8,5 @@ description = "Modular-monolith job host (unstable scaffold)"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+ed25519-dalek = "2"
+sha2 = "0.10"
