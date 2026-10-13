@@ -150,6 +150,17 @@ mod tests {
     }
 
     #[test]
+    fn exact_bound_parses_but_one_byte_over_does_not() {
+        let json = valid_json();
+        let len = u64::try_from(json.len()).expect("manifest fits in u64");
+        Manifest::parse_bounded(&json, len, &[1]).expect("exact bound must parse");
+        assert!(matches!(
+            Manifest::parse_bounded(&json, len - 1, &[1]),
+            Err(ManifestError::TooLarge)
+        ));
+    }
+
+    #[test]
     fn empty_manifest_rejected() {
         let err = Manifest::parse_bounded(&[], 16, &[1]).unwrap_err();
         assert!(matches!(err, ManifestError::Invalid(_)));
@@ -171,6 +182,13 @@ mod tests {
     fn malformed_json_unknown_version_and_shape_rejected() {
         assert!(matches!(
             Manifest::parse_bounded(b"{not json", 1 << 20, &[1]),
+            Err(ManifestError::Invalid(_))
+        ));
+        // Wrong JSON types fail closed rather than coercing.
+        let mistyped =
+            br#"{"manifest_version":"1","module_id":"m","version":"1","runtime":"r","entrypoint":"a","files":["a"]}"#;
+        assert!(matches!(
+            Manifest::parse_bounded(mistyped, 1 << 20, &[1]),
             Err(ManifestError::Invalid(_))
         ));
         let v2 = br#"{"manifest_version":2,"module_id":"m","version":"1","runtime":"r","entrypoint":"a","files":["a"]}"#;

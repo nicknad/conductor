@@ -159,12 +159,25 @@ mod tests {
 
     #[test]
     fn empty_allowlists_rejected() {
+        for clear in [
+            |p: &mut PackageValidationPolicy| p.allowed_signature_algorithms.clear(),
+            |p: &mut PackageValidationPolicy| p.allowed_compression_methods.clear(),
+            |p: &mut PackageValidationPolicy| p.allowed_manifest_versions.clear(),
+        ] {
+            let mut policy = PackageValidationPolicy::production();
+            clear(&mut policy);
+            assert!(matches!(
+                policy.validate(),
+                Err(PolicyError::EmptyAllowlist(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_archive_limits_fail_through_policy() {
         let mut policy = PackageValidationPolicy::production();
-        policy.allowed_signature_algorithms.clear();
-        assert!(matches!(
-            policy.validate(),
-            Err(PolicyError::EmptyAllowlist(_))
-        ));
+        policy.archive.max_entries = 0;
+        assert!(matches!(policy.validate(), Err(PolicyError::Archive(_))));
     }
 
     #[test]

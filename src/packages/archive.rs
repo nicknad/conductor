@@ -88,7 +88,7 @@ impl InspectedArchive {
 /// ([`PackageValidationPolicy::scan_config`](super::policy::PackageValidationPolicy::scan_config));
 /// bundling the parameters here keeps the dependency direction
 /// policy → archive instead of a module cycle.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct ScanConfig<'a> {
     pub limits: &'a ArchiveLimits,
     pub allowed_methods: &'a [CompressionMethod],
@@ -128,7 +128,7 @@ const EOCD_MAX_COMMENT: u64 = 0xFFFF;
 /// The concrete archive backend. Inspection first; extraction (directed
 /// by `storage::staging`) only runs against a verified inventory — never
 /// as a casual `unzip(path, destination)` utility.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ZipArchiveReader;
 
 impl ZipArchiveReader {
@@ -341,13 +341,10 @@ impl ZipArchiveReader {
                 "archive size totals exceed bounds",
             ));
         }
-        if compressed_total == 0 {
-            if uncompressed_total > 0 {
-                return Err(ArchiveError::LimitExceeded(
-                    "compression ratio exceeds bound",
-                ));
-            }
-        } else if uncompressed_total > u64::from(config.max_compression_ratio) * compressed_total {
+        // A zero-byte total passes trivially: every entry that contributes
+        // content occupies at least one compressed byte, so an empty
+        // archive cannot smuggle amplification past this check.
+        if uncompressed_total > u64::from(config.max_compression_ratio) * compressed_total {
             return Err(ArchiveError::LimitExceeded(
                 "compression ratio exceeds bound",
             ));
@@ -440,6 +437,7 @@ pub fn check_no_duplicate_paths(paths: &[impl AsRef<str>]) -> Result<(), Archive
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
 
     fn sane_limits() -> ArchiveLimits {
         ArchiveLimits {
@@ -457,6 +455,34 @@ mod tests {
             max_compression_ratio: 100,
             max_nesting_depth: 32,
         }
+    }
+
+    /// Builds a Stored archive in memory. Private-API tests stay hermetic:
+    /// no temp files, no fixture drift.
+    fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, data) in entries {
+            writer
+                .start_file(*name, options)
+                .expect("test zip must build");
+            writer.write_all(data).expect("test zip must build");
+        }
+        writer.finish().expect("test zip must finalize");
+        cursor.into_inner()
+    }
+
+    fn scan_bytes(bytes: &[u8], config: &ScanConfig<'_>) -> Result<InspectedArchive, ArchiveError> {
+        let mut cursor = std::io::Cursor::new(bytes);
+        let mut zip = zip::ZipArchive::new(&mut cursor).expect("test zip must parse");
+        ZipArchiveReader.scan_entries(&mut zip, config)
+    }
+
+    fn read_bytes(bytes: &[u8], name: &str, max: u64) -> Result<Vec<u8>, ArchiveError> {
+        let mut cursor = std::io::Cursor::new(bytes);
+        ZipArchiveReader.read_file_from(&mut cursor, name, max)
     }
 
     #[test]
@@ -519,6 +545,193 @@ mod tests {
             reader.inspect(Path::new("pkg.zip"), &config),
             Err(ArchiveError::Io(_))
         ));
+    }
+
+    #[test]
+    fn bounded_reads_reject_missing_directory_and_oversize() {
+        let bytes = stored_zip(&[("manifest.json", b"{}"), ("payload/x", b"data")]);
+        assert_eq!(
+            read_bytes(&bytes, "manifest.json", 16).expect("small read must succeed"),
+            b"{}"
+        );
+        assert!(matches!(
+            read_bytes(&bytes, "absent.json", 16),
+            Err(ArchiveError::InvalidArchive(_))
+        ));
+        // The metadata size is an early hint: a 4-byte entry against a
+        // 2-byte bound fails without trusting the stream.
+        assert!(matches!(
+            read_bytes(&bytes, "payload/x", 2),
+            Err(ArchiveError::LimitExceeded(_))
+        ));
+
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        writer
+            .add_directory(
+                "docs/",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .expect("test zip must build");
+        writer.finish().expect("test zip must finalize");
+        let dir_bytes = cursor.into_inner();
+        assert!(matches!(
+            read_bytes(&dir_bytes, "docs/", 16),
+            Err(ArchiveError::InvalidArchive(_))
+        ));
+    }
+
+    #[test]
+    fn scan_enforces_per_entry_and_total_bounds() {
+        let limits = ArchiveLimits {
+            max_entries: 16,
+            max_compressed_bytes: 1 << 20,
+            max_uncompressed_bytes: 1 << 20,
+            max_entry_bytes: 2,
+        };
+        let config = sane_config(&limits);
+        let bytes = stored_zip(&[("big.dat", b"1234")]);
+        assert!(matches!(
+            scan_bytes(&bytes, &config),
+            Err(ArchiveError::LimitExceeded(_))
+        ));
+
+        let totals = ArchiveLimits {
+            max_entries: 16,
+            max_compressed_bytes: 6,
+            max_uncompressed_bytes: 1 << 20,
+            max_entry_bytes: 1 << 20,
+        };
+        let totals_config = sane_config(&totals);
+        let bytes = stored_zip(&[("a", b"1234"), ("b", b"5678")]);
+        assert!(matches!(
+            scan_bytes(&bytes, &totals_config),
+            Err(ArchiveError::LimitExceeded(_))
+        ));
+    }
+
+    #[test]
+    fn scan_enforces_ratio_and_depth() {
+        let ratio = ArchiveLimits {
+            max_entries: 16,
+            max_compressed_bytes: 1 << 20,
+            max_uncompressed_bytes: 1 << 20,
+            max_entry_bytes: 1 << 20,
+        };
+        let mut config = sane_config(&ratio);
+        config.max_compression_ratio = 1;
+        // 1,000 zero bytes deflate to a handful: ratio ~50:1 trips a
+        // max-ratio-1 policy while every byte bound passes.
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        writer
+            .start_file(
+                "zeros.dat",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .expect("test zip must build");
+        writer.write_all(&[0u8; 1000]).expect("test zip must build");
+        writer.finish().expect("test zip must finalize");
+        let bytes = cursor.into_inner();
+        assert!(matches!(
+            scan_bytes(&bytes, &config),
+            Err(ArchiveError::LimitExceeded(_))
+        ));
+
+        let depth = ArchiveLimits {
+            max_entries: 16,
+            max_compressed_bytes: 1 << 20,
+            max_uncompressed_bytes: 1 << 20,
+            max_entry_bytes: 1 << 20,
+        };
+        let mut deep_config = sane_config(&depth);
+        deep_config.max_nesting_depth = 2;
+        let bytes = stored_zip(&[("a/b/c", b"x")]);
+        assert!(matches!(
+            scan_bytes(&bytes, &deep_config),
+            Err(ArchiveError::LimitExceeded(_))
+        ));
+        deep_config.max_nesting_depth = 3;
+        let inspected = scan_bytes(&bytes, &deep_config).expect("depth boundary must pass");
+        assert_eq!(inspected.files, vec!["a/b/c".to_owned()]);
+    }
+
+    #[test]
+    fn scan_rejects_disallowed_method_encrypted_and_lists_dirs() {
+        // Deflate is decodable but not allowlisted here: capability must not
+        // imply permission.
+        let limits = ArchiveLimits {
+            max_entries: 16,
+            max_compressed_bytes: 1 << 20,
+            max_uncompressed_bytes: 1 << 20,
+            max_entry_bytes: 1 << 20,
+        };
+        let stored_only = ScanConfig {
+            limits: &limits,
+            allowed_methods: &[CompressionMethod::Stored],
+            max_compression_ratio: 100,
+            max_nesting_depth: 32,
+        };
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        writer
+            .start_file(
+                "z.dat",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .expect("test zip must build");
+        writer.write_all(b"data").expect("test zip must build");
+        writer.finish().expect("test zip must finalize");
+        assert!(matches!(
+            scan_bytes(&cursor.into_inner(), &stored_only),
+            Err(ArchiveError::UnsupportedCompression(_))
+        ));
+
+        // Encrypted entries are rejected before any payload handling.
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        writer
+            .start_file(
+                "secret.dat",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored)
+                    .with_aes_encryption(zip::AesMode::Aes256, "password"),
+            )
+            .expect("test zip must build");
+        writer.write_all(b"data").expect("test zip must build");
+        writer.finish().expect("test zip must finalize");
+        let config = sane_config(&limits);
+        assert!(matches!(
+            scan_bytes(&cursor.into_inner(), &config),
+            Err(ArchiveError::InvalidArchive(_))
+        ));
+
+        // Directory entries count toward the entry total but carry no
+        // payload: they never reach the file inventory.
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        writer
+            .add_directory(
+                "docs/",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .expect("test zip must build");
+        writer
+            .start_file(
+                "docs/note.txt",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .expect("test zip must build");
+        writer.write_all(b"hi").expect("test zip must build");
+        writer.finish().expect("test zip must finalize");
+        let inspected = scan_bytes(&cursor.into_inner(), &config).expect("dirs must scan cleanly");
+        assert_eq!(inspected.entry_count, 2);
+        assert_eq!(inspected.files, vec!["docs/note.txt".to_owned()]);
     }
 
     #[test]
@@ -666,5 +879,92 @@ mod tests {
             ZipArchiveReader::central_directory_count(&mut cursor),
             Err(ArchiveError::InvalidArchive(_))
         ));
+    }
+
+    #[test]
+    fn eocd_count_rejects_disagreeing_disk_counts() {
+        use std::io::Cursor;
+
+        let mut buf = classic_eocd(2);
+        let this_disk_off = buf.len() - 22 + 8;
+        buf[this_disk_off] = 1; // this-disk 1 vs total 2 on disk 0
+        let mut cursor = Cursor::new(buf);
+        assert!(matches!(
+            ZipArchiveReader::central_directory_count(&mut cursor),
+            Err(ArchiveError::InvalidArchive(_))
+        ));
+    }
+
+    #[test]
+    fn eocd_count_rejects_zip64_without_locator() {
+        use std::io::Cursor;
+
+        // Placeholder counts but no locator immediately before the EOCD.
+        let mut buf = vec![0xCCu8; 30];
+        buf.extend_from_slice(&EOCD_MAGIC);
+        buf.extend_from_slice(&[0, 0, 0, 0]);
+        buf.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        buf.extend_from_slice(&[0xFF; 8]);
+        buf.extend_from_slice(&[0, 0]);
+        let mut cursor = Cursor::new(buf);
+        assert!(matches!(
+            ZipArchiveReader::central_directory_count(&mut cursor),
+            Err(ArchiveError::InvalidArchive(_))
+        ));
+    }
+
+    #[test]
+    fn eocd_count_rejects_broken_zip64_records() {
+        use std::io::Cursor;
+
+        // Locator points at zeros: not a ZIP64 end record.
+        let mut buf = vec![0u8; 64];
+        buf.extend_from_slice(&ZIP64_LOCATOR_MAGIC);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // points at zeros
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&EOCD_MAGIC);
+        buf.extend_from_slice(&[0, 0, 0, 0]);
+        buf.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        buf.extend_from_slice(&[0xFF; 8]);
+        buf.extend_from_slice(&[0, 0]);
+        let mut cursor = Cursor::new(buf);
+        assert!(matches!(
+            ZipArchiveReader::central_directory_count(&mut cursor),
+            Err(ArchiveError::InvalidArchive(_))
+        ));
+
+        // Locator points past EOF: truncated record.
+        let mut buf = vec![0u8; 8];
+        buf.extend_from_slice(&ZIP64_LOCATOR_MAGIC);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&u64::MAX.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&EOCD_MAGIC);
+        buf.extend_from_slice(&[0, 0, 0, 0]);
+        buf.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        buf.extend_from_slice(&[0xFF; 8]);
+        buf.extend_from_slice(&[0, 0]);
+        let mut cursor = Cursor::new(buf);
+        assert!(matches!(
+            ZipArchiveReader::central_directory_count(&mut cursor),
+            Err(ArchiveError::InvalidArchive(_))
+        ));
+    }
+
+    #[test]
+    fn eocd_count_honors_comments() {
+        use std::io::Cursor;
+
+        let mut buf = classic_eocd(4);
+        let comment_off = buf.len() - 2;
+        buf.extend_from_slice(b"hello");
+        buf[comment_off] = 5;
+        buf[comment_off + 1] = 0;
+        let mut cursor = Cursor::new(buf);
+        assert_eq!(
+            ZipArchiveReader::central_directory_count(&mut cursor).expect("commented EOCD"),
+            4
+        );
     }
 }

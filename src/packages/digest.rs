@@ -28,7 +28,7 @@ pub enum DigestError {
 }
 
 /// The concrete digest backend: SHA-256 over the given bytes.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Sha256DigestProvider;
 
 impl Sha256DigestProvider {
@@ -86,6 +86,22 @@ mod tests {
             .expect("hashing must succeed");
         assert_eq!(one.len(), 32);
         assert_ne!(one, two);
+    }
+
+    #[test]
+    fn stream_io_failure_is_a_digest_failure() {
+        struct Failing;
+
+        impl Read for Failing {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("boom"))
+            }
+        }
+
+        assert!(matches!(
+            Sha256DigestProvider.digest_stream(Failing),
+            Err(DigestError::Failure(_))
+        ));
     }
 
     #[test]

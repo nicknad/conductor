@@ -105,6 +105,12 @@ fn manifest_reads_are_bounded_by_policy() {
 
 // --- End-to-end golden path: the package is built in-test so it can never
 // drift from the schema, then signed over its exact bytes. ---
+//
+// "Golden" here means the single known-good reference package: a valid
+// manifest plus its payload, hashed and signed exactly as production
+// requires. Positive-path tests validate it as-is; negative tests derive
+// from it by breaking exactly one property (flipped byte, wrong key,
+// missing manifest, undeclared file) so each failure names its stage.
 
 /// Test-only signing key. Precedent: unit tests sign with fixed keys; this
 /// private key must never sign anything outside these tests.
@@ -146,6 +152,17 @@ fn golden_package_bytes() -> Vec<u8> {
         "entrypoint": "payload/reporting-service",
         "files": ["payload/reporting-service"],
     });
+    package_bytes(
+        &serde_json::to_vec(&manifest).expect("manifest must serialize"),
+        &[(
+            "payload/reporting-service",
+            b"not a real executable".as_slice(),
+        )],
+    )
+}
+
+/// Assembles a Stored archive from a manifest document plus payload files.
+fn package_bytes(manifest: &[u8], payloads: &[(&str, &[u8])]) -> Vec<u8> {
     let mut cursor = std::io::Cursor::new(Vec::new());
     let mut writer = zip::ZipWriter::new(&mut cursor);
     let options =
@@ -154,43 +171,76 @@ fn golden_package_bytes() -> Vec<u8> {
         .start_file("manifest.json", options)
         .expect("zip writer must accept manifest");
     writer
-        .write_all(&serde_json::to_vec(&manifest).expect("manifest must serialize"))
+        .write_all(manifest)
         .expect("zip writer must accept manifest bytes");
-    writer
-        .start_file("payload/reporting-service", options)
-        .expect("zip writer must accept payload");
-    writer
-        .write_all(b"not a real executable")
-        .expect("zip writer must accept payload bytes");
+    for (name, data) in payloads {
+        writer
+            .start_file(*name, options)
+            .expect("zip writer must accept payload");
+        writer
+            .write_all(data)
+            .expect("zip writer must accept payload bytes");
+    }
     writer.finish().expect("zip must finalize");
     cursor.into_inner()
 }
 
-fn golden_setup() -> (PackageValidator, Vec<u8>, PackageSignature) {
-    use ed25519_dalek::{Signer as _, SigningKey};
+fn manifest_doc(files: &[&str]) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "manifest_version": 1,
+        "module_id": "reporting-service",
+        "version": "1.2.0",
+        "runtime": "rust",
+        "entrypoint": "payload/reporting-service",
+        "files": files,
+    }))
+    .expect("manifest must serialize")
+}
 
-    let bytes = golden_package_bytes();
+fn real_key_validator(
+    policy: PackageValidationPolicy,
+) -> (PackageValidator, ed25519_dalek::SigningKey) {
+    use ed25519_dalek::SigningKey;
+
     let signing = SigningKey::from_bytes(&TEST_SIGNING_KEY);
-    let digest: [u8; 32] = Sha256DigestProvider
-        .digest(&bytes)
-        .expect("hashing must succeed")
-        .try_into()
-        .expect("SHA-256 is 32 bytes");
-    let signature = signing.sign(&canonical_payload(&digest));
     let keys = ConfiguredTrustedKeys::new(vec![TrustedSigningKey::new(
         "k1",
         SignatureAlgorithm::Ed25519,
         signing.verifying_key().to_bytes().to_vec(),
     )]);
-    let validator = PackageValidationBuilder::new(PackageValidationPolicy::production())
+    let validator = PackageValidationBuilder::new(policy)
         .trusted_keys(keys)
         .build()
         .expect("test validator must build");
-    let envelope = PackageSignature {
-        format_version: SUPPORTED_SIGNATURE_FORMAT_VERSION,
-        key_id: "k1".to_owned(),
-        signature: signature.to_bytes().to_vec(),
-    };
+    (validator, signing)
+}
+
+fn sign_package(signing: &ed25519_dalek::SigningKey, bytes: &[u8]) -> (PackageSignature, [u8; 32]) {
+    use ed25519_dalek::Signer as _;
+
+    let digest: [u8; 32] = Sha256DigestProvider
+        .digest(bytes)
+        .expect("hashing must succeed")
+        .try_into()
+        .expect("SHA-256 is 32 bytes");
+    let signature = signing.sign(&canonical_payload(&digest));
+    (
+        PackageSignature {
+            format_version: SUPPORTED_SIGNATURE_FORMAT_VERSION,
+            key_id: "k1".to_owned(),
+            signature: signature.to_bytes().to_vec(),
+        },
+        digest,
+    )
+}
+
+/// Assembles the golden package: manifest plus payload, hashed and signed
+/// with the test key. Returns the validator trusting that key, the exact
+/// bytes, and their detached signature — everything `validate` needs.
+fn golden_setup() -> (PackageValidator, Vec<u8>, PackageSignature) {
+    let bytes = golden_package_bytes();
+    let (validator, signing) = real_key_validator(PackageValidationPolicy::production());
+    let (envelope, _) = sign_package(&signing, &bytes);
     (validator, bytes, envelope)
 }
 
@@ -239,5 +289,87 @@ fn unknown_signing_key_fails_before_crypto() {
     assert!(matches!(
         validator.validate(package.path(), &envelope),
         Err(ValidationError::Signature(_))
+    ));
+}
+
+#[test]
+fn package_without_manifest_fails_inventory() {
+    let (validator, signing) = real_key_validator(PackageValidationPolicy::production());
+    // Payload only: no manifest.json in the archive.
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    let mut writer = zip::ZipWriter::new(&mut cursor);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer
+        .start_file("payload/reporting-service", options)
+        .expect("zip writer must accept payload");
+    writer
+        .write_all(b"not a real executable")
+        .expect("zip writer must accept payload bytes");
+    writer.finish().expect("zip must finalize");
+    let bytes = cursor.into_inner();
+    let (envelope, _) = sign_package(&signing, &bytes);
+    let package = TempPackage::write(&bytes, "no-manifest");
+    assert!(matches!(
+        validator.validate(package.path(), &envelope),
+        Err(ValidationError::Inventory(_))
+    ));
+}
+
+#[test]
+fn inventory_mismatches_fail_in_both_directions() {
+    let (validator, signing) = real_key_validator(PackageValidationPolicy::production());
+    // Manifest declares a file the archive does not contain.
+    let bytes = package_bytes(
+        &manifest_doc(&["payload/reporting-service", "payload/ghost"]),
+        &[("payload/reporting-service", b"not a real executable")],
+    );
+    let (envelope, _) = sign_package(&signing, &bytes);
+    let package = TempPackage::write(&bytes, "missing-file");
+    assert!(matches!(
+        validator.validate(package.path(), &envelope),
+        Err(ValidationError::Inventory(_))
+    ));
+    // Archive contains a file the manifest does not declare.
+    let bytes = package_bytes(
+        &manifest_doc(&["payload/reporting-service"]),
+        &[
+            ("payload/reporting-service", b"not a real executable"),
+            ("payload/stowaway", b"smuggled"),
+        ],
+    );
+    let (envelope, _) = sign_package(&signing, &bytes);
+    let package = TempPackage::write(&bytes, "extra-file");
+    assert!(matches!(
+        validator.validate(package.path(), &envelope),
+        Err(ValidationError::Inventory(_))
+    ));
+}
+
+#[test]
+fn oversized_manifest_maps_to_manifest_bound() {
+    let mut policy = PackageValidationPolicy::production();
+    policy.max_manifest_bytes = 10;
+    let (validator, signing) = real_key_validator(policy);
+    let bytes = golden_package_bytes();
+    let (envelope, _) = sign_package(&signing, &bytes);
+    let package = TempPackage::write(&bytes, "big-manifest");
+    assert!(matches!(
+        validator.validate(package.path(), &envelope),
+        Err(ValidationError::Manifest(_))
+    ));
+}
+
+#[test]
+fn disallowed_manifest_version_is_rejected() {
+    let mut policy = PackageValidationPolicy::production();
+    policy.allowed_manifest_versions = vec![2];
+    let (validator, signing) = real_key_validator(policy);
+    let bytes = golden_package_bytes();
+    let (envelope, _) = sign_package(&signing, &bytes);
+    let package = TempPackage::write(&bytes, "bad-version");
+    assert!(matches!(
+        validator.validate(package.path(), &envelope),
+        Err(ValidationError::Manifest(_))
     ));
 }

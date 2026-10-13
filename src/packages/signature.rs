@@ -143,7 +143,7 @@ pub enum SignatureError {
 /// `key.algorithm` rather than trusting package-declared metadata.
 /// Malformed keys and signatures fail closed as [`SignatureError::VerificationFailed`]:
 /// verification has exactly one success path and no diagnostic oracle.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Ed25519Verifier;
 
 impl Ed25519Verifier {
@@ -204,7 +204,7 @@ impl Ed25519Verifier {
 /// startup. Each validation captures one immutable snapshot. Tests
 /// construct instances directly with test keys — the value, not a trait
 /// object, is the test seam.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ConfiguredTrustedKeys {
     keys: Vec<TrustedSigningKey>,
 }
