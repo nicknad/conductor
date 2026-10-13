@@ -49,3 +49,9 @@ appsettings.*.local.json
 data/
 *.pfx
 *.key
+
+# Rust
+/target/
+**/target/
+*.rs.bk
+.cargo-ok
