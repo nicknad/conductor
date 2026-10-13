@@ -7,8 +7,9 @@
 //! `413`. All key-lookup and cryptographic failures (`UnknownKey`,
 //! `UnsupportedAlgorithm`, `VerificationFailed`) map to one generic
 //! `signature_verification_failed` body so the response cannot be used to
-//! enumerate trusted key ids. Internal detail is logged server-side at
-//! conversion time, never echoed to the caller.
+//! enumerate trusted key ids. Internal detail is recorded server-side as a
+//! structured rejection event (see `crate::api::rejection`), never echoed
+//! to the caller. The stable `code` values double as the audit taxonomy.
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -16,6 +17,7 @@ use axum::Json;
 use serde::Serialize;
 
 use crate::application::validate_package::ValidationError;
+use crate::audit::event::RejectionStage;
 use crate::packages::signature::SignatureError;
 
 /// Machine-readable error body. `code` is stable for matching; `message`
@@ -60,90 +62,100 @@ pub enum ApiError {
 }
 
 impl ApiError {
-    fn status_and_body(&self) -> (StatusCode, ErrorBody) {
+    /// HTTP status for this rejection.
+    fn status(&self) -> StatusCode {
         match self {
-            Self::BadRequest(code, message) => (
-                StatusCode::BAD_REQUEST,
-                ErrorBody {
-                    code,
-                    message: message.clone(),
-                },
-            ),
-            Self::Unauthorized {
-                code,
-                message,
-                challenge: _,
-            } => (
-                StatusCode::UNAUTHORIZED,
-                ErrorBody {
-                    code,
-                    message: message.clone(),
-                },
-            ),
-            Self::Unprocessable(code, message) => (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                ErrorBody {
-                    code,
-                    message: message.clone(),
-                },
-            ),
-            Self::Conflict(code, message) => (
-                StatusCode::CONFLICT,
-                ErrorBody {
-                    code,
-                    message: message.clone(),
-                },
-            ),
-            Self::PayloadTooLarge(message) => (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                ErrorBody {
-                    code: "payload_too_large",
-                    message: message.clone(),
-                },
-            ),
-            Self::HeadersTooLarge(message) => (
-                StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
-                ErrorBody {
-                    code: "headers_too_large",
-                    message: message.clone(),
-                },
-            ),
-            Self::SlowUpload(message) => (
-                StatusCode::REQUEST_TIMEOUT,
-                ErrorBody {
-                    code: "slow_upload",
-                    message: message.clone(),
-                },
-            ),
-            Self::Overloaded(message) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                ErrorBody {
-                    code: "server_busy",
-                    message: message.clone(),
-                },
-            ),
-            Self::Timeout => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                ErrorBody {
-                    code: "validation_timeout",
-                    message: "package validation timed out".to_owned(),
-                },
-            ),
-            Self::Internal(message) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorBody {
-                    code: "internal",
-                    message: message.clone(),
-                },
-            ),
+            Self::BadRequest(..) => StatusCode::BAD_REQUEST,
+            Self::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
+            Self::Unprocessable(..) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Conflict(..) => StatusCode::CONFLICT,
+            Self::PayloadTooLarge(..) => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::HeadersTooLarge(..) => StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            Self::SlowUpload(..) => StatusCode::REQUEST_TIMEOUT,
+            Self::Overloaded(..) | Self::Timeout => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Internal(..) => StatusCode::INTERNAL_SERVER_ERROR,
         }
+    }
+
+    /// Stable machine-readable code: part of the response contract and the
+    /// audit event taxonomy.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::BadRequest(code, _)
+            | Self::Unauthorized { code, .. }
+            | Self::Unprocessable(code, _)
+            | Self::Conflict(code, _) => code,
+            Self::PayloadTooLarge(..) => "payload_too_large",
+            Self::HeadersTooLarge(..) => "headers_too_large",
+            Self::SlowUpload(..) => "slow_upload",
+            Self::Overloaded(..) => "server_busy",
+            Self::Timeout => "validation_timeout",
+            Self::Internal(..) => "internal",
+        }
+    }
+
+    /// Caller-facing message. Internal audit detail may be more specific
+    /// (see [`crate::api::rejection::Rejection`]).
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::BadRequest(_, message)
+            | Self::Unprocessable(_, message)
+            | Self::Conflict(_, message)
+            | Self::PayloadTooLarge(message)
+            | Self::HeadersTooLarge(message)
+            | Self::SlowUpload(message)
+            | Self::Overloaded(message)
+            | Self::Internal(message) => message,
+            Self::Unauthorized { message, .. } => message,
+            Self::Timeout => "package validation timed out",
+        }
+    }
+
+    /// Audit classification. Codes are the stable contract, so variants only
+    /// constructed by [`From`]`<ValidationError>` are classified by code;
+    /// the production path classifies by error variant instead
+    /// ([`crate::api::rejection::Rejection::from_validation`]).
+    pub(crate) fn stage(&self) -> RejectionStage {
+        match self {
+            Self::BadRequest(..) if self.code() == "invalid_signature_envelope" => {
+                RejectionStage::Signature
+            }
+            Self::BadRequest(..) => RejectionStage::Multipart,
+            Self::Unauthorized { challenge, .. } if challenge.starts_with("Signature") => {
+                RejectionStage::Signature
+            }
+            Self::Unauthorized { .. } => RejectionStage::Transport,
+            Self::Unprocessable(..) => match self.code() {
+                "policy_rejected" => RejectionStage::Policy,
+                "archive_rejected" => RejectionStage::Archive,
+                "digest_failed" => RejectionStage::Digest,
+                "manifest_rejected" => RejectionStage::Manifest,
+                "inventory_mismatch" => RejectionStage::Inventory,
+                _ => RejectionStage::Internal,
+            },
+            Self::Conflict(..) => RejectionStage::Registration,
+            Self::PayloadTooLarge(..) | Self::SlowUpload(..) => RejectionStage::Streaming,
+            Self::HeadersTooLarge(..) | Self::Overloaded(..) | Self::Timeout => {
+                RejectionStage::Transport
+            }
+            Self::Internal(..) => RejectionStage::Internal,
+        }
+    }
+
+    fn status_and_body(&self) -> (StatusCode, ErrorBody) {
+        (
+            self.status(),
+            ErrorBody {
+                code: self.code(),
+                message: self.message().to_owned(),
+            },
+        )
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, body) = self.status_and_body();
-        tracing::warn!(code = body.code, message = %body.message, "upload rejected");
         let mut response = (status, Json(body)).into_response();
         // RFC 9110: a 401 response must carry WWW-Authenticate naming the
         // scheme that rejected the request.
@@ -164,12 +176,12 @@ impl From<ValidationError> for ApiError {
             ValidationError::Signature(SignatureError::InvalidEnvelope(message)) => {
                 Self::BadRequest("invalid_signature_envelope", message)
             }
-            ValidationError::Signature(inner) => {
+            ValidationError::Signature(_) => {
                 // Unify the external body: distinguishing unknown keys from
                 // bad signatures would let any bearer-token holder probe
-                // for valid key ids. Log the internal variant for
-                // operators, return a generic body to callers.
-                tracing::warn!(internal = %inner, "package signature rejected");
+                // for valid key ids. The internal variant is preserved for
+                // the audit record by `Rejection::from_validation`; the
+                // caller gets one generic body.
                 Self::Unauthorized {
                     code: "signature_verification_failed",
                     message: "package signature verification failed".to_owned(),
@@ -251,5 +263,49 @@ mod tests {
             ApiError::Conflict("version_conflict", "taken".to_owned()).status_and_body();
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body.code, "version_conflict");
+    }
+
+    #[test]
+    fn audit_stages_classify_transport_and_validation_failures() {
+        for (api, stage) in [
+            (
+                ApiError::HeadersTooLarge("big".to_owned()),
+                RejectionStage::Transport,
+            ),
+            (ApiError::Timeout, RejectionStage::Transport),
+            (
+                ApiError::PayloadTooLarge("big".to_owned()),
+                RejectionStage::Streaming,
+            ),
+            (
+                ApiError::SlowUpload("slow".to_owned()),
+                RejectionStage::Streaming,
+            ),
+            (
+                ApiError::Conflict("version_conflict", "taken".to_owned()),
+                RejectionStage::Registration,
+            ),
+            (
+                ApiError::Internal("io".to_owned()),
+                RejectionStage::Internal,
+            ),
+        ] {
+            assert_eq!(api.stage(), stage, "unexpected stage for {api:?}");
+        }
+        // Variants constructed only by `From<ValidationError>` classify by
+        // their stable code.
+        for (code, stage) in [
+            ("policy_rejected", RejectionStage::Policy),
+            ("archive_rejected", RejectionStage::Archive),
+            ("digest_failed", RejectionStage::Digest),
+            ("manifest_rejected", RejectionStage::Manifest),
+            ("inventory_mismatch", RejectionStage::Inventory),
+        ] {
+            assert_eq!(
+                ApiError::Unprocessable(code, String::new()).stage(),
+                stage,
+                "unexpected stage for {code}"
+            );
+        }
     }
 }

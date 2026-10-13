@@ -18,6 +18,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use conductor::api::routes::router;
 use conductor::api::uploads::{ApiToken, AppState};
 use conductor::application::validate_package::PackageValidationBuilder;
+use conductor::audit::recorder::RejectionRecorder;
 use conductor::packages::policy::PackageValidationPolicy;
 use conductor::packages::signature::{
     ConfiguredTrustedKeys, SignatureAlgorithm, TrustedSigningKey,
@@ -83,6 +84,7 @@ fn minimal_state(tag: &str) -> (AppState, PathBuf, PathBuf) {
             quarantine_dir: quarantine_dir.clone(),
             artifact_dir: artifact_dir.clone(),
             registry: Arc::new(conductor::modules::registry::ModuleRegistry::new()),
+            recorder: Arc::new(RejectionRecorder::new()),
             request_timeout: Duration::from_secs(10),
             api_token: ApiToken::new("test-bearer-upload"),
             upload_slots: Arc::new(Semaphore::new(8)),

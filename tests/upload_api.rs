@@ -13,7 +13,7 @@
 //! proof; HSTS is asserted here).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use axum::body::Body;
@@ -23,6 +23,7 @@ use bytes::Bytes;
 use conductor::api::routes::router;
 use conductor::api::uploads::{ApiToken, AppState};
 use conductor::application::validate_package::PackageValidationBuilder;
+use conductor::audit::recorder::RejectionRecorder;
 use conductor::modules::registry::ModuleRegistry;
 use conductor::packages::artifact::ArtifactDigest;
 use conductor::packages::digest::Sha256DigestProvider;
@@ -72,6 +73,7 @@ fn test_state(policy: PackageValidationPolicy, tag: &str) -> AppState {
         quarantine_dir,
         artifact_dir,
         registry: Arc::new(ModuleRegistry::new()),
+        recorder: Arc::new(RejectionRecorder::new()),
         request_timeout: Duration::from_secs(10),
         api_token: ApiToken::new("test-bearer-upload"),
         upload_slots: Arc::new(Semaphore::new(8)),
@@ -214,6 +216,52 @@ fn quarantine_zip_count(dir: &Path) -> usize {
 
 fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `io::Write` sink shared with the test so rejection events can be
+/// asserted on.
+#[derive(Clone)]
+struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("capture lock must not poison")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+    type Writer = CaptureWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Installs a thread-local subscriber capturing every audit event. The
+/// guard must stay alive while requests are sent; `#[tokio::test]` uses a
+/// current-thread runtime, so the router's events land on this thread.
+fn capture_rejection_events() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(CaptureWriter(Arc::clone(&buffer)))
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .finish();
+    (buffer, tracing::subscriber::set_default(subscriber))
+}
+
+fn captured_events(buffer: &Arc<Mutex<Vec<u8>>>) -> String {
+    let captured = buffer.lock().expect("capture lock must not poison").clone();
+    String::from_utf8(captured).expect("captured output must be UTF-8")
 }
 
 use std::io::Write as _;
@@ -629,5 +677,113 @@ async fn trickle_upload_rejected_with_408() {
     let json: serde_json::Value = serde_json::from_slice(&bytes).expect("body must be JSON");
     assert_eq!(json["code"], "slow_upload");
     assert_eq!(quarantine_zip_count(&state.quarantine_dir), 0);
+    cleanup(&state.quarantine_dir);
+}
+
+#[tokio::test]
+async fn missing_bearer_records_exactly_one_transport_event() {
+    let state = test_state(PackageValidationPolicy::production(), "audit-401");
+    let (buffer, guard) = capture_rejection_events();
+    let (status, _, _) = send_upload(&state, Body::empty(), None, &[]).await;
+    drop(guard);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let events = captured_events(&buffer);
+    assert_eq!(events.matches("package rejected").count(), 1, "{events}");
+    assert!(events.contains("stage=\"transport\""), "{events}");
+    assert!(
+        events.contains("code=\"missing_or_invalid_bearer\""),
+        "{events}"
+    );
+    assert!(
+        events.contains("request_id=\""),
+        "the server-issued request id must be attached: {events}"
+    );
+    cleanup(&state.quarantine_dir);
+}
+
+#[tokio::test]
+async fn signature_failure_records_typed_event_with_internal_reason() {
+    let state = test_state(PackageValidationPolicy::production(), "audit-signature");
+    let package = golden_package_bytes();
+    let mut body = Vec::new();
+    file_part(&mut body, "package", "pkg.zip", "application/zip", &package);
+    // Unknown key id: the response stays generic, the event keeps the
+    // internal reason for operators.
+    text_part(&mut body, "key_id", "k9");
+    text_part(&mut body, "signature", &signature_base64_for(&package));
+    let (buffer, guard) = capture_rejection_events();
+    let (status, _, _) = send_upload(
+        &state,
+        Body::from(finish_body(&mut body)),
+        Some("test-bearer-upload"),
+        &[],
+    )
+    .await;
+    drop(guard);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let events = captured_events(&buffer);
+    assert_eq!(events.matches("package rejected").count(), 1, "{events}");
+    assert!(events.contains("stage=\"signature\""), "{events}");
+    assert!(
+        events.contains("code=\"signature_verification_failed\""),
+        "{events}"
+    );
+    assert!(
+        events.contains("k9"),
+        "internal key detail missing: {events}"
+    );
+    cleanup(&state.quarantine_dir);
+}
+
+#[tokio::test]
+async fn malformed_multipart_body_records_one_typed_event() {
+    let state = test_state(PackageValidationPolicy::production(), "audit-multipart");
+    let (buffer, guard) = capture_rejection_events();
+    // Valid bearer and multipart content type, but a body that fails to
+    // parse inside the handler: the typed multipart path records exactly
+    // one event, and the fallback must skip it (response marker).
+    let (status, _, _) = send_upload(
+        &state,
+        Body::from("definitely not multipart"),
+        Some("test-bearer-upload"),
+        &[],
+    )
+    .await;
+    drop(guard);
+    assert!(status.is_client_error(), "unexpected status {status}");
+    let events = captured_events(&buffer);
+    assert_eq!(events.matches("package rejected").count(), 1, "{events}");
+    assert!(events.contains("stage=\"multipart\""), "{events}");
+    assert!(events.contains("code=\"invalid_multipart\""), "{events}");
+    cleanup(&state.quarantine_dir);
+}
+
+#[tokio::test]
+async fn non_multipart_content_type_records_one_generic_event() {
+    let state = test_state(PackageValidationPolicy::production(), "audit-fallback");
+    let (buffer, guard) = capture_rejection_events();
+    // The multipart extractor rejects before the handler runs, so no typed
+    // error exists; the transport fallback must record exactly one event.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/packages")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test-bearer-upload")
+        .body(Body::from("{}"))
+        .expect("request must build");
+    let response = router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("router must respond");
+    let status = response.status();
+    drop(guard);
+    assert!(status.is_client_error(), "unexpected status {status}");
+    let events = captured_events(&buffer);
+    assert_eq!(events.matches("package rejected").count(), 1, "{events}");
+    assert!(events.contains("stage=\"transport\""), "{events}");
+    assert!(
+        events.contains("code=\"unclassified_rejection\""),
+        "{events}"
+    );
     cleanup(&state.quarantine_dir);
 }

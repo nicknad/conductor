@@ -33,13 +33,19 @@
 //! Validation, promotion, and registration run on a blocking thread
 //! (synchronous file I/O and in-memory state) under the configured request
 //! timeout.
+//!
+//! Every refusal is recorded exactly once as a structured
+//! [`RejectionEvent`](crate::audit::event::RejectionEvent): typed where the
+//! handler or middleware still owns the error, generic for responses
+//! produced by transport layers (timeouts, body limits, panics). Status
+//! codes and bodies are unchanged by recording.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Multipart, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -49,10 +55,13 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::sync::Semaphore;
 
 use crate::api::errors::ApiError;
+use crate::api::rejection::{request_id, Rejection};
 use crate::application::upload_package::run_upload_workflow;
 use crate::application::validate_package::PackageValidator;
+use crate::audit::recorder::RejectionRecorder;
 use crate::modules::registry::ModuleRegistry;
 use crate::packages::signature::{PackageSignature, SUPPORTED_SIGNATURE_FORMAT_VERSION};
+use crate::storage::artifact_store::PromoteError;
 
 /// Caps for small text fields. The signature itself is 64 bytes (88 base64
 /// characters); the generous bounds below leave room for envelope evolution
@@ -113,6 +122,9 @@ pub struct AppState {
     /// Module registry: versions already accepted. A version re-registered
     /// with different bytes is a conflict, never an overwrite.
     pub registry: Arc<ModuleRegistry>,
+    /// Structured rejection recorder: every refused upload produces exactly
+    /// one event (tracing in this phase; durable rows in a later phase).
+    pub recorder: Arc<RejectionRecorder>,
     pub request_timeout: Duration,
     pub api_token: ApiToken,
     /// Concurrency slots: one permit per in-flight upload.
@@ -140,23 +152,28 @@ pub struct UploadResponse {
 /// bearer token. Missing, malformed, and wrong tokens get the identical
 /// `401` — no oracle distinguishing them. Package-signature authentication
 /// happens later inside validation; this layer only decides who may ask.
+/// Rejections are recorded as typed transport events.
 pub async fn require_bearer(
     State(state): State<AppState>,
     request: Request,
     next: Next,
-) -> Result<Response, ApiError> {
+) -> Response {
+    let id = request_id(request.headers());
     let presented = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
     match presented {
-        Some(token) if state.api_token.verify(token) => Ok(next.run(request).await),
-        _ => Err(ApiError::Unauthorized {
-            code: "missing_or_invalid_bearer",
-            message: "valid bearer token required".to_owned(),
-            challenge: "Bearer realm=\"package-upload\"",
-        }),
+        Some(token) if state.api_token.verify(token) => next.run(request).await,
+        _ => {
+            let api = ApiError::Unauthorized {
+                code: "missing_or_invalid_bearer",
+                message: "valid bearer token required".to_owned(),
+                challenge: "Bearer realm=\"package-upload\"",
+            };
+            Rejection::from_api(api).into_recorded_response(&state.recorder, id)
+        }
     }
 }
 
@@ -209,17 +226,33 @@ fn rate_floor_tripped(bytes: u64, elapsed: Duration, min_rate: u64, grace: Durat
     (bytes as u128) < (min_rate as u128) * (elapsed.as_nanos()) / 1_000_000_000
 }
 
-/// Streams one upload into quarantine, validates it, and mints the
-/// artifact identity. See the module docs for field layout and limits.
+/// Streams one upload into quarantine, validates it, promotes it, and
+/// registers the module version. See the module docs for field layout and
+/// limits.
+///
+/// Returns the response directly: every failure becomes a [`Rejection`],
+/// so no path can escape unrecorded.
 #[tracing::instrument(
     name = "upload_package",
-    skip(state, multipart),
+    skip(state, headers, multipart),
     fields(package_bytes = tracing::field::Empty)
 )]
 pub async fn post_package(
     State(state): State<AppState>,
-    mut multipart: Multipart,
-) -> Result<impl IntoResponse, ApiError> {
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Response {
+    let id = request_id(&headers);
+    match process_upload(&state, multipart).await {
+        Ok(response) => response,
+        Err(rejection) => rejection.into_recorded_response(&state.recorder, id),
+    }
+}
+
+/// The upload pipeline. Every failure returns a [`Rejection`] carrying the
+/// caller-facing error plus the audit evidence; recording and response
+/// conversion happen once in [`post_package`].
+async fn process_upload(state: &AppState, mut multipart: Multipart) -> Result<Response, Rejection> {
     // Shed load before touching the body: no permit means the server is
     // already at its upload bound.
     let _permit = Arc::clone(&state.upload_slots)
@@ -239,6 +272,7 @@ pub async fn post_package(
     let mut key_id: Option<String> = None;
     let mut signature_text: Option<String> = None;
     let mut format_version: u16 = SUPPORTED_SIGNATURE_FORMAT_VERSION;
+    let mut package_bytes: Option<u64> = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -250,7 +284,8 @@ pub async fn post_package(
             return Err(ApiError::BadRequest(
                 "too_many_fields",
                 format!("multipart body exceeds {MAX_FORM_FIELDS} fields"),
-            ));
+            )
+            .into());
         }
         let name = field.name().unwrap_or_default().to_owned();
         match name.as_str() {
@@ -259,7 +294,8 @@ pub async fn post_package(
                     return Err(ApiError::BadRequest(
                         "duplicate_package_field",
                         "only one package field is accepted".to_owned(),
-                    ));
+                    )
+                    .into());
                 }
                 let (path, std_file) = tokio::task::spawn_blocking({
                     let dir = state.quarantine_dir.clone();
@@ -278,6 +314,7 @@ pub async fn post_package(
                 quarantine.store(path);
                 let received =
                     stream_package_to_quarantine(&mut field, file, max_bytes, &mut rate).await?;
+                package_bytes = Some(received);
                 tracing::Span::current().record("package_bytes", received);
             }
             "key_id" => {
@@ -351,6 +388,8 @@ pub async fn post_package(
             format!("signature is not valid base64: {e}"),
         )
     })?;
+    let audit_key_id = key_id.clone();
+    let audit_key_id_outer = key_id.clone();
     let envelope = PackageSignature {
         format_version,
         key_id,
@@ -362,58 +401,78 @@ pub async fn post_package(
     let timeout = state.request_timeout;
     let blocking_path = path.clone();
     let artifact_dir = state.artifact_dir.clone();
+    let audit_bytes = package_bytes;
     let outcome = tokio::time::timeout(
         timeout,
-        tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
-            let verdict = run_upload_workflow(&validator, &blocking_path, &envelope)?;
+        tokio::task::spawn_blocking(move || -> Result<_, Rejection> {
+            let verdict = run_upload_workflow(&validator, &blocking_path, &envelope)
+                .map_err(Rejection::from_validation)
+                .map_err(|rejection| {
+                    rejection.with_upload(Some(audit_key_id.as_str()), audit_bytes)
+                })?;
             crate::storage::artifact_store::promote_quarantined(
                 &artifact_dir,
                 &blocking_path,
                 &verdict,
             )
-            .map_err(|e| match e {
-                crate::storage::artifact_store::PromoteError::DigestMismatch => {
-                    crate::storage::quarantine::discard(&blocking_path);
-                    ApiError::Internal("quarantine bytes changed after validation".to_owned())
-                }
-                crate::storage::artifact_store::PromoteError::Io(message) => {
-                    crate::storage::quarantine::discard(&blocking_path);
-                    ApiError::Internal(format!("artifact promotion failed: {message}"))
-                }
+            .map_err(|e| {
+                crate::storage::quarantine::discard(&blocking_path);
+                let api = match e {
+                    PromoteError::DigestMismatch => {
+                        ApiError::Internal("quarantine bytes changed after validation".to_owned())
+                    }
+                    PromoteError::Io(message) => {
+                        ApiError::Internal(format!("artifact promotion failed: {message}"))
+                    }
+                };
+                Rejection::from_api(api)
+                    .with_upload(Some(audit_key_id.as_str()), audit_bytes)
+                    .with_artifact(verdict.artifact())
             })?;
             // Post-promotion binding: the digest is now durable, so the
             // registry learns which bytes this module version means. A
             // version conflict leaves the promoted blob unreferenced
             // (immutable, never the source of truth) and rejects the
             // upload; an identical re-upload is idempotent.
-            crate::application::register_package::register(&registry, &verdict)
-                .map(|_| verdict)
-                .map_err(|e| ApiError::Conflict("version_conflict", e.to_string()))
+            match crate::application::register_package::register(&registry, &verdict) {
+                Ok(_) => Ok(verdict),
+                Err(e) => Err(Rejection::from_api(ApiError::Conflict(
+                    "version_conflict",
+                    e.to_string(),
+                ))
+                .with_upload(Some(audit_key_id.as_str()), audit_bytes)
+                .with_artifact(verdict.artifact())),
+            }
         }),
     )
     .await
     .map_err(|_| {
         crate::storage::quarantine::discard(&path);
-        ApiError::Timeout
+        Rejection::from_api(ApiError::Timeout)
+            .with_upload(Some(audit_key_id_outer.as_str()), audit_bytes)
     })?
-    .map_err(|e| ApiError::Internal(format!("validation task failed: {e}")))?;
+    .map_err(|e| {
+        Rejection::from_api(ApiError::Internal(format!("validation task failed: {e}")))
+            .with_upload(Some(audit_key_id_outer.as_str()), audit_bytes)
+    })?;
 
     match outcome {
-        Ok(outcome) => Ok((
+        Ok(verdict) => Ok((
             StatusCode::CREATED,
             Json(UploadResponse {
-                module_id: outcome.artifact().module_id().to_owned(),
-                version: outcome.artifact().version().to_owned(),
-                digest: outcome.artifact().digest().to_hex(),
-                signer_key_id: outcome.signer().key_id.clone(),
+                module_id: verdict.artifact().module_id().to_owned(),
+                version: verdict.artifact().version().to_owned(),
+                digest: verdict.artifact().digest().to_hex(),
+                signer_key_id: verdict.signer().key_id.clone(),
             }),
-        )),
-        Err(api_err) => {
-            // Validation failures auto-converted via `From<ValidationError>`;
-            // promotion failures already discarded their quarantine file.
-            // Best-effort discard covers both (idempotent).
+        )
+            .into_response()),
+        Err(rejection) => {
+            // Validation failures preserve their internal reason for the
+            // audit record; promotion failures already discarded their
+            // quarantine file. Best-effort discard covers both (idempotent).
             crate::storage::quarantine::discard(&path);
-            Err(api_err)
+            Err(rejection)
         }
     }
 }

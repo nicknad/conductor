@@ -3,5 +3,11 @@
 
 pub mod errors;
 pub mod middleware;
+pub mod rejection;
 pub mod routes;
 pub mod uploads;
+
+/// The package-upload route. Only rejections on this path are package
+/// rejections; transport-layer failures elsewhere (health probes, unknown
+/// routes) are not evented.
+pub(crate) const PACKAGE_UPLOAD_PATH: &str = "/v1/packages";

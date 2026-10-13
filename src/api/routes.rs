@@ -3,6 +3,10 @@
 //! Builds the axum [`Router`](axum::Router) for the upload API plus a
 //! `GET /healthz` liveness probe. Layers, outermost first:
 //!
+//! - [`audit_unhandled_rejections`](crate::api::middleware::audit_unhandled_rejections):
+//!   records one generic rejection event for unmarked 4xx/5xx responses on
+//!   the upload route (timeouts, body limits, panics); outermost so it sees
+//!   everything the transport layers produce;
 //! - [`CatchPanicLayer`](tower_http::catch_panic::CatchPanicLayer):
 //!   a panicking handler becomes a bare `500`, never a stack trace or
 //!   version string;
@@ -41,8 +45,9 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::api::middleware::limit_headers;
+use crate::api::middleware::{audit_unhandled_rejections, limit_headers};
 use crate::api::uploads::{post_package, require_bearer, AppState};
+use crate::api::PACKAGE_UPLOAD_PATH;
 
 /// Multipart framing slack over the policy package bound for the outer
 /// body limit. The handler's streaming check remains authoritative; this
@@ -70,14 +75,14 @@ pub fn router(state: AppState) -> Router {
     let timeout = state.request_timeout.max(Duration::from_secs(1));
     Router::new()
         .route(
-            "/v1/packages",
+            PACKAGE_UPLOAD_PATH,
             post(post_package).route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 require_bearer,
             )),
         )
         .route("/healthz", get(healthz))
-        .layer(middleware::from_fn(limit_headers))
+        .layer(middleware::from_fn_with_state(state.clone(), limit_headers))
         .layer(SetResponseHeaderLayer::overriding(
             axum::http::header::CACHE_CONTROL,
             axum::http::HeaderValue::from_static("no-store"),
@@ -107,6 +112,10 @@ pub fn router(state: AppState) -> Router {
             timeout,
         ))
         .layer(CatchPanicLayer::new())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            audit_unhandled_rejections,
+        ))
         .with_state(state)
 }
 

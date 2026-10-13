@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod application;
+pub mod audit;
 pub mod config;
 pub mod executions;
 pub mod modules;

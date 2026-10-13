@@ -1,5 +1,5 @@
 //! Transport guards: fixed request-header bounds enforced before any
-//! handler runs.
+//! handler runs, plus the outermost rejection-audit fallback.
 //!
 //! Hyper already caps headers at the socket level (`max_headers`,
 //! `max_buf_size`, tuned in the binary's TLS serving path); this layer is
@@ -7,13 +7,22 @@
 //! than ten headers, so anything beyond these fixed caps is hostile
 //! header bloat and is rejected with `431` without touching multipart
 //! parsing, quarantine, or validation.
+//!
+//! Rejections produced by transport layers that never reach the handler
+//! (timeouts, body limits, panics) are recorded as one generic
+//! `package_rejected` event by [`audit_unhandled_rejections`], which runs
+//! outermost and skips responses marked as already recorded by
+//! [`crate::api::rejection`].
 
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::http::HeaderMap;
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 
 use crate::api::errors::ApiError;
+use crate::api::rejection::{fallback_event, request_id, Rejection, RejectionRecorded};
+use crate::api::uploads::AppState;
+use crate::api::PACKAGE_UPLOAD_PATH;
 
 /// Maximum accepted request headers. Fixed invariant, not operator
 /// config: raising it is a code change, like the archive hard maxima.
@@ -24,10 +33,45 @@ pub const MAX_REQUEST_HEADERS: usize = 32;
 pub const MAX_HEADER_BYTES: usize = 8 * 1024;
 
 /// Rejects header bloat before routing. Runs as a global layer so even
-/// unauthenticated probes pay nothing beyond this check.
-pub async fn limit_headers(request: Request, next: Next) -> Result<Response, ApiError> {
-    check_header_limits(request.headers())?;
-    Ok(next.run(request).await)
+/// unauthenticated probes pay nothing beyond this check. Upload-route
+/// rejections are recorded as typed transport events; other paths keep the
+/// bare error response.
+pub async fn limit_headers(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let id = request_id(request.headers());
+    match check_header_limits(request.headers()) {
+        Ok(()) => next.run(request).await,
+        Err(api) => {
+            if request.uri().path() == PACKAGE_UPLOAD_PATH {
+                Rejection::from_api(api).into_recorded_response(&state.recorder, id)
+            } else {
+                api.into_response()
+            }
+        }
+    }
+}
+
+/// Outermost audit fallback: any 4xx/5xx response on the upload route that
+/// carries no typed rejection marker (tower-level timeouts, body limits,
+/// panics) is recorded as one generic transport event. Typed paths mark
+/// their responses, so nothing is recorded twice.
+pub async fn audit_unhandled_rejections(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path().to_owned();
+    let response = next.run(request).await;
+    let already_recorded = response.extensions().get::<RejectionRecorded>().is_some();
+    if let Some(event) = fallback_event(&path, response.status(), already_recorded) {
+        state
+            .recorder
+            .record(&event.with_request_id(request_id(response.headers())));
+    }
+    response
 }
 
 /// Pure header-limit check: count cap plus total-byte cap. Separate from
