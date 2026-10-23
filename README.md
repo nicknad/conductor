@@ -210,6 +210,7 @@ LICENSE                     Apache-2.0
 ```sh
 cargo build
 cargo test
+python3 scripts/check_test_quality.py   # structural test checks (also run in CI)
 ```
 
 ## License

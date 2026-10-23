@@ -1,0 +1,121 @@
+name: Mutants
+
+# Mutation testing is the regression-prevention check: a mutant that survives
+# is a behavior change no test detected.
+#
+# - Pull requests mutate only the changed production code and fail on any
+#   survivor, so new code cannot merge with untested behavior.
+# - Full runs on main/manual/schedule are report-only for now: they publish
+#   the missed-mutant list and summary without blocking until a survivor
+#   baseline has been established. Flip `continue-on-error` off once the
+#   baseline is clean.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "tests/**"
+      - ".github/workflows/mutants.yml"
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutants-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  changed:
+    name: changed code
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: Build pull-request diff
+        run: |
+          git fetch --no-tags origin \
+            "${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+          git diff --no-ext-diff \
+            "origin/${{ github.base_ref }}...HEAD" > pr.diff
+          wc -l pr.diff
+
+      - name: Mutate changed code
+        run: |
+          cargo mutants \
+            --in-diff pr.diff \
+            --timeout 120 \
+            --jobs 2
+
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-pr
+          path: mutants.out
+          if-no-files-found: ignore
+
+  full:
+    name: full suite
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: Mutate all code
+        continue-on-error: true
+        run: |
+          cargo mutants \
+            --timeout 120 \
+            --jobs 2
+
+      - name: Summarize missed mutants
+        if: always()
+        run: |
+          if [ -s mutants.out/missed.txt ]; then
+            {
+              echo "### Missed mutants"
+              echo
+              echo '```'
+              cat mutants.out/missed.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No missed mutants." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-full
+          path: mutants.out
+          if-no-files-found: ignore

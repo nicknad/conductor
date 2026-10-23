@@ -358,19 +358,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_archive_fails_before_signature_stage() {
-        use crate::packages::archive::QuarantinedFile;
-
+    fn validator_exposes_production_policy_and_digest() {
         let validator = test_validator(PackageValidationPolicy::production());
         assert!(validator.policy().require_signature);
         assert_eq!(validator.digest().algorithm(), DigestAlgorithm::Sha256);
-        // The quarantine handle itself fails to open — validation never
-        // reaches the signature stage.
-        let open = QuarantinedFile::open(std::path::Path::new("pkg.zip"));
-        assert!(matches!(
-            open,
-            Err(crate::packages::archive::ArchiveError::Io(_))
-        ));
     }
 
     #[test]

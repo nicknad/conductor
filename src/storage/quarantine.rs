@@ -114,23 +114,32 @@ mod tests {
     }
 
     #[test]
-    fn create_new_never_overwrites() {
+    fn create_file_never_overwrites_existing_content() {
+        use std::io::Write as _;
+
         let dir = std::env::temp_dir().join(format!(
             "conductor-quarantine-nooverwrite-{}",
             std::process::id()
         ));
-        ensure_dir(&dir).expect("dir must be created");
-        let victim = dir.join("upload-1-1-1.zip");
-        std::fs::write(&victim, b"original").expect("victim must be written");
-        let attempt = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&victim);
-        assert_eq!(attempt.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(
-            std::fs::read(&victim).expect("victim must read"),
-            b"original"
+        let (first_path, mut first) = create_file(&dir).expect("first quarantine file");
+        first
+            .write_all(b"original")
+            .expect("first file must be writable");
+        drop(first);
+
+        let (second_path, _second) = create_file(&dir).expect("second quarantine file");
+        assert_ne!(
+            first_path, second_path,
+            "quarantine names must be unique per upload"
         );
+        assert_eq!(
+            std::fs::read(&first_path).expect("first file must read"),
+            b"original",
+            "creating the next quarantine file must not clobber an earlier one"
+        );
+
+        discard(&first_path);
+        discard(&second_path);
         std::fs::remove_dir_all(&dir).expect("quarantine dir must clean up");
     }
 

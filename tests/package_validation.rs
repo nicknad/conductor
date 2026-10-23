@@ -84,16 +84,33 @@ fn unsigned_config_rejected_before_archive_stage() {
 
 #[test]
 fn missing_archive_fails_before_signature_stage() {
-    let _validator = PackageValidationBuilder::new(PackageValidationPolicy::production())
-        .trusted_keys(test_keys())
+    use conductor::control_plane::upload_package::run_upload_workflow;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let validator = PackageValidationBuilder::new(PackageValidationPolicy::production())
+        // Deliberately empty: if the workflow reached the signature stage,
+        // this envelope's key id would be unknown. The I/O error proves the
+        // missing handle is rejected before authentication is attempted.
+        .trusted_keys(ConfiguredTrustedKeys::new(vec![]).expect("empty test store must build"))
         .build()
         .expect("test validator must build");
-    // The quarantine handle itself fails to open — validation never reaches
-    // the signature stage. Trust is configured by value at build time.
-    assert!(matches!(
-        QuarantinedFile::open(Path::new("pkg.zip")),
-        Err(ArchiveError::Io(_))
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let missing = std::env::temp_dir().join(format!(
+        "conductor-missing-archive-{}-{nanos}.zip",
+        std::process::id()
     ));
+    let _ = std::fs::remove_file(&missing);
+    // The workflow opens the quarantine handle before validation. A missing
+    // path therefore fails at I/O, never in the signature stage.
+    let err = run_upload_workflow(&validator, &missing, &dummy_envelope())
+        .expect_err("missing archive must not validate");
+    assert!(
+        matches!(err, ValidationError::Archive(ArchiveError::Io(_))),
+        "missing archive must fail at open, got {err:?}"
+    );
 }
 
 /// The compressed-size bound is a pre-digest gate: an oversized archive

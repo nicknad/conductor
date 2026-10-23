@@ -12,6 +12,12 @@ cargo fmt --all --check || {
   exit 1
 }
 
+echo "[pre-commit] test-quality structural checks"
+python3 scripts/check_test_quality.py || {
+  echo "[pre-commit] FAILED: test-quality violations (see output above)." >&2
+  exit 1
+}
+
 echo "[pre-commit] cargo clippy (warnings denied)"
 cargo clippy --workspace --all-targets -- -D warnings || {
   echo "[pre-commit] FAILED: clippy reported lints." >&2

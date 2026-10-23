@@ -6,10 +6,10 @@
 //! trusted outside this file), so no fixture key material can drift or
 //! leak. A full TLS-client round-trip is deliberately out of scope: it
 //! would need client-side PKI machinery in dev-dependencies, while the
-//! property under test — no plaintext service — is proven by the
-//! plaintext probe plus `bind_rustls` being the only serving path.
+//! property under test — no plaintext service — is proven by driving the
+//! production `server::serve_with_handle` path and probing it with
+//! plaintext.
 
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -118,26 +118,44 @@ async fn mismatched_tls_identity_fails_closed() {
 }
 
 #[tokio::test]
+async fn serve_propagates_tls_configuration_errors() {
+    let missing = std::env::temp_dir().join(format!(
+        "conductor-missing-tls-identity-{}.pem",
+        std::process::id()
+    ));
+    let result =
+        conductor::server::serve(axum::Router::new(), "127.0.0.1:0", &missing, &missing).await;
+    assert!(
+        result.is_err(),
+        "serve must not report success when TLS identity loading fails"
+    );
+}
+
+#[tokio::test]
 async fn plaintext_http_gets_no_response() {
     let (cert, key, tls_dir) = test_identity("plaintext");
-    let tls = RustlsConfig::from_pem_file(&cert, &key)
-        .await
-        .expect("test identity must load");
-    // Ephemeral loopback port, read before serving so the probe knows it.
-    // Non-blocking mode is required: axum-server hands the socket to the
-    // tokio runtime, which refuses blocking sockets.
-    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback must bind");
-    listener
-        .set_nonblocking(true)
-        .expect("listener must be non-blocking");
-    let port = listener.local_addr().expect("port must read").port();
     let (state, quarantine_dir, artifact_dir) = minimal_state("plaintext");
-    let server = axum_server::from_tcp_rustls(listener, tls).expect("TLS server must build");
-    let serving = tokio::spawn(async move {
-        let _ = server.serve(router(state).into_make_service()).await;
-    });
 
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+    // Drive the real serving path, not a test-local reconstruction. Port 0
+    // lets the OS choose; the handle reports the actual address after bind.
+    let handle = axum_server::Handle::new();
+    let serving_handle = handle.clone();
+    let serving = tokio::spawn(async move {
+        let _ = conductor::server::serve_with_handle(
+            router(state),
+            "127.0.0.1:0",
+            &cert,
+            &key,
+            serving_handle,
+        )
+        .await;
+    });
+    let addr = tokio::time::timeout(Duration::from_secs(5), handle.listening())
+        .await
+        .expect("server must start promptly")
+        .expect("server must report its bound address");
+
+    let mut stream = tokio::net::TcpStream::connect(addr)
         .await
         .expect("TCP connect must succeed");
     stream

@@ -38,5 +38,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Test quality (structural)
+        run: python3 scripts/check_test_quality.py
+
       - name: Test
         run: cargo test

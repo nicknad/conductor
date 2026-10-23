@@ -55,11 +55,34 @@ pub async fn serve(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_with_handle(
+        router,
+        bind,
+        cert_path,
+        key_path,
+        axum_server::Handle::new(),
+    )
+    .await
+}
+
+/// Lower-level serving entry point behind [`serve`].
+///
+/// The externally-owned [`axum_server::Handle`] lets a supervisor discover
+/// the actual bound address through [`axum_server::Handle::listening`] (useful
+/// when `bind` uses port 0) and request shutdown. Production calls this via
+/// [`serve`]; the TLS-only integration test drives this function directly so
+/// it exercises the real serving path rather than rebuilding it in the test.
+pub async fn serve_with_handle(
+    router: axum::Router,
+    bind: &str,
+    cert_path: &Path,
+    key_path: &Path,
+    handle: axum_server::Handle<SocketAddr>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use axum_server::tls_rustls::RustlsConfig;
 
     let addr: SocketAddr = bind.parse()?;
     let tls = RustlsConfig::from_pem_file(cert_path, key_path).await?;
-    let handle = axum_server::Handle::new();
     let shutdown_handle = handle.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
