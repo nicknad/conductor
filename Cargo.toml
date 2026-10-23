@@ -10,7 +10,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 ed25519-dalek = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 rusqlite = { version = "0.40", features = ["bundled"] }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 axum = { version = "0.8.9", features = ["multipart"] }
