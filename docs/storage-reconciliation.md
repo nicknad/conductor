@@ -76,7 +76,7 @@
 | Activation and removal | Partial: `activate()` plus runtime allowlist | Persisted active version, deactivate/remove, draining, reference counting (no scheduler yet) |
 | Resource limits | Partial: rich upload/worker limits, concurrency cap | Disk quotas and disk-pressure behavior |
 | Download security | **Open** | No URL ingestion exists at all in the Rust code |
-| Backup and recovery | **Open** | Nothing in the rewrite (the .NET-era design is only in `archive/`) |
+| Backup and recovery | **Open** | Nothing in the rewrite (the .NET-era design was removed with the archive and remains only in Git history) |
 | Audit and observability | Partial: tracing events including signer attribution, `/healthz`, request ids | Durable audit, retention, storage exhaustion/corruption reporting, metrics |
 
 ## 6. Bottom line
