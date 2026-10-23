@@ -21,6 +21,7 @@ use std::time::SystemTime;
 use rusqlite::{params, OptionalExtension};
 use thiserror::Error;
 
+use crate::modules::activation::ActiveVersion;
 use crate::packages::artifact::ArtifactDigest;
 use crate::storage::database::{from_millis, to_millis, Database, DatabaseError};
 
@@ -72,13 +73,19 @@ impl IntegrityState {
         }
     }
 
-    fn from_str(value: &str) -> Option<Self> {
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
         match value {
             "ok" => Some(Self::Ok),
             "missing" => Some(Self::Missing),
             "mismatch" => Some(Self::Mismatch),
             _ => None,
         }
+    }
+}
+
+impl std::fmt::Display for IntegrityState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -120,12 +127,18 @@ impl From<rusqlite::Error> for RegistryError {
 /// insert, and every SQLite mutation is one immediate transaction.
 #[derive(Debug)]
 pub struct ModuleRegistry {
-    store: Store,
+    pub(crate) store: Store,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct MemoryState {
+    pub(crate) versions: HashMap<(String, String), ModuleRecord>,
+    pub(crate) active: HashMap<String, ActiveVersion>,
 }
 
 #[derive(Debug)]
-enum Store {
-    Memory(Mutex<HashMap<(String, String), ModuleRecord>>),
+pub(crate) enum Store {
+    Memory(Mutex<MemoryState>),
     Sqlite(Database),
 }
 
@@ -144,7 +157,7 @@ impl ModuleRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            store: Store::Memory(Mutex::new(HashMap::new())),
+            store: Store::Memory(Mutex::new(MemoryState::default())),
         }
     }
 
@@ -172,7 +185,7 @@ impl ModuleRegistry {
     /// rejects a different digest for an already-registered version.
     pub fn record(&self, record: ModuleRecord) -> Result<Registration, RegistryError> {
         match &self.store {
-            Store::Memory(entries) => record_in_memory(entries, record),
+            Store::Memory(state) => record_in_memory(state, record),
             Store::Sqlite(database) => record_sqlite(database, record),
         }
     }
@@ -185,9 +198,10 @@ impl ModuleRegistry {
         version: &str,
     ) -> Result<Option<ModuleRecord>, RegistryError> {
         match &self.store {
-            Store::Memory(entries) => {
-                let entries = entries.lock().unwrap_or_else(|e| e.into_inner());
-                Ok(entries
+            Store::Memory(state) => {
+                let state = state.lock().unwrap_or_else(|e| e.into_inner());
+                Ok(state
+                    .versions
                     .get(&(module_id.to_owned(), version.to_owned()))
                     .cloned())
             }
@@ -207,9 +221,10 @@ impl ModuleRegistry {
     /// string.
     pub fn list_versions(&self, module_id: &str) -> Result<Vec<ModuleRecord>, RegistryError> {
         match &self.store {
-            Store::Memory(entries) => {
-                let entries = entries.lock().unwrap_or_else(|e| e.into_inner());
-                let mut records: Vec<ModuleRecord> = entries
+            Store::Memory(state) => {
+                let state = state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut records: Vec<ModuleRecord> = state
+                    .versions
                     .values()
                     .filter(|record| record.module_id == module_id)
                     .cloned()
@@ -240,9 +255,9 @@ impl ModuleRegistry {
     /// stat each artifact without SQL outside this module.
     pub fn all_versions(&self) -> Result<Vec<ModuleRecord>, RegistryError> {
         match &self.store {
-            Store::Memory(entries) => {
-                let entries = entries.lock().unwrap_or_else(|e| e.into_inner());
-                let mut records: Vec<ModuleRecord> = entries.values().cloned().collect();
+            Store::Memory(state) => {
+                let state = state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut records: Vec<ModuleRecord> = state.versions.values().cloned().collect();
                 records.sort_by(|a, b| (&a.module_id, &a.version).cmp(&(&b.module_id, &b.version)));
                 Ok(records)
             }
@@ -266,9 +281,10 @@ impl ModuleRegistry {
     /// by module id.
     pub fn list_modules(&self) -> Result<Vec<String>, RegistryError> {
         match &self.store {
-            Store::Memory(entries) => {
-                let entries = entries.lock().unwrap_or_else(|e| e.into_inner());
-                let mut modules: Vec<String> = entries
+            Store::Memory(state) => {
+                let state = state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut modules: Vec<String> = state
+                    .versions
                     .values()
                     .map(|record| record.module_id.clone())
                     .collect::<std::collections::HashSet<_>>()
@@ -315,9 +331,12 @@ impl ModuleRegistry {
         state: IntegrityState,
     ) -> Result<bool, RegistryError> {
         match &self.store {
-            Store::Memory(entries) => {
-                let mut entries = entries.lock().unwrap_or_else(|e| e.into_inner());
-                match entries.get_mut(&(module_id.to_owned(), version.to_owned())) {
+            Store::Memory(memory) => {
+                let mut guard = memory.lock().unwrap_or_else(|e| e.into_inner());
+                match guard
+                    .versions
+                    .get_mut(&(module_id.to_owned(), version.to_owned()))
+                {
                     Some(record) => {
                         record.integrity_state = state;
                         Ok(true)
@@ -339,9 +358,9 @@ impl ModuleRegistry {
     /// Number of registered module versions.
     pub fn len(&self) -> Result<usize, RegistryError> {
         match &self.store {
-            Store::Memory(entries) => {
-                let entries = entries.lock().unwrap_or_else(|e| e.into_inner());
-                Ok(entries.len())
+            Store::Memory(state) => {
+                let state = state.lock().unwrap_or_else(|e| e.into_inner());
+                Ok(state.versions.len())
             }
             Store::Sqlite(database) => database.with_connection(|conn| {
                 conn.query_row("SELECT COUNT(*) FROM module_versions", [], |row| {
@@ -360,12 +379,12 @@ impl ModuleRegistry {
 }
 
 fn record_in_memory(
-    entries: &Mutex<HashMap<(String, String), ModuleRecord>>,
+    state: &Mutex<MemoryState>,
     record: ModuleRecord,
 ) -> Result<Registration, RegistryError> {
     let key = (record.module_id.clone(), record.version.clone());
-    let mut entries = entries.lock().unwrap_or_else(|e| e.into_inner());
-    match entries.get(&key) {
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    match state.versions.get(&key) {
         Some(existing) if existing.digest == record.digest => Ok(Registration {
             record: existing.clone(),
             already_registered: true,
@@ -381,7 +400,7 @@ fn record_in_memory(
                 record: record.clone(),
                 already_registered: false,
             };
-            entries.insert(key, record);
+            state.versions.insert(key, record);
             Ok(registration)
         }
     }

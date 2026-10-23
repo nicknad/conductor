@@ -49,7 +49,7 @@ pub fn artifact_relative_path(validated: &ValidatedPackage) -> String {
 
 /// Destination address for a validated package.
 #[must_use]
-pub fn artifact_path(artifacts: &Path, validated: &ValidatedPackage) -> PathBuf {
+pub(crate) fn artifact_path(artifacts: &Path, validated: &ValidatedPackage) -> PathBuf {
     artifacts.join(artifact_relative_path(validated))
 }
 

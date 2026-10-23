@@ -24,7 +24,7 @@ pub fn ensure_dir(dir: &Path) -> io::Result<()> {
 /// opens it with `create_new(true)`; on collision it retries with a fresh
 /// counter value.
 #[must_use]
-pub fn unique_path(dir: &Path) -> PathBuf {
+fn unique_path(dir: &Path) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_nanos())

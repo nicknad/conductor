@@ -15,7 +15,7 @@
 
 use thiserror::Error;
 
-use crate::modules::registry::{ModuleRegistry, RegistryError};
+use crate::modules::registry::{IntegrityState, ModuleRegistry, RegistryError};
 use crate::packages::artifact::ArtifactDigest;
 
 /// What activation is permitted to run. Built once at startup, held
@@ -54,6 +54,14 @@ pub enum ActivationError {
     EmptyRuntimeAllowlist,
     #[error("module version is not registered: {module_id} {version}")]
     NotRegistered { module_id: String, version: String },
+    #[error("module has no active version: {module_id}")]
+    NoActiveVersion { module_id: String },
+    #[error("module version artifact is not intact ({state}): {module_id} {version}")]
+    Integrity {
+        module_id: String,
+        version: String,
+        state: IntegrityState,
+    },
     #[error("module runtime is not allowed to activate: {runtime} ({module_id} {version})")]
     RuntimeNotAllowed {
         module_id: String,
@@ -78,6 +86,13 @@ pub fn activate(
                 module_id: module_id.to_owned(),
                 version: version.to_owned(),
             })?;
+    if record.integrity_state != IntegrityState::Ok {
+        return Err(ActivationError::Integrity {
+            module_id: record.module_id,
+            version: record.version,
+            state: record.integrity_state,
+        });
+    }
     if !policy
         .allowed_runtimes
         .iter()
@@ -95,6 +110,23 @@ pub fn activate(
         digest: record.digest,
         signer_key_id: record.signer_key_id,
     })
+}
+
+/// Activates whichever version is currently marked active for the module.
+/// Resolves the active pointer, then applies the same pinned checks
+/// (existence, integrity, runtime allowlist).
+pub fn activate_active(
+    registry: &ModuleRegistry,
+    module_id: &str,
+    policy: &ActivationPolicy,
+) -> Result<ActivatedModule, ActivationError> {
+    let active =
+        registry
+            .get_active(module_id)?
+            .ok_or_else(|| ActivationError::NoActiveVersion {
+                module_id: module_id.to_owned(),
+            })?;
+    activate(registry, module_id, &active.version, policy)
 }
 
 #[cfg(test)]
@@ -158,5 +190,42 @@ mod tests {
         let policy = ActivationPolicy::new(vec!["rust".to_owned()]).expect("policy");
         let err = activate(&registry, "reporting", "1.2.0", &policy).unwrap_err();
         assert!(matches!(err, ActivationError::RuntimeNotAllowed { .. }));
+    }
+
+    #[test]
+    fn non_intact_artifact_never_activates() {
+        for state in [IntegrityState::Missing, IntegrityState::Mismatch] {
+            let registry = ModuleRegistry::new();
+            registry
+                .record(record("reporting", "1.2.0", "rust"))
+                .expect("record");
+            registry
+                .set_integrity_state("reporting", "1.2.0", state)
+                .expect("mark");
+            let policy = ActivationPolicy::new(vec!["rust".to_owned()]).expect("policy");
+            let err = activate(&registry, "reporting", "1.2.0", &policy).unwrap_err();
+            assert!(
+                matches!(err, ActivationError::Integrity { state: s, .. } if s == state),
+                "state {state} must refuse activation"
+            );
+        }
+    }
+
+    #[test]
+    fn activate_active_resolves_the_pointer() {
+        let registry = ModuleRegistry::new();
+        let policy = ActivationPolicy::new(vec!["rust".to_owned()]).expect("policy");
+        let err = activate_active(&registry, "reporting", &policy).unwrap_err();
+        assert!(matches!(err, ActivationError::NoActiveVersion { .. }));
+
+        registry
+            .record(record("reporting", "1.2.0", "rust"))
+            .expect("record");
+        registry
+            .record(record("reporting", "1.3.0", "rust"))
+            .expect("record");
+        registry.set_active("reporting", "1.3.0").expect("point");
+        let activated = activate_active(&registry, "reporting", &policy).expect("activate");
+        assert_eq!(activated.version, "1.3.0");
     }
 }
