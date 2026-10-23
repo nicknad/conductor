@@ -248,9 +248,10 @@ impl ZipArchiveReader {
     /// One-shot inspection of the archive at `path`. Opens the file once
     /// and inspects that same handle, so this single call is atomic.
     ///
-    /// Production validation must NOT combine this with a separate hash of
-    /// the same path (two opens can diverge under replacement). Thread one
-    /// [`QuarantinedFile`] through [`ZipArchiveReader::inspect_file`] and
+    /// Standalone inspection only: production validation must NOT combine
+    /// this with a separate hash of the same path (two opens can diverge
+    /// under replacement). Thread one [`QuarantinedFile`] through
+    /// [`ZipArchiveReader::inspect_file`] and
     /// [`ZipArchiveReader::read_file_from`] instead.
     pub fn inspect(
         &self,
@@ -475,7 +476,10 @@ impl ZipArchiveReader {
                     "non-regular entries are never extracted",
                 ));
             }
-            let normalized = check_entry_path(entry.name(), file_type == EntryFileType::Symlink)?;
+            let name = entry
+                .name()
+                .map_err(|e| ArchiveError::InvalidArchive(e.to_string()))?;
+            let normalized = check_entry_path(&name, file_type == EntryFileType::Symlink)?;
             if entry.is_dir() {
                 // Directories carry no payload; they are recreated from
                 // file parents below.
@@ -597,7 +601,10 @@ impl ZipArchiveReader {
                     "non-regular entries are never extracted",
                 ));
             }
-            let normalized = check_entry_path(entry.name(), file_type == EntryFileType::Symlink)?;
+            let name = entry
+                .name()
+                .map_err(|e| ArchiveError::InvalidArchive(e.to_string()))?;
+            let normalized = check_entry_path(&name, file_type == EntryFileType::Symlink)?;
             if entry.is_dir() {
                 continue;
             }
@@ -1252,19 +1259,30 @@ mod tests {
         assert_eq!(archive.len(), accepted.len());
         for i in 0..archive.len() {
             let file = archive.by_index(i).expect("entry must read");
-            let raw = file.name().to_owned();
+            let raw = file.name().expect("entry name must decode").into_owned();
             assert!(
                 check_entry_path(&raw, false).is_ok(),
                 "policy must accept {raw:?}"
             );
             let enclosed = file
                 .enclosed_name()
-                .expect("zip enclosed_name must accept every policy-accepted path");
-            assert_eq!(
-                enclosed.to_string_lossy().replace('\\', "/"),
-                raw,
-                "enclosed path must match the validated name for {raw:?}"
-            );
+                .expect("zip enclosed_name must accept every policy-accepted path")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if raw == "C:/windows/evil" {
+                // `zip` 9 applies Windows semantics in `enclosed_name` and
+                // strips the drive prefix. This policy is deliberately
+                // Linux-scoped: on Linux `C:` is an ordinary name, and the
+                // extractor writes the validated byte path (it never calls
+                // `enclosed_name`), so the rewrite is harmless. Re-add drive
+                // rejection before allowing extraction on Windows.
+                assert_eq!(enclosed, "windows/evil");
+            } else {
+                assert_eq!(
+                    enclosed, raw,
+                    "enclosed path must match the validated name for {raw:?}"
+                );
+            }
         }
     }
 
