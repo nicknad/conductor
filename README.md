@@ -107,6 +107,9 @@ overrides produce an immutable `Config`:
 - `Config::validate_for_startup` refuses to proceed without a non-empty token
   and at least one trusted key, and rejects an unusable bind address, zero
   timeout or upload slots, and empty paths.
+- `Config::trust_store` converts the configured records into the runtime
+  `ConfiguredTrustedKeys`, validating standard base64, the 32-byte Ed25519 key
+  size, and non-empty unique key ids.
 
 Example: [`config/conductor.example.json`](config/conductor.example.json).
 Its token and key are placeholders; generate your own and do not commit real

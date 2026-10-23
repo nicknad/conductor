@@ -19,9 +19,12 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use base64::prelude::*;
 use serde::Deserialize;
 
-use crate::packages::signature::SignatureAlgorithm;
+use crate::packages::signature::{
+    ConfiguredTrustedKeys, SignatureAlgorithm, TrustStoreError, TrustedSigningKey,
+};
 
 const ENV_CONFIG: &str = "CONDUCTOR_CONFIG";
 const ENV_HTTP_BIND: &str = "CONDUCTOR_HTTP_BIND";
@@ -48,6 +51,42 @@ pub struct TrustedKeyConfig {
     pub key_id: String,
     pub algorithm: SignatureAlgorithm,
     pub public_key_base64: String,
+}
+
+impl TrustedKeyConfig {
+    /// Converts the operator-facing record into the runtime key type.
+    /// The key id must be non-empty, the public key must be standard base64
+    /// over exactly 32 raw bytes (the Ed25519 key size), and the algorithm
+    /// is the closed [`SignatureAlgorithm`] enum. Failures include the
+    /// offending field but never echo key material.
+    fn to_signing_key(&self) -> Result<TrustedSigningKey, ConfigError> {
+        if self.key_id.trim().is_empty() {
+            return Err(ConfigError::Invalid {
+                field: "trusted_keys.key_id",
+                reason: "must not be empty".to_owned(),
+            });
+        }
+        let public_key = BASE64_STANDARD
+            .decode(self.public_key_base64.trim())
+            .map_err(|err| ConfigError::Invalid {
+                field: "trusted_keys.public_key_base64",
+                reason: format!("must be standard base64: {err}"),
+            })?;
+        if public_key.len() != 32 {
+            return Err(ConfigError::Invalid {
+                field: "trusted_keys.public_key_base64",
+                reason: format!(
+                    "Ed25519 public key must be 32 bytes, got {}",
+                    public_key.len()
+                ),
+            });
+        }
+        Ok(TrustedSigningKey::new(
+            self.key_id.clone(),
+            self.algorithm,
+            public_key,
+        ))
+    }
 }
 
 /// Host configuration. Built once at startup and shared by value or by
@@ -245,15 +284,30 @@ impl Config {
         if self.trusted_keys.is_empty() {
             return Err(ConfigError::Missing("trusted_keys"));
         }
-        for key in &self.trusted_keys {
-            if key.key_id.trim().is_empty() {
-                return Err(ConfigError::Invalid {
-                    field: "trusted_keys.key_id",
-                    reason: "must not be empty".to_owned(),
-                });
-            }
-        }
+        self.trust_store()?;
         Ok(())
+    }
+
+    /// Builds the runtime trust store from the configured key records.
+    /// Validates standard-base64 encoding, the 32-byte Ed25519 key size, and
+    /// non-empty unique key ids, so startup never proceeds with a key that
+    /// cannot verify or a lookup that could resolve ambiguously.
+    pub fn trust_store(&self) -> Result<ConfiguredTrustedKeys, ConfigError> {
+        let keys = self
+            .trusted_keys
+            .iter()
+            .map(TrustedKeyConfig::to_signing_key)
+            .collect::<Result<Vec<_>, _>>()?;
+        ConfiguredTrustedKeys::new(keys).map_err(|err| match err {
+            TrustStoreError::EmptyKeyId => ConfigError::Invalid {
+                field: "trusted_keys.key_id",
+                reason: "must not be empty".to_owned(),
+            },
+            TrustStoreError::DuplicateKeyId(key_id) => ConfigError::Invalid {
+                field: "trusted_keys.key_id",
+                reason: format!("duplicate key id: {key_id}"),
+            },
+        })
     }
 
     /// Directory holding untrusted uploads awaiting validation. Created on
@@ -477,13 +531,15 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    const VALID_PUBLIC_KEY_BASE64: &str = "GX9rI+FshTLGq8g4+s1ep4m+DHaykgM0A5v6iz02jWE=";
+
     fn startup_ready_config() -> Config {
         Config {
             api_token: Some("startup-token".to_owned()),
             trusted_keys: vec![TrustedKeyConfig {
                 key_id: "k1".to_owned(),
                 algorithm: SignatureAlgorithm::Ed25519,
-                public_key_base64: "GX9rI+FshTLGq8g4+s1ep4m+DHaykgM0A5v6iz02jWE=".to_owned(),
+                public_key_base64: VALID_PUBLIC_KEY_BASE64.to_owned(),
             }],
             ..Config::default()
         }
@@ -538,6 +594,62 @@ mod tests {
     }
 
     #[test]
+    fn trust_store_converts_and_validates_configured_keys() {
+        let config = startup_ready_config();
+        let store = config.trust_store().expect("valid key must build");
+        let key = store.key("k1").expect("configured key must resolve");
+        assert_eq!(key.algorithm, SignatureAlgorithm::Ed25519);
+        assert_eq!(key.public_key.len(), 32);
+        assert_eq!(
+            key.public_key,
+            BASE64_STANDARD
+                .decode(VALID_PUBLIC_KEY_BASE64)
+                .expect("test constant must be valid base64")
+        );
+    }
+
+    #[test]
+    fn invalid_base64_key_material_is_rejected() {
+        let mut config = startup_ready_config();
+        config.trusted_keys[0].public_key_base64 = "not base64!".to_owned();
+        assert!(matches!(
+            config.validate_for_startup(),
+            Err(ConfigError::Invalid {
+                field: "trusted_keys.public_key_base64",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn wrong_length_ed25519_key_material_is_rejected() {
+        let mut config = startup_ready_config();
+        config.trusted_keys[0].public_key_base64 = BASE64_STANDARD.encode([1u8; 31]);
+        assert!(matches!(
+            config.validate_for_startup(),
+            Err(ConfigError::Invalid {
+                field: "trusted_keys.public_key_base64",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn duplicate_trusted_key_ids_are_rejected() {
+        let mut config = startup_ready_config();
+        let mut duplicate = config.trusted_keys[0].clone();
+        duplicate.public_key_base64 = BASE64_STANDARD.encode([2u8; 32]);
+        config.trusted_keys.push(duplicate);
+        assert!(matches!(
+            config.validate_for_startup(),
+            Err(ConfigError::Invalid {
+                field: "trusted_keys.key_id",
+                ref reason,
+            }) if reason.contains("duplicate")
+        ));
+    }
+
+    #[test]
     fn config_file_parses_and_overrides_defaults() {
         let path = write_temp(
             "full.json",
@@ -552,7 +664,7 @@ mod tests {
                 "trusted_keys": [{
                     "key_id": "file-key",
                     "algorithm": "ed25519",
-                    "public_key_base64": "AAAA"
+                    "public_key_base64": VALID_PUBLIC_KEY_BASE64
                 }]
             })
             .to_string(),
@@ -689,7 +801,12 @@ mod tests {
     fn trusted_keys_file_replaces_config_keys() {
         let keys_path = write_temp(
             "keys.json",
-            r#"[{"key_id":"env-key","algorithm":"ed25519","public_key_base64":"AAAA"}]"#,
+            &serde_json::json!([{
+                "key_id": "env-key",
+                "algorithm": "ed25519",
+                "public_key_base64": VALID_PUBLIC_KEY_BASE64
+            }])
+            .to_string(),
         );
         let config = Config::load_with(
             None,
@@ -745,7 +862,7 @@ mod tests {
             trusted_keys: vec![TrustedKeyConfig {
                 key_id: String::new(),
                 algorithm: SignatureAlgorithm::Ed25519,
-                public_key_base64: "AAAA".to_owned(),
+                public_key_base64: VALID_PUBLIC_KEY_BASE64.to_owned(),
             }],
             ..startup_ready_config()
         };
