@@ -157,10 +157,11 @@ included), output bounds, and staged-file tamper detection at resolve time.
 ## Status
 
 - Active code: single-crate Rust modular monolith (`src/`, `tests/`).
-- Scaffold only: module boundaries and responsibilities are laid out, but no scheduler behavior is
-  ported yet.
-- Reference: the original .NET 10 implementation is frozen under
-  [`archive/dotnet-original/`](archive/README.md) for consultation only.
+- In progress: package ingestion, validation, promotion, registry persistence,
+  and the worker execution library are implemented. Host startup wiring,
+  scheduler/triggering, lifecycle endpoints, execution history, and the
+  operator CLI are not built yet — see
+  [Not built yet](docs/architecture.md#not-built-yet).
 - Specification: [`docs/architecture.md`](docs/architecture.md) describes the
   Rust system as built. `docs/storage-reconciliation.md` and
   `docs/design-persistence.md` are background/planning notes, not specs.
@@ -180,15 +181,17 @@ src/
   modules/                  Installed module registry
   executions/               Worker-process execution (spawn, IPC, limits)
   config.rs                 Host configuration
+config/
+  conductor.example.json    Example host configuration
 tests/
   package_validation.rs     Package validation workflow tests
   archive_security.rs       Archive security tests
   execution_worker.rs       Worker-process execution tests
+  upload_api.rs             Upload API tests
+  tls_only.rs               TLS-only serving tests
   upload_workflow.rs        Upload workflow tests
 docs/                       Current architecture + background notes (see docs/README.md)
-archive/
-  dotnet-original/          Frozen .NET 10 implementation (reference only)
-  README.md                 What the archive contains and why
+.env.example                Environment variable template
 LICENSE                     Apache-2.0
 ```
 

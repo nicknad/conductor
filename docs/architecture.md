@@ -1,9 +1,7 @@
 # Architecture
 
-> Current as of the Rust rewrite. The frozen .NET 10 implementation under
-> `archive/dotnet-original/` and its design notes are reference only; nothing
-> below describes them. There is no scheduler, no in-process plugin runtime,
-> and no CLI yet — see [Not built yet](#not-built-yet).
+> Current as of the Rust rewrite. There is no scheduler, no in-process plugin
+> runtime, and no CLI yet — see [Not built yet](#not-built-yet).
 
 Conductor is a single-machine job execution platform: operators upload signed
 service packages, the host validates and stores them as immutable artifacts,
