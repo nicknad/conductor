@@ -310,8 +310,26 @@ impl Config {
         })
     }
 
-    /// Directory holding untrusted uploads awaiting validation. Created on
-    /// demand by the quarantine layer; never served or executed from.
+    /// Creates and tightens the managed storage layout: the storage root,
+    /// `quarantine/`, `artifacts/`, `database/`, and `staging/`. Directories
+    /// are created if missing and set to owner-only (`0700`) on Unix,
+    /// including directories that already exist. Idempotent; any I/O failure
+    /// is fatal at startup.
+    pub fn ensure_layout(&self) -> Result<(), ConfigError> {
+        for path in [
+            self.storage_root.clone(),
+            self.quarantine_dir(),
+            self.artifact_dir(),
+            self.database_dir(),
+            self.staging_dir(),
+        ] {
+            create_private_dir(&path)?;
+        }
+        Ok(())
+    }
+
+    /// Directory holding untrusted uploads awaiting validation. Created by
+    /// [`ensure_layout`](Self::ensure_layout); never served or executed from.
     #[must_use]
     pub fn quarantine_dir(&self) -> PathBuf {
         self.storage_root.join("quarantine")
@@ -325,12 +343,46 @@ impl Config {
         self.storage_root.join("artifacts")
     }
 
-    /// SQLite database path. The parent directory is created on demand by
-    /// the database layer; migrations run at startup.
+    /// Owner-only staging root for verified extraction
+    /// ([`extract_verified`](crate::storage::staging::extract_verified)).
+    #[must_use]
+    pub fn staging_dir(&self) -> PathBuf {
+        self.storage_root.join("staging")
+    }
+
+    /// Directory holding the SQLite database.
+    #[must_use]
+    pub fn database_dir(&self) -> PathBuf {
+        self.storage_root.join("database")
+    }
+
+    /// SQLite database path. Migrations run at startup over the one
+    /// process-wide connection.
     #[must_use]
     pub fn database_path(&self) -> PathBuf {
-        self.storage_root.join("database").join("conductor.db")
+        self.database_dir().join("conductor.db")
     }
+}
+
+/// Creates `path` and makes it owner-only on Unix. Existing directories are
+/// tightened too: storage roots hold untrusted uploads and immutable
+/// artifacts, so a permissive umask must not weaken them.
+fn create_private_dir(path: &Path) -> Result<(), ConfigError> {
+    std::fs::create_dir_all(path).map_err(|err| ConfigError::Layout {
+        path: path.display().to_string(),
+        detail: err.to_string(),
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|err| {
+            ConfigError::Layout {
+                path: path.display().to_string(),
+                detail: err.to_string(),
+            }
+        })?;
+    }
+    Ok(())
 }
 
 /// On-disk shape. Every field is optional: missing values fall back to
@@ -370,6 +422,8 @@ pub enum ConfigError {
     Missing(&'static str),
     #[error("invalid {field}: {reason}")]
     Invalid { field: &'static str, reason: String },
+    #[error("storage layout {path}: {detail}")]
+    Layout { path: String, detail: String },
 }
 
 /// Reads only `CONDUCTOR_*` variables from the process environment. A
@@ -558,10 +612,87 @@ mod tests {
             config.storage_root.join("quarantine")
         );
         assert_eq!(config.artifact_dir(), config.storage_root.join("artifacts"));
+        assert_eq!(config.staging_dir(), config.storage_root.join("staging"));
+        assert_eq!(config.database_dir(), config.storage_root.join("database"));
         assert_eq!(
             config.database_path(),
             config.storage_root.join("database").join("conductor.db")
         );
+    }
+
+    #[test]
+    fn ensure_layout_creates_owner_only_storage_dirs() {
+        let root = temp_path("layout");
+        let config = Config {
+            storage_root: root.clone(),
+            ..Config::default()
+        };
+        config.ensure_layout().expect("layout must be created");
+
+        for dir in [
+            config.storage_root.clone(),
+            config.quarantine_dir(),
+            config.artifact_dir(),
+            config.database_dir(),
+            config.staging_dir(),
+        ] {
+            assert!(dir.is_dir(), "{} must be a directory", dir.display());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(&dir)
+                    .expect("directory metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o700, "{} must be owner-only", dir.display());
+            }
+        }
+
+        config
+            .ensure_layout()
+            .expect("layout creation is idempotent");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_layout_tightens_an_existing_storage_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp_path("layout-existing");
+        std::fs::create_dir_all(&root).expect("root must be created");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))
+            .expect("root permissions must be relaxed for the test");
+
+        let config = Config {
+            storage_root: root.clone(),
+            ..Config::default()
+        };
+        config.ensure_layout().expect("layout must be tightened");
+
+        let mode = std::fs::metadata(&root)
+            .expect("root metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "existing root must become owner-only");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ensure_layout_reports_an_unusable_storage_root() {
+        let root = temp_path("layout-file");
+        std::fs::write(&root, b"not a directory").expect("blocking file must be written");
+        let config = Config {
+            storage_root: root.clone(),
+            ..Config::default()
+        };
+        assert!(matches!(
+            config.ensure_layout(),
+            Err(ConfigError::Layout { .. })
+        ));
+        cleanup(&root);
     }
 
     #[test]

@@ -110,6 +110,9 @@ overrides produce an immutable `Config`:
 - `Config::trust_store` converts the configured records into the runtime
   `ConfiguredTrustedKeys`, validating standard base64, the 32-byte Ed25519 key
   size, and non-empty unique key ids.
+- `Config::ensure_layout` creates and tightens the managed storage directories
+  (`storage_root`, `quarantine/`, `artifacts/`, `database/`, `staging/`) to
+  owner-only permissions.
 
 Example: [`config/conductor.example.json`](config/conductor.example.json).
 Its token and key are placeholders; generate your own and do not commit real

@@ -7,7 +7,8 @@
 //!
 //! Two backends, one API: an in-memory map for tests and ephemeral hosts,
 //! and SQLite ([`ModuleRegistry::open`], migrations applied on
-//! construction), which makes registrations survive a restart. The
+//! construction; [`ModuleRegistry::from_database`] wraps an already-migrated
+//! shared handle), which makes registrations survive a restart. The
 //! registry stores records, never code and never a path it will open:
 //! activation consumes registry state plus policy and must not re-open
 //! archives. `artifact_relpath` is reconciliation bookkeeping, not an
@@ -15,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use rusqlite::{params, OptionalExtension};
@@ -139,7 +140,7 @@ pub(crate) struct MemoryState {
 #[derive(Debug)]
 pub(crate) enum Store {
     Memory(Mutex<MemoryState>),
-    Sqlite(Database),
+    Sqlite(Arc<Database>),
 }
 
 impl Default for ModuleRegistry {
@@ -164,21 +165,28 @@ impl ModuleRegistry {
     /// Opens (or creates) the SQLite-backed registry at `path` and applies
     /// pending migrations. Registrations survive restarts.
     pub fn open(path: &Path) -> Result<Self, RegistryError> {
-        let database = Database::open(path)?;
+        let database = Arc::new(Database::open(path)?);
         database.migrate()?;
-        Ok(Self {
-            store: Store::Sqlite(database),
-        })
+        Ok(Self::from_database(database))
     }
 
     /// SQLite-backed registry over a private in-memory database: the real
     /// storage semantics with no files.
     pub fn open_in_memory() -> Result<Self, RegistryError> {
-        let database = Database::open_in_memory()?;
+        let database = Arc::new(Database::open_in_memory()?);
         database.migrate()?;
-        Ok(Self {
+        Ok(Self::from_database(database))
+    }
+
+    /// Wraps an already-migrated shared database handle. Startup opens and
+    /// migrates one [`Database`], then hands [`Arc`] clones to the registry
+    /// and every other repository (rejection store, reconciliation) so all
+    /// writes share one connection and one WAL/pragma policy.
+    #[must_use]
+    pub fn from_database(database: Arc<Database>) -> Self {
+        Self {
             store: Store::Sqlite(database),
-        })
+        }
     }
 
     /// Registers a module version. Idempotent for the identical digest;
@@ -186,7 +194,7 @@ impl ModuleRegistry {
     pub fn record(&self, record: ModuleRecord) -> Result<Registration, RegistryError> {
         match &self.store {
             Store::Memory(state) => record_in_memory(state, record),
-            Store::Sqlite(database) => record_sqlite(database, record),
+            Store::Sqlite(database) => record_sqlite(database.as_ref(), record),
         }
     }
 

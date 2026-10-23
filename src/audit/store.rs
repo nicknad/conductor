@@ -148,6 +148,9 @@ fn row_to_rejection(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRejection
 mod tests {
     use super::*;
     use crate::audit::event::RejectionStage;
+    use crate::modules::registry::{IntegrityState, ModuleRecord, ModuleRegistry};
+    use crate::packages::artifact::ArtifactDigest;
+    use std::time::SystemTime;
 
     fn event_for(stage: RejectionStage, code: &'static str) -> RejectionEvent {
         RejectionEvent::new(stage, code, format!("{code} at {}", stage.as_str()))
@@ -240,5 +243,50 @@ mod tests {
         for window in rows.windows(2) {
             assert!(window[0].id < window[1].id);
         }
+    }
+
+    #[test]
+    fn shared_database_serves_registry_and_rejection_rows() {
+        let database = Arc::new(Database::open_in_memory().expect("in-memory database must open"));
+        database.migrate().expect("database must migrate");
+
+        // Two repositories over Arc clones of the same handle: no second
+        // connection is opened and both writes land in the one database.
+        let registry = ModuleRegistry::from_database(Arc::clone(&database));
+        registry
+            .record(ModuleRecord {
+                module_id: "reporting-service".to_owned(),
+                version: "1.2.0".to_owned(),
+                digest: ArtifactDigest::new([7u8; 32]),
+                signer_key_id: "k1".to_owned(),
+                runtime: "rust".to_owned(),
+                manifest_version: 2,
+                manifest_json: "{}".to_owned(),
+                artifact_relpath: "reporting-service/1.2.0/pkg.zip".to_owned(),
+                artifact_size: 123,
+                integrity_state: IntegrityState::Ok,
+                registered_at: SystemTime::now(),
+            })
+            .expect("registration must write through the shared handle");
+
+        let store = RejectionStore::new(Arc::clone(&database));
+        store
+            .record(&event_for(RejectionStage::Signature, "signature_rejected"))
+            .expect("rejection must write through the shared handle");
+
+        let counts: (i64, i64) = database
+            .with_connection(|conn| {
+                let versions = conn
+                    .query_row("SELECT COUNT(*) FROM module_versions", [], |row| row.get(0))
+                    .map_err(DatabaseError::from)?;
+                let rejections = conn
+                    .query_row("SELECT COUNT(*) FROM package_rejections", [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(DatabaseError::from)?;
+                Ok::<(i64, i64), DatabaseError>((versions, rejections))
+            })
+            .expect("counts must read through the shared handle");
+        assert_eq!(counts, (1, 1));
     }
 }

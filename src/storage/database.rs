@@ -7,9 +7,9 @@
 //! cleanly on the next start, and a database written by a newer binary is
 //! refused instead of misread.
 //!
-//! This module owns the schema DDL; repositories (starting with
-//! `modules::registry`) own the queries. Later phases add the rejection
-//! sink and startup reconciliation over the same connection.
+//! This module owns the schema DDL; repositories (`modules::registry`,
+//! `audit::store`) own the queries and share one `Arc<Database>` so all
+//! writes use the same WAL/pragma policy.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};

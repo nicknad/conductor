@@ -88,11 +88,15 @@ audited. Quarantine bytes are deleted on failure.
 | `quarantine/` | Untrusted uploads awaiting validation | API streaming; deleted on failure |
 | `artifacts/{module}/{version}/{digest}.zip` | Immutable promoted artifacts | Artifact store only |
 | `database/conductor.db` | SQLite: module registry (+ activation/rejection rows per schema v1) | Registry / later phases |
-| staging temp dirs | Owner-only verified extraction, removed on drop | `extract_verified`; executor re-verifies at spawn |
+| `staging/` | Owner-only verified extraction, removed on drop | `extract_verified`; executor re-verifies at spawn |
 
-SQLite (`storage::database`): single mutex-guarded connection, WAL,
-foreign keys, busy timeout, forward-only migrations with `user_version`
-crash-resume; newer-than-binary DBs are refused. Repositories own queries.
+`Config::ensure_layout` creates the root and its managed directories with
+owner-only permissions at startup, tightening existing directories too.
+
+SQLite (`storage::database`): one mutex-guarded connection shared through
+`Arc<Database>` by the registry and rejection store, WAL, foreign keys, busy
+timeout, forward-only migrations with `user_version` crash-resume;
+newer-than-binary DBs are refused. Repositories own queries.
 
 ## Execution (`executions/`)
 
@@ -135,9 +139,9 @@ stderr volume, and wall time are all bounded.
 
 ## Not built yet
 
-Scheduler/triggering, CLI, operator trusted-key loading (`server::run`
-refuses to serve until it lands — the API is exercised via `router` in
-tests), durable audit sink behind `RejectionRecorder::record`, startup
+Scheduler/triggering, CLI, startup assembly and operator trusted-key wiring
+(`server::run` refuses to serve until it lands — the API is exercised via
+`router` in tests), startup wiring of the durable rejection sink, startup
 reconciliation/leftover sweeps, artifact GC, and any execution-history or
-activation persistence beyond the registry. `control_plane/lifecycle.rs` is
+activation API beyond the persisted registry. `control_plane/lifecycle.rs` is
 currently a placeholder for deactivate/remove/rollback transitions.
