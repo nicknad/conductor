@@ -1,0 +1,66 @@
+name: Security
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Re-check advisories and history even when nothing changed.
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Advisories, bans, licenses, sources
+        uses: EmbarkStudios/cargo-deny-action@v2
+
+  semgrep:
+    name: semgrep
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Scan
+        # Pinned to the version documented in .semgrep.yml.
+        run: |
+          docker run --rm \
+            --volume "$PWD:/src" \
+            --workdir /src \
+            semgrep/semgrep:1.175.0 \
+            semgrep scan --config .semgrep.yml --error
+
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # Full history so the scan is not limited to the tip commit.
+          fetch-depth: 0
+
+      - name: Install
+        run: |
+          curl --fail --silent --show-error --location \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar --extract --gzip --directory /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Scan history
+        run: gitleaks git --no-banner --redact --verbose

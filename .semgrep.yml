@@ -1,4 +1,4 @@
-# Semgrep rules for the job-scheduler workspace.
+# Semgrep rules for the Conductor workspace.
 #
 # Run (Linux/macOS/WSL or CI):
 #   semgrep scan --config .semgrep.yml
@@ -59,6 +59,11 @@ rules:
           - pattern: $CONN.prepare(&format!($FMT, ...))
           - pattern: $CONN.query(&format!($FMT, ...))
           - pattern: $CONN.execute(&format!($FMT, ...))
+      # A literal-only `format!` cannot interpolate a value; the constant
+      # query text is not an injection sink.
+      - pattern-not: $CONN.prepare(&format!("..."))
+      - pattern-not: $CONN.query(&format!("..."))
+      - pattern-not: $CONN.execute(&format!("..."))
 
   - id: generic.hardcoded-secret
     message: >

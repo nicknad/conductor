@@ -30,7 +30,10 @@ const ENV_REQUEST_TIMEOUT_SECS: &str = "CONDUCTOR_REQUEST_TIMEOUT_SECS";
 const ENV_TLS_CERT_PATH: &str = "CONDUCTOR_TLS_CERT_PATH";
 const ENV_TLS_KEY_PATH: &str = "CONDUCTOR_TLS_KEY_PATH";
 const ENV_MAX_CONCURRENT_UPLOADS: &str = "CONDUCTOR_MAX_CONCURRENT_UPLOADS";
+// Environment variable names, not credentials.
+// nosemgrep: generic.hardcoded-secret
 const ENV_API_TOKEN: &str = "CONDUCTOR_API_TOKEN";
+// nosemgrep: generic.hardcoded-secret
 const ENV_API_TOKEN_FILE: &str = "CONDUCTOR_API_TOKEN_FILE";
 const ENV_TRUSTED_KEYS_FILE: &str = "CONDUCTOR_TRUSTED_KEYS_FILE";
 
