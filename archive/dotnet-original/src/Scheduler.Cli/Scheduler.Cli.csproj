@@ -1,9 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <RootNamespace>Scheduler.Cli</RootNamespace>
-  </PropertyGroup>
-  <ItemGroup>
-    <ProjectReference Include="..\Scheduler.Application\Scheduler.Application.csproj" />
-  </ItemGroup>
-</Project>

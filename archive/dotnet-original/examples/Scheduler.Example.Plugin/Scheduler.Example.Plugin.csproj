@@ -1,9 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <Description>Runnable example plugin: declares a secret reference and produces deterministic, observable work.</Description>
-    <GenerateDependencyFile>true</GenerateDependencyFile>
-  </PropertyGroup>
-  <ItemGroup>
-    <ProjectReference Include="..\..\src\Scheduler.Contracts\Scheduler.Contracts.csproj" />
-  </ItemGroup>
-</Project>

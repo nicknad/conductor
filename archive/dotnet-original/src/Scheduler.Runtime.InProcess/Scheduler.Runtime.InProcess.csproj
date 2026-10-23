@@ -1,8 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <Description>In-process plugin runtime: collectible AssemblyLoadContext loading and execution scopes.</Description>
-  </PropertyGroup>
-  <ItemGroup>
-    <ProjectReference Include="..\Scheduler.Application\Scheduler.Application.csproj" />
-  </ItemGroup>
-</Project>

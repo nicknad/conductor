@@ -1,8 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <Description>Worker-process execution backend: versioned IPC messages and supervision contract.</Description>
-  </PropertyGroup>
-  <ItemGroup>
-    <ProjectReference Include="..\Scheduler.Contracts\Scheduler.Contracts.csproj" />
-  </ItemGroup>
-</Project>

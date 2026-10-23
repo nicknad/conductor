@@ -1,9 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <Description>Test-only plugin assemblies loaded by runtime tests.</Description>
-    <GenerateDependencyFile>true</GenerateDependencyFile>
-  </PropertyGroup>
-  <ItemGroup>
-    <ProjectReference Include="..\Scheduler.Contracts\Scheduler.Contracts.csproj" />
-  </ItemGroup>
-</Project>

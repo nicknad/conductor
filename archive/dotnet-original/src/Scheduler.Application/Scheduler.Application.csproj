@@ -1,8 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <Description>Lifecycle, job, execution, and reconciliation use cases.</Description>
-  </PropertyGroup>
-  <ItemGroup>
-    <ProjectReference Include="..\Scheduler.Contracts\Scheduler.Contracts.csproj" />
-  </ItemGroup>
-</Project>
