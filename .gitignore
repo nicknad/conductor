@@ -45,7 +45,10 @@ Desktop.ini
 
 # Secrets and local-only configuration
 *.env
+!.env.example
 appsettings.*.local.json
+config/conductor.local.json
+secrets/
 data/
 *.pfx
 *.key

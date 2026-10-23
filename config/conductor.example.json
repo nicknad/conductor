@@ -1,0 +1,16 @@
+{
+  "http_bind": "127.0.0.1:8443",
+  "storage_root": "data",
+  "request_timeout_secs": 30,
+  "tls_cert_path": "tls/cert.pem",
+  "tls_key_path": "tls/key.pem",
+  "max_concurrent_uploads": 8,
+  "api_token": "replace-with-a-long-random-token",
+  "trusted_keys": [
+    {
+      "key_id": "replace-with-a-release-key-id",
+      "algorithm": "ed25519",
+      "public_key_base64": "GX9rI+FshTLGq8g4+s1ep4m+DHaykgM0A5v6iz02jWE="
+    }
+  ]
+}

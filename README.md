@@ -3,6 +3,12 @@
 > **Unstable:** this repository is being rewritten in Rust. Nothing here is stable yet —
 > no API, no storage format, no CLI contract should be relied upon.
 
+> **Development is not finished:** this is an in-progress implementation, not a
+> complete job scheduler. Package ingestion and the worker execution library
+> exist, but host startup wiring, scheduling, lifecycle endpoints, execution
+> history, and the operator CLI are still outstanding. Do not treat it as a
+> finished or production-ready product.
+
 A single-machine job execution platform supporting installing, validating, activating,
 updating, disabling, removing, and rolling back job plugin implementations **without
 restarting the scheduler host**.
@@ -83,6 +89,42 @@ store to promote. The binary still refuses to serve until operator
 trusted-key loading lands (`conductor::server::run` fails closed), so
 the API is exercised through `router` in `tests/upload_api.rs` (one
 test per hardening effort) and `tests/tls_only.rs`.
+
+## Host configuration
+
+Configuration loading lives in `src/config.rs`; `server::run` will consume it
+when startup assembly lands. One JSON file plus `CONDUCTOR_*` environment
+overrides produce an immutable `Config`:
+
+- `--config <path>` (highest precedence) or `CONDUCTOR_CONFIG` selects the
+  file; without either, built-in defaults apply.
+- Environment variables override file fields. See [`.env.example`](.env.example)
+  for the complete list.
+- `CONDUCTOR_API_TOKEN` or `CONDUCTOR_API_TOKEN_FILE` supplies the operator
+  bearer token. The token is redacted from `Debug` output.
+- `CONDUCTOR_TRUSTED_KEYS_FILE` replaces the file's `trusted_keys` array with
+  its own JSON array.
+- `Config::validate_for_startup` refuses to proceed without a non-empty token
+  and at least one trusted key, and rejects an unusable bind address, zero
+  timeout or upload slots, and empty paths.
+
+Example: [`config/conductor.example.json`](config/conductor.example.json).
+Its token and key are placeholders; generate your own and do not commit real
+configuration or key material.
+
+| Field | Environment variable | Default |
+|---|---|---|
+| `http_bind` | `CONDUCTOR_HTTP_BIND` | `127.0.0.1:8080` |
+| `storage_root` | `CONDUCTOR_STORAGE_ROOT` | `data` |
+| `request_timeout_secs` | `CONDUCTOR_REQUEST_TIMEOUT_SECS` | `30` |
+| `tls_cert_path` | `CONDUCTOR_TLS_CERT_PATH` | `tls/cert.pem` |
+| `tls_key_path` | `CONDUCTOR_TLS_KEY_PATH` | `tls/key.pem` |
+| `max_concurrent_uploads` | `CONDUCTOR_MAX_CONCURRENT_UPLOADS` | `8` |
+| `api_token` | `CONDUCTOR_API_TOKEN` / `CONDUCTOR_API_TOKEN_FILE` | none (required) |
+| `trusted_keys` | `CONDUCTOR_TRUSTED_KEYS_FILE` | none (required) |
+
+Relative paths resolve against the process working directory; prefer absolute
+paths in deployed configuration.
 
 ## Worker execution (unstable)
 
