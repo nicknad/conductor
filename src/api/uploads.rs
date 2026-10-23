@@ -409,7 +409,7 @@ async fn process_upload(
                 let text = read_text_capped(field, MAX_FORMAT_VERSION_TEXT_BYTES, "format_version")
                     .await
                     .map_err(|e| UploadFailure::from_api(RejectionStage::Multipart, e))?;
-                format_version = text.trim().parse::<u16>().map_err(|_| {
+                format_version = parse_format_version(&text).map_err(|_| {
                     UploadFailure::from_api(
                         RejectionStage::Multipart,
                         ApiError::BadRequest(
@@ -730,6 +730,20 @@ async fn stream_package_to_quarantine(
     Ok(total)
 }
 
+/// Parses the `format_version` text field strictly: canonical decimal digits
+/// only, no sign, no leading zeros, fitting in `u16`. Rejects `+1`, `01`,
+/// empty, and out-of-range values so the envelope version is unambiguous.
+fn parse_format_version(text: &str) -> Result<u16, ()> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
+    }
+    if trimmed.len() > 1 && trimmed.starts_with('0') {
+        return Err(());
+    }
+    trimmed.parse::<u16>().map_err(|_| ())
+}
+
 /// Reads a small text field with a byte cap enforced per chunk, so a huge
 /// field cannot force buffering before the limit applies.
 async fn read_text_capped(
@@ -800,5 +814,28 @@ mod tests {
         let expected = ApiToken::new("correct-token-value");
         let rendered = format!("{expected:?} {expected:?}");
         assert!(!rendered.contains("correct-token-value"));
+    }
+
+    #[test]
+    fn format_version_parses_canonical_decimal_only() {
+        assert_eq!(parse_format_version("1"), Ok(1));
+        assert_eq!(parse_format_version(" 1 "), Ok(1));
+        for bad in [
+            "",
+            " ",
+            "+1",
+            "-1",
+            "01",
+            "00",
+            "1.0",
+            "v1",
+            "65536",
+            "99999999999",
+        ] {
+            assert!(
+                parse_format_version(bad).is_err(),
+                "must reject {bad:?} as non-canonical"
+            );
+        }
     }
 }

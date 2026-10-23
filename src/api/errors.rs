@@ -98,11 +98,18 @@ impl ApiError {
     }
 
     fn status_and_body(&self) -> (StatusCode, ErrorBody) {
+        // Internal failures keep their verbose reason in `message()` for the
+        // audit event, but the caller-facing body is a generic sentinel so
+        // I/O paths and OS errors never leak to clients.
+        let message = match self {
+            Self::Internal(..) => "internal error".to_owned(),
+            _ => self.message().to_owned(),
+        };
         (
             self.status(),
             ErrorBody {
                 code: self.code(),
-                message: self.message().to_owned(),
+                message,
             },
         )
     }
@@ -208,5 +215,17 @@ mod tests {
             ApiError::Conflict("version_conflict", "taken".to_owned()).status_and_body();
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body.code, "version_conflict");
+    }
+
+    #[test]
+    fn internal_body_is_generic_while_audit_keeps_detail() {
+        let err = ApiError::Internal("quarantine write failed: /tmp/x: denied".to_owned());
+        // Audit detail keeps the verbose reason.
+        assert!(err.message().contains("quarantine write failed"));
+        let (status, body) = err.status_and_body();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.code, "internal");
+        assert_eq!(body.message, "internal error");
+        assert!(!body.message.contains("quarantine"));
     }
 }
