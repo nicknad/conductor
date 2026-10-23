@@ -49,7 +49,16 @@ impl Sha256DigestProvider {
     /// archive is inspected from the same bytes.
     pub fn digest_stream(&self, mut reader: impl Read) -> Result<[u8; 32], DigestError> {
         let mut hasher = Sha256::new();
-        std::io::copy(&mut reader, &mut hasher).map_err(|e| DigestError::Failure(e.to_string()))?;
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .map_err(|e| DigestError::Failure(e.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
         Ok(hasher.finalize().into())
     }
 }
