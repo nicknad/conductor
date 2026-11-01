@@ -612,8 +612,9 @@ async fn process_upload(
                     byte_count: bytes,
                 })
             })?;
-            // The registry records the promoted artifact's relative address
-            // for reconciliation; the layout is owned by the artifact store.
+            // The registry records the promoted artifact's canonical relative
+            // address (identity plus an execution locator); the layout is
+            // owned by the artifact store.
             let promoted_relpath = crate::storage::artifact_store::artifact_relative_path(&verdict);
             // Post-promotion binding: the digest is now durable, so the
             // registry learns which bytes this module version means. A
@@ -636,6 +637,10 @@ async fn process_upload(
                         RegistryError::Storage(_) => (
                             RejectionStage::Internal,
                             ApiError::Internal(format!("registry storage failed: {err}")),
+                        ),
+                        RegistryError::InvalidArtifactPath { .. } => (
+                            RejectionStage::Internal,
+                            ApiError::Internal(format!("registration invariant violated: {err}")),
                         ),
                     };
                     let detail = api.message().to_owned();

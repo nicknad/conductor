@@ -13,9 +13,9 @@
 //!
 //! A separate process is fault isolation, not a security sandbox. The
 //! executor restricts what it can — explicit environment, no shell
-//! interpretation, digest re-verification at resolve time, process-group
-//! teardown — while filesystem, network, and credential restriction remain
-//! deployment concerns.
+//! interpretation, digest re-verification at resolve time and again
+//! immediately before spawn, process-group teardown — while filesystem,
+//! network, and credential restriction remain deployment concerns.
 //!
 //! Workers inherit the host's identity by design: no `uid`, `gid`, or
 //! supplementary-group change is ever applied. Same-identity execution
@@ -23,6 +23,18 @@
 //! credentials are concerned (staging directories are owner-reachable, the
 //! artifact store is readable); the process boundary exists for faults and
 //! resources, not for malice.
+//!
+//! **Residual path race:** staged files are re-hashed at resolve time and
+//! again at the last moment before `Command::spawn`, with the entrypoint
+//! verified last so its check is as close to `exec` as this path-based design
+//! allows. The path is still resolved by the kernel at `exec` after that
+//! check, so the ordering narrows the window but does not eliminate it.
+//! Staging directories are created `0700` and owned by the same uid that runs
+//! the worker, so only that uid (or a privileged actor) can mutate the staged
+//! entrypoint in the window. The second check is defense-in-depth against
+//! accidental or buggy mutation, not a same-uid boundary. Closing the window
+//! fully would require descriptor-based execution (`fexecve`) of an
+//! already-open, verified file, which is out of scope for this executor.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -36,7 +48,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
-use crate::packages::archive::check_entry_path;
+use crate::packages::archive::{check_entry_path, ExtractedFile};
 use crate::packages::digest::Sha256DigestProvider;
 use crate::storage::staging::StagedPackage;
 
@@ -94,6 +106,17 @@ pub struct CapturedOutput {
 }
 
 impl CapturedOutput {
+    /// Captures an already-bounded in-memory byte slice (the single
+    /// protocol response line). Total bytes equals the slice length; no
+    /// truncation has happened at this point.
+    fn from_bounded_slice(bytes: &[u8]) -> Self {
+        Self {
+            bytes: bytes.to_vec(),
+            truncated: false,
+            total_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        }
+    }
+
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -142,6 +165,11 @@ pub enum ExecutionOutcome {
 pub struct ExecutionReport {
     pub execution_id: String,
     pub outcome: ExecutionOutcome,
+    /// Bounded raw stdout payload: the single protocol response line without
+    /// its terminator, or empty when the worker wrote no usable line. It is
+    /// bounded by the executor's message byte limit, which is also the
+    /// limit applied while reading.
+    pub stdout: CapturedOutput,
     /// Bounded stderr diagnostics (truncated at the configured cap).
     pub stderr: CapturedOutput,
     /// Wall time from spawn to report, including termination.
@@ -155,6 +183,10 @@ pub struct ExecutionReport {
 pub enum ExecutionError {
     #[error("invalid execution request: {0}")]
     InvalidRequest(String),
+    /// The staged bytes no longer match the digests recorded at extraction.
+    /// Returned before `Command::spawn`, so no worker runs.
+    #[error("staged worker target failed re-verification before spawn: {0}")]
+    TargetVerification(#[source] TargetError),
     #[error("worker process failed to start: {0}")]
     Spawn(String),
 }
@@ -193,9 +225,9 @@ impl WorkerTarget {
     /// Verifies the staged files against their recorded digests, confines
     /// `entrypoint` under the staging root, and marks it executable.
     pub fn resolve(staged: StagedPackage, entrypoint: &str) -> Result<Self, TargetError> {
-        verify_staged_files(&staged)?;
         let normalized = check_entry_path(entrypoint, false)
             .map_err(|e| TargetError::EntrypointRejected(e.to_string()))?;
+        verify_staged_files(&staged, Some(Path::new(&normalized)))?;
         let program = staged.root().join(&normalized);
         if !program.is_file() {
             return Err(TargetError::EntrypointMissing);
@@ -238,34 +270,59 @@ impl WorkerTarget {
 /// Re-hashes every staged file and compares against the size and SHA-256
 /// recorded when extraction hashed the same bytes. Any mismatch (or
 /// unreadable file) refuses the target.
-fn verify_staged_files(staged: &StagedPackage) -> Result<(), TargetError> {
+///
+/// When `entrypoint` is supplied, every other declared file is verified
+/// first and the entrypoint is hashed last. That puts the check immediately
+/// before the caller's `Command::spawn`, narrowing the window in which the
+/// executable path can change after verification (it does not eliminate the
+/// same-uid path race; see the module docs).
+fn verify_staged_files(
+    staged: &StagedPackage,
+    entrypoint: Option<&Path>,
+) -> Result<(), TargetError> {
+    let mut entry: Option<&ExtractedFile> = None;
     for file in staged.files() {
-        let path = staged.root().join(&file.path);
-        let metadata = std::fs::metadata(&path).map_err(|e| TargetError::StagedFileUnreadable {
+        if entrypoint == Some(Path::new(&file.path)) {
+            entry = Some(file);
+            continue;
+        }
+        verify_staged_file(staged, file)?;
+    }
+    if entrypoint.is_some() {
+        let Some(file) = entry else {
+            return Err(TargetError::EntrypointMissing);
+        };
+        // Last on purpose: the caller is about to execute this path.
+        verify_staged_file(staged, file)?;
+    }
+    Ok(())
+}
+
+fn verify_staged_file(staged: &StagedPackage, file: &ExtractedFile) -> Result<(), TargetError> {
+    let path = staged.root().join(&file.path);
+    let metadata = std::fs::metadata(&path).map_err(|e| TargetError::StagedFileUnreadable {
+        path: file.path.clone(),
+        detail: e.to_string(),
+    })?;
+    if !metadata.is_file() || metadata.len() != file.size {
+        return Err(TargetError::StagedFileChanged {
+            path: file.path.clone(),
+        });
+    }
+    let mut source = std::fs::File::open(&path).map_err(|e| TargetError::StagedFileUnreadable {
+        path: file.path.clone(),
+        detail: e.to_string(),
+    })?;
+    let digest = Sha256DigestProvider
+        .digest_stream(&mut source)
+        .map_err(|e| TargetError::StagedFileUnreadable {
             path: file.path.clone(),
             detail: e.to_string(),
         })?;
-        if !metadata.is_file() || metadata.len() != file.size {
-            return Err(TargetError::StagedFileChanged {
-                path: file.path.clone(),
-            });
-        }
-        let mut source =
-            std::fs::File::open(&path).map_err(|e| TargetError::StagedFileUnreadable {
-                path: file.path.clone(),
-                detail: e.to_string(),
-            })?;
-        let digest = Sha256DigestProvider
-            .digest_stream(&mut source)
-            .map_err(|e| TargetError::StagedFileUnreadable {
-                path: file.path.clone(),
-                detail: e.to_string(),
-            })?;
-        if digest != file.sha256 {
-            return Err(TargetError::StagedFileChanged {
-                path: file.path.clone(),
-            });
-        }
+    if digest != file.sha256 {
+        return Err(TargetError::StagedFileChanged {
+            path: file.path.clone(),
+        });
     }
     Ok(())
 }
@@ -326,6 +383,10 @@ impl WorkerExecutor {
     /// cancels nothing, and the execution runs to its deadline. The
     /// deadline and cancellation cover the entire exchange, including the
     /// request write.
+    ///
+    /// Before `Command::spawn`, every staged file is re-hashed against the
+    /// digests recorded at extraction. A mismatch returns
+    /// [`ExecutionError::TargetVerification`] and no worker is started.
     pub async fn execute_cancellable(
         &self,
         target: &WorkerTarget,
@@ -370,6 +431,16 @@ impl WorkerExecutor {
         // take descendants along "where supported" (Unix).
         #[cfg(unix)]
         command.process_group(0);
+        // Last-moment re-verification: `resolve` hashed the staged files, but
+        // staging and spawning are separate moments. Reuse the same recorded
+        // extraction digests so bytes swapped after resolution are refused
+        // before `exec`, not executed. The entrypoint is hashed last so the
+        // check sits immediately before `spawn`; this narrows, but cannot
+        // eliminate, the path-based same-uid race documented in the module
+        // docs.
+        let entrypoint = target.program.strip_prefix(target.staged.root()).ok();
+        verify_staged_files(&target.staged, entrypoint)
+            .map_err(ExecutionError::TargetVerification)?;
         let mut child = command
             .spawn()
             .map_err(|e| ExecutionError::Spawn(e.to_string()))?;
@@ -446,8 +517,10 @@ impl WorkerExecutor {
         // the write already finished).
         write_task.abort();
 
+        let mut stdout = CapturedOutput::default();
         let outcome = match first {
             First::Response(read) => {
+                stdout = stdout_from_read(&read);
                 // The worker answered (or closed stdout). Let it exit on its
                 // own for the grace window; one that answers and then hangs
                 // is stopped like a timed-out one. The exit status backs up
@@ -484,6 +557,9 @@ impl WorkerExecutor {
                         None
                     }
                 };
+                stdout = read
+                    .as_ref()
+                    .map_or_else(CapturedOutput::default, stdout_from_read);
                 kill_group_best_effort(pid);
                 match read {
                     Some(ResponseRead::Eof) | None => match status {
@@ -525,6 +601,7 @@ impl WorkerExecutor {
         Ok(ExecutionReport {
             execution_id,
             outcome,
+            stdout,
             stderr,
             duration: started.elapsed(),
         })
@@ -777,6 +854,16 @@ fn signal_group(pid: Option<u32>, signal: i32) {
     // narrow reuse window deliberately: descendants still holding the group
     // open are the more immediate leak.
     let _ = unsafe { libc::killpg(pid as libc::pid_t, signal) };
+}
+
+/// Captures the one bounded stdout line, if the reader collected one.
+fn stdout_from_read(read: &ResponseRead) -> CapturedOutput {
+    match read {
+        ResponseRead::Line(bytes) => CapturedOutput::from_bounded_slice(bytes),
+        ResponseRead::Eof | ResponseRead::TooLarge | ResponseRead::Io(_) => {
+            CapturedOutput::default()
+        }
+    }
 }
 
 fn outcome_from_response(read: ResponseRead, max_message_bytes: usize) -> ExecutionOutcome {

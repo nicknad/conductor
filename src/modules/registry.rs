@@ -9,10 +9,12 @@
 //! and SQLite ([`ModuleRegistry::open`], migrations applied on
 //! construction; [`ModuleRegistry::from_database`] wraps an already-migrated
 //! shared handle), which makes registrations survive a restart. The
-//! registry stores records, never code and never a path it will open:
-//! activation consumes registry state plus policy and must not re-open
-//! archives. `artifact_relpath` is reconciliation bookkeeping, not an
-//! execution input.
+//! registry stores records, never code: activation consumes registry state
+//! plus policy and must not re-open archives. `artifact_relpath` is a
+//! canonical, non-authoritative artifact locator: execution re-derives
+//! `{module_id}/{version}/{digest_hex}.zip`, rejects any stored value that
+//! differs, confines the result under the artifact root, and verifies the
+//! bytes' size and SHA-256 before use.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -116,6 +118,11 @@ pub enum RegistryError {
     },
     #[error("registry storage failure: {0}")]
     Storage(#[from] DatabaseError),
+    #[error(
+        "artifact_relpath is not the canonical `{{module_id}}/{{version}}/{{digest}}.zip` form: \
+         stored {relpath:?}, expected {expected:?}"
+    )]
+    InvalidArtifactPath { relpath: String, expected: String },
 }
 
 impl From<rusqlite::Error> for RegistryError {

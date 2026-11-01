@@ -1,13 +1,20 @@
 //! Private staging directories: extraction with cleanup. Never makes
 //! partially validated packages executable.
 //!
-//! [`extract_verified`] is the only extraction entry point. It re-hashes
-//! the source over one open handle and compares against the validation
-//! verdict — promotion and execution never trust a path across time — then
-//! extracts into a private directory (owner-only permissions) while
-//! hashing every decompressed stream exactly once. Manifest v2 per-file
-//! integrity is enforced against the actual bytes; v1 packages retain
-//! path-only agreement (set-equality was already proven at validation).
+//! Two entry points share one extraction path:
+//!
+//! - [`extract_verified`] consumes a validation verdict (upload-time flow).
+//! - [`extract_registered`] consumes a stored manifest plus its expected
+//!   digest (execution-after-restart flow), so no archive is re-validated
+//!   from registry state alone.
+//!
+//! Both re-hash the source over one open handle and compare against the
+//! expected digest — promotion and execution never trust a path across
+//! time — then extract into a private directory (owner-only permissions)
+//! while hashing every decompressed stream exactly once. The stored
+//! manifest supplies the declared files, their v2 per-file integrity, and
+//! the entrypoint used by the executor; v1 packages retain path-only
+//! agreement (set-equality was already proven at validation).
 //!
 //! The returned [`StagedPackage`] removes its directory on drop; call
 //! [`StagedPackage::keep`] to hand the directory to an executor, which
@@ -24,8 +31,9 @@ use crate::packages::archive::{
     ArchiveError, DeclaredIntegrity, ExtractedFile, ExtractedFiles, ExtractionTarget,
     QuarantinedFile, ZipArchiveReader,
 };
+use crate::packages::artifact::ArtifactDigest;
 use crate::packages::digest::{DigestError, Sha256DigestProvider};
-use crate::packages::manifest::MANIFEST_FILE_NAME;
+use crate::packages::manifest::{Manifest, MANIFEST_FILE_NAME};
 use crate::packages::policy::PackageValidationPolicy;
 
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -136,8 +144,48 @@ pub fn extract_verified(
     validated: &ValidatedPackage,
     policy: &PackageValidationPolicy,
 ) -> Result<StagedPackage, StagingError> {
+    extract_extraction(
+        staging_root,
+        source,
+        validated.artifact().digest(),
+        validated.manifest(),
+        policy,
+    )
+}
+
+/// Verifies the source against a registered artifact digest and extracts
+/// the files declared by the stored manifest.
+///
+/// This is the execution-after-restart counterpart of
+/// [`extract_verified`]: the caller has already resolved the registered
+/// record, parsed its stored manifest with the package policy, and checked
+/// the manifest identity against that record. This function still binds the
+/// bytes: the source is re-hashed over the same handle that is extracted,
+/// every declared path must be present, no undeclared path may appear, and
+/// v2 per-file size/SHA-256 declarations are enforced against the actual
+/// decompressed streams. On failure the partial directory is removed before
+/// returning.
+pub fn extract_registered(
+    staging_root: &Path,
+    source: &Path,
+    expected_digest: &ArtifactDigest,
+    manifest: &Manifest,
+    policy: &PackageValidationPolicy,
+) -> Result<StagedPackage, StagingError> {
+    extract_extraction(staging_root, source, expected_digest, manifest, policy)
+}
+
+/// Shared extraction path: one open handle, one outer-digest check, then a
+/// directed extraction driven by the manifest's declared files.
+fn extract_extraction(
+    staging_root: &Path,
+    source: &Path,
+    expected_digest: &ArtifactDigest,
+    manifest: &Manifest,
+    policy: &PackageValidationPolicy,
+) -> Result<StagedPackage, StagingError> {
     let mut file = QuarantinedFile::open(source)?;
-    let expected = *validated.artifact().digest().as_bytes();
+    let expected = *expected_digest.as_bytes();
     let actual = Sha256DigestProvider.digest_stream(&mut file)?;
     if actual != expected {
         return Err(StagingError::SourceChanged);
@@ -148,8 +196,7 @@ pub fn extract_verified(
     // Declared payload files enforce v2 integrity where present; the
     // manifest itself is extracted alongside (the outer digest binds its
     // bytes, but executors may want it on disk).
-    let mut targets: Vec<ExtractionTarget> = validated
-        .manifest()
+    let mut targets: Vec<ExtractionTarget> = manifest
         .files
         .iter()
         .map(|file| ExtractionTarget {
@@ -165,13 +212,7 @@ pub fn extract_verified(
         integrity: None,
     });
 
-    let root = unique_staging_dir(staging_root);
-    std::fs::create_dir_all(&root)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
-    }
+    let root = create_staging_root(staging_root)?;
 
     match ZipArchiveReader.extract_to(&mut file, &root, &targets, &policy.scan_config()) {
         Ok(ExtractedFiles { files }) => Ok(StagedPackage {
@@ -183,6 +224,64 @@ pub fn extract_verified(
             Err(StagingError::Archive(err))
         }
     }
+}
+
+/// Number of distinct predicted names tried before giving up. Names are
+/// process-unique (pid + monotonic counter + nanos), so collisions only
+/// happen when something deliberately pre-created the path.
+const MAX_STAGING_ATTEMPTS: usize = 16;
+
+/// Creates the staging root if it does not exist, then atomically creates a
+/// fresh private child directory.
+///
+/// `create_dir` (not `create_dir_all`) is the security boundary: it fails
+/// with `AlreadyExists` instead of following a pre-created file or symlink
+/// at the predicted path. A collision is retried with a new name; any other
+/// failure is surfaced. On Unix the directory is created owner-only and
+/// re-chmodded after creation so the umask cannot widen it.
+fn create_staging_root(staging_root: &Path) -> Result<PathBuf, StagingError> {
+    create_staging_root_with(staging_root, || unique_staging_dir(staging_root))
+}
+
+/// Collision-retry body, parameterized on the candidate generator so the
+/// retry path is directly testable without guessing process-unique names.
+fn create_staging_root_with(
+    staging_root: &Path,
+    mut next_name: impl FnMut() -> PathBuf,
+) -> Result<PathBuf, StagingError> {
+    std::fs::create_dir_all(staging_root)?;
+    for _ in 0..MAX_STAGING_ATTEMPTS {
+        let candidate = next_name();
+        match create_private_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(StagingError::Io(err.to_string())),
+        }
+    }
+    Err(StagingError::Io(
+        "could not create a unique staging directory".to_owned(),
+    ))
+}
+
+/// Atomic owner-only directory creation for one predicted stage path.
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(err) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
+            // Do not leave a partially configured directory behind.
+            let _ = std::fs::remove_dir(path);
+            return Err(err);
+        }
+    }
+    Ok(())
 }
 
 fn unique_staging_dir(root: &Path) -> PathBuf {
@@ -325,6 +424,113 @@ mod tests {
     }
 
     #[test]
+    fn registered_extraction_uses_the_stored_manifest_and_expected_digest() {
+        let bytes = package_v2(PAYLOAD.len() as u64, &sha256_hex(PAYLOAD));
+        let fixture = fixture(&bytes, "registered-ok");
+        let manifest = fixture.validated.manifest().clone();
+        let digest = *fixture.validated.artifact().digest();
+        let staging_root = fixture.dir.join("staging");
+        let staged = extract_registered(
+            &staging_root,
+            &fixture.source,
+            &digest,
+            &manifest,
+            &PackageValidationPolicy::production(),
+        )
+        .expect("registered extraction must succeed");
+        assert_eq!(
+            std::fs::read(staged.root().join(&manifest.entrypoint)).expect("entrypoint"),
+            PAYLOAD
+        );
+        assert!(
+            staged.root().join(MANIFEST_FILE_NAME).is_file(),
+            "the outer manifest must be staged for the executor"
+        );
+        let _ = std::fs::remove_dir_all(&fixture.dir);
+    }
+
+    #[test]
+    fn registered_extraction_refuses_a_source_that_no_longer_matches_the_digest() {
+        let bytes = package_v2(PAYLOAD.len() as u64, &sha256_hex(PAYLOAD));
+        let fixture = fixture(&bytes, "registered-digest");
+        let manifest = fixture.validated.manifest().clone();
+        let wrong = ArtifactDigest::new([0u8; 32]);
+        let staging_root = fixture.dir.join("staging");
+        let err = extract_registered(
+            &staging_root,
+            &fixture.source,
+            &wrong,
+            &manifest,
+            &PackageValidationPolicy::production(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, StagingError::SourceChanged));
+        assert!(
+            !staging_root.exists(),
+            "a digest mismatch must not leave a staging directory"
+        );
+        let _ = std::fs::remove_dir_all(&fixture.dir);
+    }
+
+    #[test]
+    fn registered_extraction_rejects_files_outside_the_stored_manifest() {
+        let bytes = package_v2(PAYLOAD.len() as u64, &sha256_hex(PAYLOAD));
+        let fixture = fixture(&bytes, "registered-files");
+        let policy = PackageValidationPolicy::production();
+        let stored = serde_json::json!({
+            "manifest_version": 2,
+            "module_id": "reporting-service",
+            "version": "1.2.0",
+            "runtime": "rust",
+            "entrypoint": "payload/other",
+            "files": [{
+                "path": "payload/other",
+                "size": PAYLOAD.len() as u64,
+                "sha256": sha256_hex(PAYLOAD),
+            }],
+        });
+        let manifest = Manifest::parse_with_policy(
+            &serde_json::to_vec(&stored).expect("stored manifest must serialize"),
+            &policy,
+        )
+        .expect("stored manifest must parse");
+        let digest = *fixture.validated.artifact().digest();
+        let staging_root = fixture.dir.join("staging");
+        let err = extract_registered(&staging_root, &fixture.source, &digest, &manifest, &policy)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StagingError::Archive(ArchiveError::UndeclaredEntry(path)) if path == "payload/bin"
+        ));
+        let _ = std::fs::remove_dir_all(&fixture.dir);
+    }
+
+    #[test]
+    fn registered_extraction_enforces_v2_file_integrity() {
+        // The registered manifest claims a size the payload does not have;
+        // extraction must catch the disagreement even though the outer
+        // digest still matches the archive bytes.
+        let bytes = package_v2(PAYLOAD.len() as u64 + 1, &sha256_hex(PAYLOAD));
+        let fixture = fixture(&bytes, "registered-v2");
+        let manifest = fixture.validated.manifest().clone();
+        let digest = *fixture.validated.artifact().digest();
+        let staging_root = fixture.dir.join("staging");
+        let err = extract_registered(
+            &staging_root,
+            &fixture.source,
+            &digest,
+            &manifest,
+            &PackageValidationPolicy::production(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            StagingError::Archive(ArchiveError::SizeMismatch { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&fixture.dir);
+    }
+
+    #[test]
     fn v2_package_extracts_with_enforced_integrity() {
         let bytes = package_v2(PAYLOAD.len() as u64, &sha256_hex(PAYLOAD));
         let fixture = fixture(&bytes, "v2-ok");
@@ -392,8 +598,15 @@ mod tests {
             err,
             StagingError::Archive(ArchiveError::DigestMismatch { .. })
         ));
-        // The partial directory was removed.
-        assert!(!staging_root.join("stage").exists());
+        // The partial staging directory was removed; the root itself stays.
+        assert!(staging_root.is_dir(), "the staging root must remain");
+        assert_eq!(
+            std::fs::read_dir(&staging_root)
+                .expect("staging root must be readable")
+                .count(),
+            0,
+            "a failed extraction must not leave a partial staging directory"
+        );
         let _ = std::fs::remove_dir_all(&fixture.dir);
     }
 
@@ -430,8 +643,132 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, StagingError::SourceChanged));
-        assert!(!staging_root.join("stage").exists());
+        assert!(
+            !staging_root.exists(),
+            "a digest mismatch must refuse before creating a staging directory"
+        );
         let _ = std::fs::remove_dir_all(&fixture.dir);
+    }
+
+    #[test]
+    fn failed_extraction_removes_the_partial_staging_directory() {
+        // The archive is valid and its digest matches, but the v2 per-file
+        // declaration does not. Extraction starts writing, then fails; the
+        // already-created private directory must not survive.
+        let bytes = package_v2(PAYLOAD.len() as u64, &"bb".repeat(32));
+        let fixture = fixture(&bytes, "partial-cleanup");
+        let staging_root = fixture.dir.join("staging");
+        let err = extract_verified(
+            &staging_root,
+            &fixture.source,
+            &fixture.validated,
+            &PackageValidationPolicy::production(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            StagingError::Archive(ArchiveError::DigestMismatch { .. })
+        ));
+        assert!(staging_root.is_dir(), "the staging root must remain");
+        assert_eq!(
+            std::fs::read_dir(&staging_root)
+                .expect("staging root must be readable")
+                .count(),
+            0,
+            "the failed stage directory must be removed completely"
+        );
+        let _ = std::fs::remove_dir_all(&fixture.dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_staging_directory_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "conductor-staging-mode-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("parent must be creatable");
+        let stage = dir.join("stage-mode");
+        create_private_dir(&stage).expect("atomic private directory must be creatable");
+        let mode = std::fs::metadata(&stage)
+            .expect("staged dir must exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "staging directories must be owner-only");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staging_creation_retries_on_a_collision() {
+        let dir = std::env::temp_dir().join(format!(
+            "conductor-staging-collision-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("parent must be creatable");
+        // A file (or symlink) already occupies the first predicted name.
+        let collision = dir.join("stage-collision");
+        std::fs::write(&collision, b"occupied").expect("collision file must be writable");
+        let fresh = dir.join("stage-fresh");
+        let mut names = vec![collision.clone(), fresh.clone()].into_iter();
+        let created =
+            create_staging_root_with(&dir, || names.next().expect("two names are queued"))
+                .expect("a collision must be retried with a fresh name");
+
+        assert_eq!(created, fresh);
+        assert!(created.is_dir(), "the retry must create a real directory");
+        assert!(
+            collision.is_file(),
+            "the pre-existing path must be left untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_creation_never_follows_a_preexisting_symlink() {
+        // A pre-created symlink at the predicted stage path must make atomic
+        // creation fail with AlreadyExists, never redirect writes outside.
+        let dir = std::env::temp_dir().join(format!(
+            "conductor-staging-symlink-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir must be creatable");
+        let predicted = dir.join("stage-predicted");
+        std::os::unix::fs::symlink(&outside, &predicted).expect("symlink must be creatable");
+
+        let err = create_private_dir(&predicted).expect_err("an existing symlink must not be used");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(
+            std::fs::symlink_metadata(&predicted)
+                .expect("predicted path must still exist")
+                .file_type()
+                .is_symlink(),
+            "the pre-existing symlink must be left untouched"
+        );
+        assert_eq!(
+            std::fs::read_dir(&outside)
+                .expect("outside dir must be readable")
+                .count(),
+            0,
+            "creation must never write through the symlink"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

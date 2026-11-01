@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::control_plane::validate_package::ValidatedPackage;
+use crate::packages::artifact::ArtifactDigest;
 use crate::packages::digest::Sha256DigestProvider;
 
 /// Promotion failures. Everything here is a server-side condition the
@@ -33,17 +34,29 @@ pub enum PromoteError {
     Io(String),
 }
 
+/// Canonical artifact address relative to the configured artifacts root:
+/// `{module_id}/{version}/{digest_hex}.zip`. This is the only accepted form;
+/// execution re-derives it from the registry's identity fields and refuses
+/// any stored value that differs.
+#[must_use]
+pub fn canonical_artifact_relpath(
+    module_id: &str,
+    version: &str,
+    digest: &ArtifactDigest,
+) -> String {
+    format!("{module_id}/{version}/{}.zip", digest.to_hex())
+}
+
 /// Artifact address relative to the configured artifacts root:
 /// `{module_id}/{version}/{digest_hex}.zip`. The layout lives here and
 /// nowhere else; the registry stores this string so reconciliation does
 /// not re-derive it.
 #[must_use]
 pub fn artifact_relative_path(validated: &ValidatedPackage) -> String {
-    format!(
-        "{}/{}/{}.zip",
+    canonical_artifact_relpath(
         validated.artifact().module_id(),
         validated.artifact().version(),
-        validated.artifact().digest().to_hex()
+        validated.artifact().digest(),
     )
 }
 

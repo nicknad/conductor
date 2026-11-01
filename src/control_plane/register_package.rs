@@ -8,15 +8,20 @@
 //! already carries everything the registry records.
 //!
 //! Promotion (copying bytes into the artifact store) happens before
-//! registration; the registry stores identity, not location. A registration
-//! rejected for a version conflict leaves any promoted blob in the
-//! content-addressed store unreferenced — harmless, immutable, and never
+//! registration; the registry stores identity plus a canonical artifact
+//! locator, never code. Registration refuses any `artifact_relpath` that is
+//! not the exact content-addressed address
+//! (`{module_id}/{version}/{digest_hex}.zip`) derived from the verdict, so a
+//! registry write cannot point execution at an arbitrary path. A
+//! registration rejected for a version conflict leaves any promoted blob in
+//! the content-addressed store unreferenced — harmless, immutable, and never
 //! the source of truth.
 
 use crate::control_plane::validate_package::ValidatedPackage;
 use crate::modules::registry::{
     IntegrityState, ModuleRecord, ModuleRegistry, Registration, RegistryError,
 };
+use crate::storage::artifact_store::canonical_artifact_relpath;
 use std::time::SystemTime;
 
 /// Records a validated artifact as a registered module version.
@@ -28,15 +33,28 @@ use std::time::SystemTime;
 ///
 /// `artifact_relpath` is the promoted artifact's address relative to the
 /// configured artifacts root (see
-/// [`artifact_relative_path`](crate::storage::artifact_store::artifact_relative_path)).
-/// The registry stores it as reconciliation bookkeeping; it is never used
-/// to load code. The artifact size comes from the verdict, which measured
-/// the exact validated bytes.
+/// [`canonical_artifact_relpath`]). It must equal the canonical
+/// `{module_id}/{version}/{digest_hex}.zip` form derived from the verdict;
+/// any other value is refused with
+/// [`RegistryError::InvalidArtifactPath`], because execution derives that
+/// same canonical form and would reject the row anyway. The artifact size
+/// comes from the verdict, which measured the exact validated bytes.
 pub fn register(
     registry: &ModuleRegistry,
     validated: &ValidatedPackage,
     artifact_relpath: &str,
 ) -> Result<Registration, RegistryError> {
+    let expected = canonical_artifact_relpath(
+        validated.artifact().module_id(),
+        validated.artifact().version(),
+        validated.artifact().digest(),
+    );
+    if artifact_relpath != expected {
+        return Err(RegistryError::InvalidArtifactPath {
+            relpath: artifact_relpath.to_owned(),
+            expected,
+        });
+    }
     registry.record(ModuleRecord {
         module_id: validated.artifact().module_id().to_owned(),
         version: validated.artifact().version().to_owned(),
@@ -45,7 +63,7 @@ pub fn register(
         runtime: validated.manifest().runtime.clone(),
         manifest_version: validated.manifest().manifest_version,
         manifest_json: validated.manifest_json().to_owned(),
-        artifact_relpath: artifact_relpath.to_owned(),
+        artifact_relpath: expected,
         artifact_size: validated.artifact_size(),
         integrity_state: IntegrityState::Ok,
         registered_at: SystemTime::now(),
@@ -158,6 +176,29 @@ mod tests {
             serde_json::from_str(&outcome.record.manifest_json).expect("stored manifest is JSON");
         assert_eq!(stored["module_id"], "reporting-service");
         assert_eq!(stored["manifest_version"].as_u64(), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_canonical_artifact_path_is_refused_at_registration() {
+        let bytes = package_bytes("1.2.0", b"bin");
+        let (verdict, dir) = validated(&bytes, "canonical");
+        let registry = ModuleRegistry::new();
+        for hostile in [
+            "arbitrary/path.zip".to_owned(),
+            "/absolute/path.zip".to_owned(),
+            format!("{}/../escape.zip", relpath(&verdict)),
+        ] {
+            let err = register(&registry, &verdict, &hostile).unwrap_err();
+            assert!(
+                matches!(err, RegistryError::InvalidArtifactPath { .. }),
+                "non-canonical relpath {hostile:?} must be refused"
+            );
+        }
+        assert!(
+            registry.is_empty().expect("empty lookup must succeed"),
+            "a refused registration must not write a record"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

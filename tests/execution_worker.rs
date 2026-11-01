@@ -11,7 +11,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use conductor::control_plane::validate_package::{PackageValidationBuilder, PackageValidator};
 use conductor::executions::executor::{
@@ -26,6 +26,13 @@ use conductor::packages::signature::{
     TrustedSigningKey, SUPPORTED_SIGNATURE_FORMAT_VERSION,
 };
 use conductor::storage::staging::{extract_verified, StagedPackage};
+use serial_test::serial;
+
+// These tests spawn child processes. On Unix, a concurrently forked child can
+// inherit another test's still-open writable descriptor to a staged
+// entrypoint; exec'ing that file then fails with ETXTBSY ("Text file busy").
+// Serialize the spawning tests so no other test forks while an entrypoint is
+// being written or executed.
 
 /// Test-only signing key. Precedent: unit tests sign with fixed keys; this
 /// private key must never sign anything outside these tests.
@@ -39,8 +46,12 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn new(tag: &str) -> Self {
         let count = SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
         let dir = std::env::temp_dir().join(format!(
-            "conductor-execution-{}-{tag}-{count}",
+            "conductor-execution-{}-{tag}-{count}-{nanos}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
@@ -192,6 +203,7 @@ printf '{"protocol_version":1,"status":"ok","result":{"rows":3}}\n'
 "#;
 
 #[tokio::test]
+#[serial]
 async fn validated_artifact_runs_and_the_request_reaches_the_worker() {
     let scratch = Scratch::new("round-trip");
     let capture = scratch.file("request.jsonl");
@@ -226,6 +238,7 @@ printf '{"protocol_version":1,"status":"ok","result":null}\n'
 "#;
 
 #[tokio::test]
+#[serial]
 async fn secrets_stay_on_stdin_and_the_environment_is_restricted() {
     let scratch = Scratch::new("environment");
     let env_file = scratch.file("env.txt");
@@ -267,6 +280,7 @@ printf '{"protocol_version":1,"status":"ok","result":null}\n'
 /// Workers run as the host: the executor must never change `uid`, `gid`, or
 /// supplementary groups.
 #[tokio::test]
+#[serial]
 async fn workers_run_with_the_host_identity() {
     let scratch = Scratch::new("identity");
     let identity_file = scratch.file("identity.txt");
@@ -300,6 +314,7 @@ printf '{"protocol_version":1,"status":"failed","message":"bad input"}\n'
 "#;
 
 #[tokio::test]
+#[serial]
 async fn worker_failure_is_reported_with_its_message() {
     let scratch = Scratch::new("failed");
     let target = resolved_target(&scratch, SCRIPT_FAILED);
@@ -321,6 +336,7 @@ sleep 60
 "#;
 
 #[tokio::test]
+#[serial]
 async fn deadline_terminates_the_worker_group_including_descendants() {
     let scratch = Scratch::new("deadline");
     let ticks = scratch.file("ticks");
@@ -355,6 +371,7 @@ async fn deadline_terminates_the_worker_group_including_descendants() {
 }
 
 #[tokio::test]
+#[serial]
 async fn cancellation_terminates_the_worker() {
     let scratch = Scratch::new("cancel");
     let target = resolved_target(&scratch, "#!/bin/sh\nsleep 60\n");
@@ -382,6 +399,7 @@ async fn cancellation_terminates_the_worker() {
 }
 
 #[tokio::test]
+#[serial]
 async fn early_exit_is_a_worker_error_with_the_exit_status() {
     let scratch = Scratch::new("early-exit");
     // Read the request before exiting. Exiting before the host writes it
@@ -411,6 +429,7 @@ printf '\n'
 "#;
 
 #[tokio::test]
+#[serial]
 async fn oversized_response_is_a_protocol_violation() {
     let scratch = Scratch::new("oversize");
     let target = resolved_target(&scratch, SCRIPT_OVERSIZE);
@@ -430,6 +449,7 @@ async fn oversized_response_is_a_protocol_violation() {
 }
 
 #[tokio::test]
+#[serial]
 async fn malformed_response_is_a_protocol_violation() {
     let scratch = Scratch::new("malformed");
     let target = resolved_target(&scratch, "#!/bin/sh\nread -r line\nprintf 'not-json\\n'\n");
@@ -456,6 +476,7 @@ printf '{"protocol_version":1,"status":"ok","result":null}\n'
 "#;
 
 #[tokio::test]
+#[serial]
 async fn stderr_is_captured_bounded_and_separate_from_the_protocol() {
     let scratch = Scratch::new("noisy");
     let target = resolved_target(&scratch, SCRIPT_NOISY);
@@ -474,6 +495,7 @@ async fn stderr_is_captured_bounded_and_separate_from_the_protocol() {
 }
 
 #[tokio::test]
+#[serial]
 async fn oversized_request_is_rejected_before_spawn() {
     let scratch = Scratch::new("request-bound");
     let target = resolved_target(&scratch, "#!/bin/sh\nexit 0\n");
@@ -500,6 +522,39 @@ fn tampered_staged_payload_is_refused_at_resolve() {
     ));
 }
 
+#[tokio::test]
+#[serial]
+async fn entrypoint_tampered_after_resolve_is_refused_before_spawn() {
+    let scratch = Scratch::new("tamper-before-spawn");
+    let marker = scratch.file("executed");
+    let healthy = "#!/bin/sh\nread -r line\nprintf '{\"protocol_version\":1,\"status\":\"ok\",\"result\":null}\\n'\n";
+    let target = resolved_target(&scratch, healthy);
+    let malicious = format!("#!/bin/sh\nprintf ran > '{}'\n", marker.display());
+    std::fs::write(target.program(), malicious).expect("tampered entrypoint must be writable");
+
+    let err = WorkerExecutor::new(ExecutionLimits::default())
+        .execute(&target, request(Duration::from_secs(10)))
+        .await
+        .expect_err("a target tampered after resolve must not spawn");
+    assert!(matches!(
+        err,
+        ExecutionError::TargetVerification(TargetError::StagedFileChanged { .. })
+    ));
+    assert!(
+        !marker.exists(),
+        "the tampered entrypoint must never execute"
+    );
+
+    // The refusal is per-execution, not sticky: a freshly resolved target
+    // still runs normally.
+    let recovered = resolved_target(&scratch, healthy);
+    let report = WorkerExecutor::new(ExecutionLimits::default())
+        .execute(&recovered, request(Duration::from_secs(10)))
+        .await
+        .expect("a healthy target must still execute");
+    assert!(matches!(report.outcome, ExecutionOutcome::Succeeded { .. }));
+}
+
 #[test]
 fn entrypoint_path_escape_is_refused() {
     let scratch = Scratch::new("escape");
@@ -521,6 +576,7 @@ fn dropping_the_target_removes_the_staging_directory() {
 }
 
 #[tokio::test]
+#[serial]
 async fn unread_request_larger_than_the_pipe_does_not_stall_the_deadline() {
     let scratch = Scratch::new("unread-request");
     // `exec` replaces the shell, so nothing ever reads stdin.
@@ -550,6 +606,7 @@ printf '{"protocol_version":1,"status":"ok","result":"drained"}\n'
 "#;
 
 #[tokio::test]
+#[serial]
 async fn stderr_flood_while_the_request_is_written_does_not_deadlock() {
     let scratch = Scratch::new("stderr-flood");
     let target = resolved_target(&scratch, SCRIPT_STDERR_FLOOD);
@@ -583,6 +640,7 @@ sleep 0.15
 "#;
 
 #[tokio::test]
+#[serial]
 async fn sigterm_ignoring_descendants_die_when_the_leader_exits_first() {
     let scratch = Scratch::new("ignore-term");
     let ticks = scratch.file("ticks");
@@ -612,6 +670,7 @@ async fn sigterm_ignoring_descendants_die_when_the_leader_exits_first() {
 }
 
 #[tokio::test]
+#[serial]
 async fn dropping_the_execution_future_terminates_descendants() {
     let scratch = Scratch::new("future-drop");
     let ticks = scratch.file("ticks");
@@ -646,6 +705,7 @@ printf '{"protocol_version":1,"status":"ok","result":"slow"}\n'
 "#;
 
 #[tokio::test]
+#[serial]
 async fn dropped_cancel_sender_does_not_cancel() {
     let scratch = Scratch::new("cancel-dropped");
     let target = resolved_target(&scratch, SCRIPT_SLOW_OK);
