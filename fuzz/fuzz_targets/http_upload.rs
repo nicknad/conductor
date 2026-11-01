@@ -19,6 +19,8 @@ use tokio::sync::Semaphore;
 use tower::ServiceExt as _;
 
 const BOUNDARY: &str = "conductor-fuzz-boundary";
+// Harness fixture accepted by the test-only trust store, not a credential.
+// nosemgrep: generic.hardcoded-secret
 const TOKEN: &str = "fuzz-token";
 
 /// Inputs are arbitrary request bodies; the endpoint state is initialized
