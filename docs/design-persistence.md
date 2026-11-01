@@ -228,7 +228,7 @@ Additional read API: `list_versions(module_id)` (landed with PR2);
 
 ### 4.6 Upload ordering and crash windows
 
-Order is unchanged: **stream → validate → promote (fsync) → register (one DB
+Order is unchanged: **stream → validate → promote (file + directory fsync) → register (one DB
 tx) → 201**.
 
 | Crash window | Residue | Detection | Action |

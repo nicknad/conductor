@@ -45,7 +45,7 @@
 3. **Digest + detached signature** — Implemented, with a different shape: the body streams to quarantine, then digest and signature verification run over one handle (`src/control_plane/validate_package.rs`). The signature is Ed25519 over `domain ‖ zip/v1 ‖ sha256 ‖ archive-digest` — it covers the whole archive, not a separate manifest document, and it is not CMS (`src/packages/signature.rs`).
 4. **Archive/manifest/paths/inventory/dependencies/limits** — Partial: everything implemented except dependencies — the manifest has no dependency concept, and unknown fields are rejected (`src/packages/manifest.rs`).
 5. **Extract into private staging with content and hash checks** — Implemented as a function (manifest v2 per-file size and SHA-256 enforced during extraction), but **not wired into the production upload path**.
-6. **Promote to immutable storage** — Implemented and wired: re-hash quarantine, `create_new`, file fsync, partial-write self-repair, quarantine consumed (`src/storage/artifact_store.rs`).
+6. **Promote to immutable storage** — Implemented and wired: re-hash quarantine, `create_new`, file and directory fsync, partial-write self-repair, quarantine consumed (`src/storage/artifact_store.rs`).
 7. **Register in database** — Partial: in-memory registry stores id/version/digest/signer/runtime/timestamp; no database, no validation report, lost on restart.
 8. **Explicit activation; execution resolves a registered artifact** — Partial: `activate()` checks the registry and runtime allowlist and returns digest + signer (`src/control_plane/activate_module.rs`), but has no API/CLI wiring, no persisted activation, and the executor is handed a staged package rather than resolving a registered artifact.
 
@@ -70,7 +70,7 @@
 | Database | **Open** | Everything |
 | Artifact storage | **Decided for now**: local filesystem | Remote/object backend; explicit artifact permissions (staging sets `0700`; artifact files rely on umask) |
 | Deduplication | **Open**; identical digests are duplicated under different module/version paths | Sharing layout and reference counting |
-| Promotion | **Implemented**: `create_new`, file fsync, same-digest reuse, delete-and-rewrite for partial writes, quarantine consumed (`src/storage/artifact_store.rs`) | Directory fsync; explicit mode bits |
+| Promotion | **Implemented**: `create_new`, file and directory fsync, same-digest reuse, delete-and-rewrite for partial writes, quarantine consumed (`src/storage/artifact_store.rs`) | Explicit file mode bits |
 | Crash reconciliation | Partial mechanics only: idempotent promotion and a quarantine sweep helper that **exists but has no caller** (`src/storage/quarantine.rs`) | Startup reconciliation and orphan/missing detection — blocked on persistence |
 | Retention | Mostly open: rejected uploads are deleted immediately; the sweep helper is unwired; **no artifact GC**; staging cleanup only via drop | Policies for all four areas |
 | Activation and removal | Partial: `activate()` plus runtime allowlist | Persisted active version, deactivate/remove, draining, reference counting (no scheduler yet) |
@@ -119,9 +119,9 @@ are independently shippable unless noted. Items 7 and 8 are planned in detail in
    after this audit:** `Config::ensure_layout` creates and tightens every
    managed root to `0700` under `#[cfg(unix)]`, and refuses symlinked or
    world-writable pre-existing roots rather than silently tightening them.
-4. **Directory fsync after promotion.** Promotion fsyncs the file but not the
-   containing directory (`src/storage/artifact_store.rs`), so a crash can lose
-   the name while the operation claimed success.
+4. **Directory fsync after promotion.** **Implemented after this audit:**
+   promotion syncs the containing directory after the file, so a crash cannot
+   lose the artifact name while the operation reported success.
 5. **Per-module authorization in the trust store.** Any trusted key can
    currently sign any `module_id` (`TrustedSigningKey` has no scope). Adding
    key→allowed-modules (or runtime) mapping now is small; retrofitting it into

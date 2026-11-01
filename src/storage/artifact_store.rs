@@ -101,6 +101,15 @@ pub fn promote_quarantined(
                 }
                 drop(out);
                 drop(input);
+                // The file content is durable; make the directory entry
+                // durable too, or a crash can lose the name while the
+                // operation reported success.
+                if let Some(parent) = dest.parent() {
+                    if let Err(e) = sync_dir(parent) {
+                        let _ = std::fs::remove_file(&dest);
+                        return Err(PromoteError::Io(e.to_string()));
+                    }
+                }
                 crate::storage::quarantine::discard(quarantine);
                 return Ok(dest);
             }
@@ -125,6 +134,19 @@ pub fn promote_quarantined(
     Err(PromoteError::Io(
         "artifact path kept reappearing while promoting".to_owned(),
     ))
+}
+
+/// Makes a directory entry durable. Directory `fsync` is Unix-specific;
+/// other platforms keep their existing behavior because the file itself was
+/// already synced.
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
