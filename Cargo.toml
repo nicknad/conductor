@@ -29,4 +29,6 @@ subtle = "2.6.1"
 libc = "0.2"
 
 [dev-dependencies]
+proptest = "1"
 rcgen = "0.14.10"
+tokio-rustls = "0.26"

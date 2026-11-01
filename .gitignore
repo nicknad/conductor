@@ -58,3 +58,16 @@ data/
 **/target/
 *.rs.bk
 .cargo-ok
+
+# Fuzzing
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+
+# Mutation testing output
+/mutants.out/
+/mutants.out.old/
+
+# DAST fixture output
+/tests/security/generated/
+/tests/security/out/

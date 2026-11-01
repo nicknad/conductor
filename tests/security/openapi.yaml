@@ -1,0 +1,61 @@
+openapi: 3.0.3
+info:
+  title: Conductor upload API
+  description: >-
+    Scan surface for OWASP ZAP. The upload body is multipart, so the spec
+    describes the real fields without claiming a JSON contract.
+  version: 0.1.0
+servers:
+  - url: https://conductor:8443
+    description: Test host from tests/security/compose.yml
+paths:
+  /healthz:
+    get:
+      operationId: healthz
+      responses:
+        "200":
+          description: Liveness only; no version or topology detail.
+  /v1/packages:
+    post:
+      operationId: uploadPackage
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [package, key_id, signature]
+              properties:
+                package:
+                  type: string
+                  format: binary
+                key_id:
+                  type: string
+                  maxLength: 256
+                signature:
+                  type: string
+                format_version:
+                  type: string
+                  maxLength: 16
+      responses:
+        "201":
+          description: Package validated, promoted, and registered.
+        "400":
+          description: Malformed multipart, field, envelope, or version.
+        "401":
+          description: Missing/invalid bearer or package signature.
+        "409":
+          description: Version already registered with different bytes.
+        "413":
+          description: Body or streamed package exceeds the policy bound.
+        "422":
+          description: Well-formed but semantically invalid package.
+        "503":
+          description: Upload slots saturated or validation timed out.
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer

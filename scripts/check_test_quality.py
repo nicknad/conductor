@@ -24,6 +24,7 @@ TEST_ATTR = re.compile(r"#\s*\[\s*(?:tokio\s*::\s*)?test\b")
 IGNORE_ATTR = re.compile(r"#\s*\[\s*ignore\b")
 ASSERTION = re.compile(
     r"\b(?:assert|assert_eq|assert_ne|assert_matches|"
+    r"prop_assert|prop_assert_eq|prop_assert_ne|"
     r"debug_assert|debug_assert_eq|debug_assert_ne)\s*!"
     r"|\b(?:matches|panic|unreachable|todo|unimplemented)\s*!"
     r"|\.(?:expect|unwrap|unwrap_err)\s*\("

@@ -1,0 +1,89 @@
+name: Fuzz
+
+# Bounded libFuzzer smoke runs on every relevant change, plus a longer weekly
+# run. Fuzz targets assert endpoint/parser invariants (no server errors,
+# normalized paths, bounded manifests, signed-byte agreement), so a crash or
+# assertion is a real regression. Corpus and crash artifacts are uploaded even
+# on failure for reproduction.
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
+  workflow_dispatch:
+  schedule:
+    - cron: "43 4 * * 4"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - manifest_parse
+          - entry_path
+          - archive_inspect
+          - upload_workflow
+          - http_upload
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Build target
+        run: cargo fuzz build ${{ matrix.target }}
+
+      - name: Format fuzz targets
+        run: cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
+
+      - name: Clippy fuzz targets
+        run: cargo clippy --manifest-path fuzz/Cargo.toml --bins -- -D warnings
+
+      - name: Fuzz (bounded)
+        run: |
+          cargo fuzz run ${{ matrix.target }} -- \
+            -max_total_time=60 \
+            -timeout=10 \
+            -rss_limit_mb=2048 \
+            -print_final_stats=1
+
+      - name: Upload corpus and crashes
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: |
+            fuzz/corpus/${{ matrix.target }}
+            fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

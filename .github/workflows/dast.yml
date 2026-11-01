@@ -1,0 +1,45 @@
+name: DAST
+
+# Runs the real container under TLS and scans it with OWASP ZAP's API scan.
+# Reports are always uploaded; FAIL-level ZAP rules fail the job.
+
+on:
+  pull_request:
+    paths:
+      - "src/api/**"
+      - "src/server.rs"
+      - "src/config.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "tests/security/**"
+      - ".github/workflows/dast.yml"
+  workflow_dispatch:
+  schedule:
+    - cron: "19 3 * * 2"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dast-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zap:
+    name: ZAP API scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run ZAP scan
+        run: tests/security/scan.sh
+
+      - name: Upload ZAP reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: zap-api-scan
+          path: tests/security/out/
+          if-no-files-found: ignore

@@ -685,4 +685,14 @@ mod tests {
         assert_eq!(after, before, "the record must survive a restart unchanged");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn open_in_memory_uses_the_sqlite_backend() {
+        // The constructor promises SQLite semantics (constraints,
+        // transactions) without files, not the process-lifetime map. A
+        // regression to `Default::default()` would silently change those
+        // guarantees while simple record/lookup tests continue to pass.
+        let registry = ModuleRegistry::open_in_memory().expect("in-memory registry must open");
+        assert!(matches!(registry.store, Store::Sqlite(_)));
+    }
 }

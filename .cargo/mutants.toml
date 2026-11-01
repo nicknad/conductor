@@ -1,0 +1,13 @@
+# Mutation-testing scope. Mutants are only useful where production behavior
+# can regress; test harnesses and fuzz targets are not targets themselves.
+exclude_globs = [
+  "fuzz/**",
+  "tests/**",
+  "scripts/**",
+  "docs/**",
+  "config/**",
+]
+
+# Test commands here include integration tests with real file/database I/O,
+# so allow more than the auto-detected baseline before declaring a timeout.
+timeout_multiplier = 2.0

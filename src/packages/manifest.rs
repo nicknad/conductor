@@ -311,7 +311,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
 
 /// Maximum accepted byte length of a path-forming identity field
 /// (`module_id`, `version`).
-const MAX_IDENTITY_BYTES: usize = 64;
+pub const MAX_IDENTITY_BYTES: usize = 64;
 
 /// Identity fields become path components in the artifact store
 /// (`artifacts/{module_id}/{version}/…`) and registry keys. They must be

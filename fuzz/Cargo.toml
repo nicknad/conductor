@@ -1,0 +1,58 @@
+[package]
+name = "conductor-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+axum = { version = "0.8.9", features = ["multipart"] }
+base64 = "0.23.1"
+conductor = { path = ".." }
+ed25519-dalek = "3"
+libfuzzer-sys = "0.4"
+sha2 = "0.11"
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+
+[[bin]]
+name = "manifest_parse"
+path = "fuzz_targets/manifest_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "entry_path"
+path = "fuzz_targets/entry_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive_inspect"
+path = "fuzz_targets/archive_inspect.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "upload_workflow"
+path = "fuzz_targets/upload_workflow.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_upload"
+path = "fuzz_targets/http_upload.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone workspace: keep the root crate's `cargo test`/clippy from
+# building libFuzzer, and let cargo-fuzz own the target directory.
+[workspace]
+members = ["."]

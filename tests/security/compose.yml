@@ -1,0 +1,66 @@
+name: conductor-dast
+
+services:
+  conductor:
+    build:
+      context: ../..
+      dockerfile: tests/security/Dockerfile
+    # The fixture mounts generated files from the host. Root avoids bind-mount
+    # uid/subuid and SELinux-label mismatches across Docker and rootless
+    # Podman; the production image still runs as `conductor` by default.
+    user: "0:0"
+    environment:
+      CONDUCTOR_CONFIG: /etc/conductor/config.json
+    volumes:
+      # Absolute host paths: Docker Compose resolves relative paths against
+      # the compose file, Podman Compose against the process cwd. `z`
+      # relabels the fixture for SELinux hosts; Docker ignores it when
+      # SELinux is absent.
+      - ${DAST_DIR:?set DAST_DIR}/generated/config.json:/etc/conductor/config.json:ro,z
+      - ${DAST_DIR:?set DAST_DIR}/generated/tls:/tls:ro,z
+      - conductor-data:/data
+    healthcheck:
+      # ZAP ignores server certificate validity, so a probe only needs to
+      # prove the TLS listener answers; -k keeps the fixture self-contained.
+      # The listener is HTTP/1 only; pin the probe so curl does not attempt
+      # h2 via ALPN.
+      test: ["CMD", "curl", "-kfsS", "--http1.1", "https://127.0.0.1:8443/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+    restart: "no"
+
+  zap:
+    image: ghcr.io/zaproxy/zaproxy:stable
+    depends_on:
+      conductor:
+        condition: service_healthy
+    environment:
+      # ZAP's built-in auth-header support attaches the operator bearer to
+      # every generated request, so the scan reaches /v1/packages instead of
+      # only seeing 401s.
+      ZAP_AUTH_HEADER: Authorization
+      ZAP_AUTH_HEADER_VALUE: "Bearer ${CONDUCTOR_API_TOKEN:?set CONDUCTOR_API_TOKEN}"
+      ZAP_AUTH_HEADER_SITE: conductor
+    volumes:
+      - ${DAST_DIR:?set DAST_DIR}/out:/zap/wrk:rw,z
+    command:
+      - zap-api-scan.py
+      - -t
+      - /zap/wrk/openapi.yaml
+      - -f
+      - openapi
+      - -r
+      - /zap/wrk/api-scan.html
+      - -J
+      - /zap/wrk/api-scan.json
+      - -w
+      - /zap/wrk/api-scan.md
+      - -c
+      - /zap/wrk/zap-rules.conf
+      - -I
+    restart: "no"
+
+volumes:
+  conductor-data:
