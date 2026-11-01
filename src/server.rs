@@ -202,7 +202,7 @@ pub async fn serve_with_handle(
     let addr: SocketAddr = bind.parse()?;
     let tls = RustlsConfig::from_pem_file(cert_path, key_path).await?;
     let shutdown_handle = handle.clone();
-    tokio::spawn(async move {
+    let shutdown = tokio::spawn(async move {
         shutdown_signal().await;
         shutdown_handle.graceful_shutdown(Some(Duration::from_secs(30)));
     });
@@ -213,11 +213,15 @@ pub async fn serve_with_handle(
     let mut server = axum_server::bind_rustls(addr, tls);
     server.http_builder().http1().max_headers(32);
     server.http_builder().http1().max_buf_size(16 * 1024);
-    server
+    let served = server
         .handle(handle)
         .http1_only()
         .serve(router.into_make_service())
-        .await?;
+        .await;
+    // A failed bind/serve must not leave the signal watcher waiting for a
+    // signal that may never come (one task per failed startup otherwise).
+    shutdown.abort();
+    served?;
     Ok(())
 }
 

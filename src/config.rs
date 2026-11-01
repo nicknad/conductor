@@ -389,6 +389,42 @@ impl Config {
 /// tightened too: storage roots hold untrusted uploads and immutable
 /// artifacts, so a permissive umask must not weaken them.
 fn create_private_dir(path: &Path) -> Result<(), ConfigError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(ConfigError::Layout {
+                    path: path.display().to_string(),
+                    detail: "must not be a symlink".to_owned(),
+                });
+            }
+            if !metadata.is_dir() {
+                return Err(ConfigError::Layout {
+                    path: path.display().to_string(),
+                    detail: "must be a directory".to_owned(),
+                });
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                // A world-writable existing root may already be shared with
+                // other users; tightening it silently would not make the
+                // bytes that were there before private.
+                if metadata.permissions().mode() & 0o002 != 0 {
+                    return Err(ConfigError::Layout {
+                        path: path.display().to_string(),
+                        detail: "must not be world-writable".to_owned(),
+                    });
+                }
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(ConfigError::Layout {
+                path: path.display().to_string(),
+                detail: err.to_string(),
+            });
+        }
+    }
     std::fs::create_dir_all(path).map_err(|err| ConfigError::Layout {
         path: path.display().to_string(),
         detail: err.to_string(),
@@ -699,6 +735,50 @@ mod tests {
             & 0o777;
         assert_eq!(mode, 0o700, "existing root must become owner-only");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_layout_rejects_a_world_writable_existing_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp_path("layout-world-writable");
+        std::fs::create_dir_all(&root).expect("root must be created");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777))
+            .expect("root permissions must be widened for the test");
+        let config = Config {
+            storage_root: root.clone(),
+            ..Config::default()
+        };
+
+        assert!(matches!(
+            config.ensure_layout(),
+            Err(ConfigError::Layout { ref detail, .. })
+                if detail.contains("world-writable")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_layout_rejects_a_symlinked_root() {
+        let target = temp_path("layout-symlink-target");
+        let link = temp_path("layout-symlink-link");
+        std::fs::create_dir_all(&target).expect("target must be created");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink must be created");
+
+        let config = Config {
+            storage_root: link.clone(),
+            ..Config::default()
+        };
+        assert!(matches!(
+            config.ensure_layout(),
+            Err(ConfigError::Layout { ref detail, .. })
+                if detail.contains("symlink")
+        ));
+        assert!(target.is_dir(), "the symlink target must not be touched");
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&target);
     }
 
     #[test]
