@@ -179,9 +179,10 @@ included), output bounds, and staged-file tamper detection at resolve time.
 - Active code: single-crate Rust modular monolith (`src/`, `tests/`).
 - In progress: package ingestion, validation, promotion, registry persistence,
   startup assembly (configuration, trust store, storage layout, shared
-  database, durable rejection sink), and the worker execution library are
-  implemented. Scheduler/triggering, lifecycle endpoints, execution history,
-  and the operator CLI are not built yet — see
+  database, durable rejection sink), the worker execution library, and a
+  library-level registered-artifact execution service are implemented.
+  Scheduler/triggering, activation/execution HTTP endpoints, execution
+  history, and the operator CLI are not built yet — see
   [Not built yet](docs/architecture.md#not-built-yet).
 - Specification: [`docs/architecture.md`](docs/architecture.md) describes the
   Rust system as built. `docs/storage-reconciliation.md` and

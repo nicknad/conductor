@@ -151,6 +151,39 @@ sandbox; filesystem/network/credential isolation is a deployment concern.
 Secrets ride stdin only (`Debug` redacts them); request/response sizes,
 stderr volume, and wall time are all bounded.
 
+### Registered-artifact execution (`control_plane::execute_module`)
+
+The execution service closes the restart gap: it resolves an active or
+pinned version from the registry, loads the promoted artifact, and hands a
+verified staged target to the worker executor. Fail-closed checks before
+spawn:
+
+- activation policy (runtime allowlist) is re-applied to the record actually
+  used for execution;
+- `artifact_relpath` must exactly equal the canonical
+  `{module_id}/{version}/{digest}.zip` address and resolve under the artifact
+  root (no traversal, symlink escape, or sibling-prefix confusion);
+- artifact size is bounded by the package policy before hashing; size and
+  SHA-256 must match the registry record;
+- execution requires **manifest v2** (v1 has no per-file integrity, so it
+  cannot be safely rebound after restart);
+- the archive `manifest.json` read from the artifact must match the stored
+  manifest identity/runtime/entrypoint/files, and extraction enforces v2
+  per-file size/SHA-256;
+- `signer_key_id` must be in the current operator allowlist (revocation
+  takes effect at execution; this is an id allowlist, not signature
+  re-verification);
+- concurrency is bounded by a semaphore; preparation runs on the blocking
+  pool and the permit survives caller cancellation;
+- staged files are re-verified immediately before spawn, with the entrypoint
+  checked last.
+
+Residual, documented risks: registry/artifact-store write access is code
+execution authority; the signer check is id-only; and pre-spawn verification
+is not atomic with `exec`, so a same-uid writer inside the 0700 staging
+directory can still race the final path resolution. HTTP exposure must not
+weaken these invariants.
+
 ## Invariants
 
 1. Authenticate before parsing — nothing inside an archive is trusted before
