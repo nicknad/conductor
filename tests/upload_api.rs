@@ -12,7 +12,7 @@
 //! `tests/tls_only.rs` for the socket proof; HSTS is asserted here).
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use axum::body::Body;
@@ -90,6 +90,29 @@ fn golden_package_bytes() -> Vec<u8> {
 
 /// Golden identity (`reporting-service` `1.2.0`) with a caller-chosen
 /// payload, for conflict cases that must differ only in bytes.
+/// Golden package whose `manifest.json` is caller-supplied raw bytes, for
+/// route-level manifest rejection tests.
+fn package_with_raw_manifest(manifest: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    let mut writer = zip::ZipWriter::new(&mut cursor);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer
+        .start_file("manifest.json", options)
+        .expect("zip writer must accept manifest");
+    writer
+        .write_all(manifest)
+        .expect("zip writer must accept manifest bytes");
+    writer
+        .start_file("payload/reporting-service", options)
+        .expect("zip writer must accept payload");
+    writer
+        .write_all(payload)
+        .expect("zip writer must accept payload bytes");
+    writer.finish().expect("zip must finalize");
+    cursor.into_inner()
+}
+
 fn package_bytes_with_payload(payload: &[u8]) -> Vec<u8> {
     let manifest = serde_json::json!({
         "manifest_version": 1,
@@ -197,6 +220,17 @@ async fn send_upload(
     (status, headers, bytes.to_vec())
 }
 
+/// Upload a caller-built multipart body with the standard test bearer and
+/// decode the JSON error/success body.
+async fn post_custom_body(state: &AppState, body: Vec<u8>) -> (StatusCode, serde_json::Value) {
+    let (status, _, bytes) =
+        send_upload(state, Body::from(body), Some("test-bearer-upload"), &[]).await;
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
 async fn post_multipart(
     state: AppState,
     body: Vec<u8>,
@@ -218,52 +252,6 @@ fn quarantine_zip_count(dir: &Path) -> usize {
 
 fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
-}
-
-/// `io::Write` sink shared with the test so rejection events can be
-/// asserted on.
-#[derive(Clone)]
-struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for CaptureWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .lock()
-            .expect("capture lock must not poison")
-            .extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
-    type Writer = CaptureWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-/// Installs a thread-local subscriber capturing every audit event. The
-/// guard must stay alive while requests are sent; `#[tokio::test]` uses a
-/// current-thread runtime, so the router's events land on this thread.
-fn capture_rejection_events() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
-    let buffer = Arc::new(Mutex::new(Vec::new()));
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(CaptureWriter(Arc::clone(&buffer)))
-        .with_ansi(false)
-        .without_time()
-        .with_target(false)
-        .finish();
-    (buffer, tracing::subscriber::set_default(subscriber))
-}
-
-fn captured_events(buffer: &Arc<Mutex<Vec<u8>>>) -> String {
-    let captured = buffer.lock().expect("capture lock must not poison").clone();
-    String::from_utf8(captured).expect("captured output must be UTF-8")
 }
 
 use std::io::Write as _;
@@ -566,7 +554,11 @@ fn assert_security_headers(headers: &HeaderMap) {
     assert_eq!(value("x-content-type-options"), "nosniff");
     assert_eq!(value("x-frame-options"), "DENY");
     assert_eq!(value("referrer-policy"), "no-referrer");
-    assert_eq!(value("cache-control"), "no-store");
+    assert_eq!(
+        value("cache-control"),
+        "no-store, no-cache, must-revalidate"
+    );
+    assert_eq!(value("cross-origin-resource-policy"), "same-origin");
     assert!(
         value("strict-transport-security").starts_with("max-age=63072000"),
         "HSTS commits the service to HTTPS-only"
@@ -622,20 +614,18 @@ async fn concurrent_upload_bound_sheds_load() {
 #[tokio::test]
 async fn missing_bearer_records_exactly_one_transport_event() {
     let state = test_state(PackageValidationPolicy::production(), "audit-401");
-    let (buffer, guard) = capture_rejection_events();
     let (status, _, _) = send_upload(&state, Body::empty(), None, &[]).await;
-    drop(guard);
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let events = captured_events(&buffer);
-    assert_eq!(events.matches("package rejected").count(), 1, "{events}");
-    assert!(events.contains("stage=\"transport\""), "{events}");
+    let rows = rejection_rows(&state);
+    assert_eq!(rows.len(), 1, "one rejection must persist exactly one row");
+    assert_eq!(rows[0].stage, "transport");
+    assert_eq!(rows[0].code, "missing_or_invalid_bearer");
     assert!(
-        events.contains("code=\"missing_or_invalid_bearer\""),
-        "{events}"
-    );
-    assert!(
-        events.contains("request_id=\""),
-        "the server-issued request id must be attached: {events}"
+        rows[0]
+            .request_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty()),
+        "the server-issued request id must be attached"
     );
     cleanup(&state.quarantine_dir);
 }
@@ -650,7 +640,6 @@ async fn signature_failure_records_typed_event_with_internal_reason() {
     // internal reason for operators.
     text_part(&mut body, "key_id", "k9");
     text_part(&mut body, "signature", &signature_base64_for(&package));
-    let (buffer, guard) = capture_rejection_events();
     let (status, _, _) = send_upload(
         &state,
         Body::from(finish_body(&mut body)),
@@ -658,18 +647,15 @@ async fn signature_failure_records_typed_event_with_internal_reason() {
         &[],
     )
     .await;
-    drop(guard);
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let events = captured_events(&buffer);
-    assert_eq!(events.matches("package rejected").count(), 1, "{events}");
-    assert!(events.contains("stage=\"signature\""), "{events}");
+    let rows = rejection_rows(&state);
+    assert_eq!(rows.len(), 1, "one rejection must persist exactly one row");
+    assert_eq!(rows[0].stage, "signature");
+    assert_eq!(rows[0].code, "signature_verification_failed");
     assert!(
-        events.contains("code=\"signature_verification_failed\""),
-        "{events}"
-    );
-    assert!(
-        events.contains("k9"),
-        "internal key detail missing: {events}"
+        rows[0].detail.contains("k9"),
+        "internal key detail missing: {}",
+        rows[0].detail
     );
     cleanup(&state.quarantine_dir);
 }
@@ -677,10 +663,9 @@ async fn signature_failure_records_typed_event_with_internal_reason() {
 #[tokio::test]
 async fn malformed_multipart_body_records_one_typed_event() {
     let state = test_state(PackageValidationPolicy::production(), "audit-multipart");
-    let (buffer, guard) = capture_rejection_events();
     // Valid bearer and multipart content type, but a body that fails to
     // parse inside the handler: the typed multipart path records exactly
-    // one event, and the fallback must skip it (response marker).
+    // one durable event, and the fallback must skip it (response marker).
     let (status, _, _) = send_upload(
         &state,
         Body::from("definitely not multipart"),
@@ -688,12 +673,11 @@ async fn malformed_multipart_body_records_one_typed_event() {
         &[],
     )
     .await;
-    drop(guard);
     assert!(status.is_client_error(), "unexpected status {status}");
-    let events = captured_events(&buffer);
-    assert_eq!(events.matches("package rejected").count(), 1, "{events}");
-    assert!(events.contains("stage=\"multipart\""), "{events}");
-    assert!(events.contains("code=\"invalid_multipart\""), "{events}");
+    let rows = rejection_rows(&state);
+    assert_eq!(rows.len(), 1, "one rejection must persist exactly one row");
+    assert_eq!(rows[0].stage, "multipart");
+    assert_eq!(rows[0].code, "invalid_multipart");
     cleanup(&state.quarantine_dir);
 }
 
@@ -753,6 +737,304 @@ async fn accepted_upload_persists_no_rejection_row() {
         rejection_rows(&state).is_empty(),
         "an accepted upload must leave the rejection table empty"
     );
+    cleanup(&state.quarantine_dir);
+    cleanup(&state.artifact_dir);
+}
+
+#[tokio::test]
+async fn valid_package_above_axums_two_mib_default_is_accepted() {
+    // axum's Multipart extractor defaults to a 2 MiB body cap. The route
+    // relies on the policy bound (100 MiB in production) instead, so a valid
+    // package larger than that default must still be accepted.
+    let state = test_state(PackageValidationPolicy::production(), "large-body");
+    let payload = vec![0u8; 2 * 1024 * 1024 + 4096];
+    let package = package_bytes_with_payload(&payload);
+    assert!(package.len() > 2 * 1024 * 1024);
+
+    let (status, json, _) = post_multipart(state.clone(), golden_body(&package)).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the policy bound, not axum's 2 MiB default, must gate uploads: {json}"
+    );
+    assert_eq!(json["signer_key_id"], "k1");
+    cleanup(&state.quarantine_dir);
+    cleanup(&state.artifact_dir);
+}
+
+#[tokio::test]
+async fn client_supplied_request_id_is_replaced_on_every_response() {
+    let state = test_state(PackageValidationPolicy::production(), "request-id-strip");
+    let app = router(state.clone());
+
+    let request = Request::builder()
+        .uri("/healthz")
+        .header("x-request-id", "attacker-chosen-id")
+        .body(Body::empty())
+        .expect("request must build");
+    let response = app.oneshot(request).await.expect("router must respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let issued = response
+        .headers()
+        .get("x-request-id")
+        .expect("every response carries a server-issued id")
+        .to_str()
+        .expect("request id must be ASCII")
+        .to_owned();
+    assert_ne!(issued, "attacker-chosen-id");
+    assert!(!issued.is_empty());
+
+    // The audit attribution must use the server id as well.
+    let (status, _, _) = send_upload(
+        &state,
+        Body::from(golden_body(&golden_package_bytes())),
+        None,
+        &[("x-request-id", "attacker-chosen-id".to_owned())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let rows = rejection_rows(&state);
+    assert_eq!(rows.len(), 1);
+    assert_ne!(rows[0].request_id.as_deref(), Some("attacker-chosen-id"));
+    assert!(
+        rows[0]
+            .request_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty()),
+        "the rejection must carry the server-issued id"
+    );
+    cleanup(&state.quarantine_dir);
+    cleanup(&state.artifact_dir);
+}
+
+#[tokio::test]
+async fn missing_key_after_package_discards_quarantine() {
+    let state = test_state(PackageValidationPolicy::production(), "missing-key-cleanup");
+    let package = golden_package_bytes();
+    let mut body = Vec::new();
+    file_part(&mut body, "package", "pkg.zip", "application/zip", &package);
+    text_part(&mut body, "signature", &signature_base64_for(&package));
+
+    let (status, json) = post_custom_body(&state, finish_body(&mut body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["code"], "missing_key_id");
+    assert_eq!(
+        quarantine_zip_count(&state.quarantine_dir),
+        0,
+        "a field failure after streaming must delete the quarantine file"
+    );
+    cleanup(&state.quarantine_dir);
+}
+
+#[tokio::test]
+async fn whitespace_only_key_discards_quarantine() {
+    let state = test_state(PackageValidationPolicy::production(), "blank-key-cleanup");
+    let package = golden_package_bytes();
+    let mut body = Vec::new();
+    file_part(&mut body, "package", "pkg.zip", "application/zip", &package);
+    text_part(&mut body, "key_id", " \t ");
+    text_part(&mut body, "signature", &signature_base64_for(&package));
+
+    let (status, json) = post_custom_body(&state, finish_body(&mut body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["code"], "missing_key_id");
+    assert_eq!(quarantine_zip_count(&state.quarantine_dir), 0);
+    cleanup(&state.quarantine_dir);
+}
+
+#[tokio::test]
+async fn missing_signature_discards_quarantine() {
+    let state = test_state(PackageValidationPolicy::production(), "missing-sig-cleanup");
+    let package = golden_package_bytes();
+    let mut body = Vec::new();
+    file_part(&mut body, "package", "pkg.zip", "application/zip", &package);
+    text_part(&mut body, "key_id", "k1");
+
+    let (status, json) = post_custom_body(&state, finish_body(&mut body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["code"], "missing_signature");
+    assert_eq!(quarantine_zip_count(&state.quarantine_dir), 0);
+    cleanup(&state.quarantine_dir);
+}
+
+#[tokio::test]
+async fn invalid_base64_signature_discards_quarantine() {
+    let state = test_state(PackageValidationPolicy::production(), "bad-sig-cleanup");
+    let package = golden_package_bytes();
+    let mut body = Vec::new();
+    file_part(&mut body, "package", "pkg.zip", "application/zip", &package);
+    text_part(&mut body, "key_id", "k1");
+    text_part(&mut body, "signature", "not base64!");
+
+    let (status, json) = post_custom_body(&state, finish_body(&mut body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["code"], "invalid_signature_encoding");
+    assert_eq!(quarantine_zip_count(&state.quarantine_dir), 0);
+    cleanup(&state.quarantine_dir);
+}
+
+#[tokio::test]
+async fn duplicate_known_fields_are_rejected_instead_of_last_wins() {
+    let package = golden_package_bytes();
+    for (field, value, code) in [
+        ("key_id", "k1", "duplicate_key_id_field"),
+        ("signature", "", "duplicate_signature_field"),
+        ("format_version", "1", "duplicate_format_version_field"),
+    ] {
+        let state = test_state(PackageValidationPolicy::production(), field);
+        let mut body = Vec::new();
+        file_part(&mut body, "package", "pkg.zip", "application/zip", &package);
+        text_part(&mut body, "key_id", "k1");
+        text_part(&mut body, "signature", &signature_base64_for(&package));
+        // First occurrence of the field under test, then a duplicate.
+        if field == "format_version" {
+            text_part(&mut body, field, value);
+        }
+        text_part(&mut body, field, value);
+
+        let (status, json) = post_custom_body(&state, finish_body(&mut body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "field {field}");
+        assert_eq!(json["code"], code, "field {field}");
+        assert_eq!(
+            quarantine_zip_count(&state.quarantine_dir),
+            0,
+            "field {field} must not leak quarantined bytes"
+        );
+        cleanup(&state.quarantine_dir);
+    }
+}
+
+#[tokio::test]
+async fn oversized_signature_field_is_rejected_without_leftovers() {
+    let state = test_state(PackageValidationPolicy::production(), "oversized-signature");
+    let package = golden_package_bytes();
+    let mut body = Vec::new();
+    file_part(&mut body, "package", "pkg.zip", "application/zip", &package);
+    text_part(&mut body, "key_id", "k1");
+    // MAX_SIGNATURE_TEXT_BYTES is 16 KiB; one byte over must be rejected by
+    // the per-field cap, not by base64 decoding.
+    text_part(&mut body, "signature", &"A".repeat(16 * 1024 + 1));
+
+    let (status, json) = post_custom_body(&state, finish_body(&mut body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["code"], "field_too_large");
+    assert_eq!(quarantine_zip_count(&state.quarantine_dir), 0);
+    cleanup(&state.quarantine_dir);
+}
+
+#[tokio::test]
+async fn key_id_at_the_256_byte_boundary_is_rejected_one_byte_over() {
+    let state = test_state(PackageValidationPolicy::production(), "key-id-boundary");
+    let package = golden_package_bytes();
+    let mut body = Vec::new();
+    file_part(&mut body, "package", "pkg.zip", "application/zip", &package);
+    text_part(&mut body, "key_id", &"k".repeat(257));
+    text_part(&mut body, "signature", &signature_base64_for(&package));
+
+    let (status, json) = post_custom_body(&state, finish_body(&mut body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["code"], "field_too_large");
+    assert_eq!(quarantine_zip_count(&state.quarantine_dir), 0);
+    cleanup(&state.quarantine_dir);
+}
+
+#[tokio::test]
+async fn sixteen_form_fields_are_accepted_and_seventeen_are_rejected() {
+    let state = test_state(
+        PackageValidationPolicy::production(),
+        "field-count-boundary",
+    );
+    let package = golden_package_bytes();
+
+    let mut accepted = Vec::new();
+    file_part(
+        &mut accepted,
+        "package",
+        "pkg.zip",
+        "application/zip",
+        &package,
+    );
+    text_part(&mut accepted, "key_id", "k1");
+    text_part(&mut accepted, "signature", &signature_base64_for(&package));
+    text_part(&mut accepted, "format_version", "1");
+    for index in 0..12 {
+        text_part(&mut accepted, &format!("extra_{index}"), "ignored");
+    }
+    let (status, _, _) = send_upload(
+        &state,
+        Body::from(finish_body(&mut accepted)),
+        Some("test-bearer-upload"),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "16 fields is the cap");
+
+    let mut rejected = Vec::new();
+    file_part(
+        &mut rejected,
+        "package",
+        "pkg.zip",
+        "application/zip",
+        &package,
+    );
+    text_part(&mut rejected, "key_id", "k1");
+    text_part(&mut rejected, "signature", &signature_base64_for(&package));
+    text_part(&mut rejected, "format_version", "1");
+    for index in 0..13 {
+        text_part(&mut rejected, &format!("extra_{index}"), "ignored");
+    }
+    let (status, json) = post_custom_body(&state, finish_body(&mut rejected)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["code"], "too_many_fields");
+    cleanup(&state.quarantine_dir);
+    cleanup(&state.artifact_dir);
+}
+
+#[tokio::test]
+async fn invalid_manifest_is_mapped_to_422_and_recorded_as_manifest_stage() {
+    let state = test_state(PackageValidationPolicy::production(), "manifest-422");
+    let package = package_with_raw_manifest(b"definitely not json", b"payload");
+    let (status, json, _) = post_multipart(state.clone(), golden_body(&package)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(json["code"], "manifest_rejected");
+
+    let rows = rejection_rows(&state);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].stage, "manifest");
+    assert_eq!(rows[0].code, "manifest_rejected");
+    assert_eq!(quarantine_zip_count(&state.quarantine_dir), 0);
+    cleanup(&state.quarantine_dir);
+    cleanup(&state.artifact_dir);
+}
+
+#[tokio::test]
+async fn bearer_auth_runs_before_the_body_limit() {
+    let state = test_state(PackageValidationPolicy::production(), "auth-before-limit");
+    let body = golden_body(&golden_package_bytes());
+    // A Content-Length over the policy bound would be a 413 if the limit ran
+    // first; unauthenticated callers must never reach it.
+    let (status, _, _) = send_upload(
+        &state,
+        Body::from(body.clone()),
+        None,
+        &[("content-length", (200 * 1024 * 1024).to_string())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Authenticated: the limit responds, and transport rejections still carry
+    // the request id and security headers.
+    let (status, headers, _) = send_upload(
+        &state,
+        Body::from(body),
+        Some("test-bearer-upload"),
+        &[("content-length", (200 * 1024 * 1024).to_string())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(headers.contains_key("x-request-id"));
+    assert!(headers.contains_key("strict-transport-security"));
+    assert!(headers.contains_key("x-content-type-options"));
     cleanup(&state.quarantine_dir);
     cleanup(&state.artifact_dir);
 }

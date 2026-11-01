@@ -58,13 +58,15 @@ use crate::audit::recorder::RejectionRecorder;
 use crate::control_plane::upload_package::run_upload_workflow;
 use crate::control_plane::validate_package::{PackageValidator, ValidationError};
 use crate::modules::registry::{ModuleRegistry, RegistryError};
-use crate::packages::signature::{PackageSignature, SUPPORTED_SIGNATURE_FORMAT_VERSION};
+use crate::packages::signature::{
+    PackageSignature, MAX_KEY_ID_BYTES, SUPPORTED_SIGNATURE_FORMAT_VERSION,
+};
 use crate::storage::artifact_store::PromoteError;
 
 /// Caps for small text fields. The signature itself is 64 bytes (88 base64
 /// characters); the generous bounds below leave room for envelope evolution
-/// while the global body limit bounds total memory.
-const MAX_KEY_ID_BYTES: usize = 256;
+/// while the global body limit bounds total memory. The key-id bound is
+/// shared with configuration so every configured key is addressable.
 const MAX_SIGNATURE_TEXT_BYTES: usize = 16 * 1024;
 const MAX_FORMAT_VERSION_TEXT_BYTES: usize = 16;
 
@@ -191,6 +193,24 @@ fn reject(
             .with_byte_count(byte_count),
     );
     api.into_response()
+}
+
+/// Rejects a repeated known text field. `package` is handled separately by
+/// the quarantine guard; allowing `key_id`/`signature`/`format_version` to
+/// silently overwrite would make the authenticated identity depend on part
+/// order, which is ambiguous input, not a convenience.
+fn duplicate_field(name: &'static str) -> Box<UploadFailure> {
+    UploadFailure::from_api(
+        RejectionStage::Multipart,
+        ApiError::BadRequest(
+            match name {
+                "key_id" => "duplicate_key_id_field",
+                "signature" => "duplicate_signature_field",
+                _ => "duplicate_format_version_field",
+            },
+            format!("multipart field `{name}` may appear only once"),
+        ),
+    )
 }
 
 /// A failed upload: the caller-facing error plus the audit facts known at
@@ -330,12 +350,13 @@ async fn process_upload(
     let mut key_id: Option<String> = None;
     let mut signature_text: Option<String> = None;
     let mut format_version: u16 = SUPPORTED_SIGNATURE_FORMAT_VERSION;
+    let mut format_version_seen = false;
     let mut package_bytes: Option<u64> = None;
 
     while let Some(field) = multipart.next_field().await.map_err(|e| {
         UploadFailure::from_api(
             RejectionStage::Multipart,
-            ApiError::BadRequest("invalid_multipart", e.to_string()),
+            multipart_error(&e, "invalid_multipart"),
         )
     })? {
         field_count += 1;
@@ -392,6 +413,9 @@ async fn process_upload(
                 tracing::Span::current().record("package_bytes", received);
             }
             "key_id" => {
+                if key_id.is_some() {
+                    return Err(duplicate_field("key_id"));
+                }
                 key_id = Some(
                     read_text_capped(field, MAX_KEY_ID_BYTES, "key_id")
                         .await
@@ -399,6 +423,9 @@ async fn process_upload(
                 );
             }
             "signature" => {
+                if signature_text.is_some() {
+                    return Err(duplicate_field("signature"));
+                }
                 signature_text = Some(
                     read_text_capped(field, MAX_SIGNATURE_TEXT_BYTES, "signature")
                         .await
@@ -406,6 +433,10 @@ async fn process_upload(
                 );
             }
             "format_version" => {
+                if format_version_seen {
+                    return Err(duplicate_field("format_version"));
+                }
+                format_version_seen = true;
                 let text = read_text_capped(field, MAX_FORMAT_VERSION_TEXT_BYTES, "format_version")
                     .await
                     .map_err(|e| UploadFailure::from_api(RejectionStage::Multipart, e))?;
@@ -429,7 +460,7 @@ async fn process_upload(
                     .map_err(|e| {
                         UploadFailure::from_api(
                             RejectionStage::Multipart,
-                            ApiError::BadRequest("invalid_multipart", e.to_string()),
+                            multipart_error(&e, "invalid_multipart"),
                         )
                     })?
                     .is_some()
@@ -437,19 +468,18 @@ async fn process_upload(
             }
         }
     }
-    // The write handle was closed by the streaming helper before the path
-    // was stored, so validation opens the quarantined file itself with no
-    // writer still attached. `keep` disarms the guard: from here on the
-    // file is deleted explicitly on failure and kept on success.
-    let path = quarantine.keep().ok_or_else(|| {
-        UploadFailure::from_api(
+    // Check every cheap field before disarming the guard: a missing package,
+    // key, or signature (or undecodable base64) must delete the quarantined
+    // bytes through `QuarantineGuard::drop`, not leak them.
+    if !quarantine.contains() {
+        return Err(UploadFailure::from_api(
             RejectionStage::Multipart,
             ApiError::BadRequest(
                 "missing_package",
                 "multipart field `package` is required".to_owned(),
             ),
-        )
-    })?;
+        ));
+    }
     let key_id = key_id
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
@@ -480,6 +510,19 @@ async fn process_upload(
             ),
         )
     })?;
+    // The write handle was closed by the streaming helper before the path
+    // was stored, so validation opens the quarantined file itself with no
+    // writer still attached. `keep` disarms the guard: from here on the
+    // file is deleted explicitly on failure and kept on success.
+    let Some(path) = quarantine.keep() else {
+        return Err(UploadFailure::from_api(
+            RejectionStage::Multipart,
+            ApiError::BadRequest(
+                "missing_package",
+                "multipart field `package` is required".to_owned(),
+            ),
+        ));
+    };
     let audit_key_id = key_id.clone();
     let audit_key_id_outer = key_id.clone();
     let envelope = PackageSignature {
@@ -604,6 +647,9 @@ async fn process_upload(
         })
     })?
     .map_err(|e| {
+        // The blocking task was cancelled or panicked: no other branch will
+        // consume the quarantined bytes.
+        crate::storage::quarantine::discard(&path);
         let api = ApiError::Internal(format!("validation task failed: {e}"));
         let detail = api.message().to_owned();
         Box::new(UploadFailure {
@@ -696,10 +742,7 @@ async fn stream_package_to_quarantine(
         let chunk = match field.chunk().await {
             Ok(chunk) => chunk,
             Err(e) => {
-                return fail(
-                    file,
-                    ApiError::BadRequest("unreadable_package_chunk", e.to_string()),
-                );
+                return fail(file, multipart_error(&e, "unreadable_package_chunk"));
             }
         };
         let Some(chunk) = chunk else { break };
@@ -730,6 +773,18 @@ async fn stream_package_to_quarantine(
     Ok(total)
 }
 
+/// Maps a multipart extraction error to the API contract. axum reports a
+/// body-cap violation as `413`; flattening every multipart failure to `400`
+/// would make the status depend on whether the client sent `Content-Length`
+/// and hide the real overload condition.
+fn multipart_error(err: &axum::extract::multipart::MultipartError, code: &'static str) -> ApiError {
+    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        ApiError::PayloadTooLarge("request body exceeds the allowed size".to_owned())
+    } else {
+        ApiError::BadRequest(code, err.to_string())
+    }
+}
+
 /// Parses the `format_version` text field strictly: canonical decimal digits
 /// only, no sign, no leading zeros, fitting in `u16`. Rejects `+1`, `01`,
 /// empty, and out-of-range values so the envelope version is unambiguous.
@@ -755,7 +810,7 @@ async fn read_text_capped(
     while let Some(chunk) = field
         .chunk()
         .await
-        .map_err(|e| ApiError::BadRequest("invalid_multipart", e.to_string()))?
+        .map_err(|e| multipart_error(&e, "invalid_multipart"))?
     {
         if bytes.len() + chunk.len() > cap {
             return Err(ApiError::BadRequest(
@@ -776,6 +831,7 @@ async fn read_text_capped(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn response_serializes_audit_fields() {
@@ -836,6 +892,44 @@ mod tests {
                 parse_format_version(bad).is_err(),
                 "must reject {bad:?} as non-canonical"
             );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, .. ProptestConfig::default() })]
+
+        /// The parser accepts exactly canonical decimal `u16` text: optional
+        /// surrounding whitespace, no sign, no leading zero, in range.
+        #[test]
+        fn format_version_accepts_exactly_canonical_u16_decimals(text in ".{0,24}") {
+            let trimmed = text.trim();
+            let expected = !trimmed.is_empty()
+                && trimmed.bytes().all(|byte| byte.is_ascii_digit())
+                && !(trimmed.len() > 1 && trimmed.starts_with('0'))
+                && trimmed.parse::<u16>().is_ok();
+            prop_assert_eq!(parse_format_version(&text).is_ok(), expected);
+        }
+
+        /// Every in-range version renders canonically and round-trips.
+        #[test]
+        fn every_u16_version_round_trips(version in any::<u16>()) {
+            prop_assert_eq!(parse_format_version(&version.to_string()), Ok(version));
+        }
+
+        /// Adding a sign, decimal point, or leading zero is always rejected.
+        #[test]
+        fn decorated_numeric_forms_are_rejected(
+            version in 0u16..=9999,
+            prefix in "[+\\-.]",
+            leading_zero in any::<bool>(),
+        ) {
+            let digits = if leading_zero {
+                format!("0{version}")
+            } else {
+                version.to_string()
+            };
+            let text = format!("{prefix}{digits}");
+            prop_assert!(parse_format_version(&text).is_err(), "{text:?} must be rejected");
         }
     }
 }
