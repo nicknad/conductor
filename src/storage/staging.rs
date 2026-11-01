@@ -105,13 +105,23 @@ pub fn sweep_older_than(dir: &Path, max_age: Duration) -> std::io::Result<usize>
         let stale = entry
             .metadata()
             .and_then(|metadata| metadata.modified())
-            .map(|modified| modified.elapsed().map(|age| age > max_age).unwrap_or(false))
+            .map(|modified| {
+                modified
+                    .elapsed()
+                    .map(|age| is_older_than(age, max_age))
+                    .unwrap_or(false)
+            })
             .unwrap_or(false);
         if stale && std::fs::remove_dir_all(entry.path()).is_ok() {
             removed += 1;
         }
     }
     Ok(removed)
+}
+
+/// Strict age comparison: an entry exactly at the TTL is not stale yet.
+fn is_older_than(age: Duration, max_age: Duration) -> bool {
+    age > max_age
 }
 
 /// Verifies the source against the validation verdict and extracts the
@@ -479,5 +489,48 @@ mod tests {
         assert!(!stale.exists(), "stale staging dir must be removed");
         assert!(fresh.is_dir(), "fresh staging dir must survive");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sweep_treats_a_missing_root_as_empty() {
+        let missing = std::env::temp_dir().join(format!(
+            "conductor-staging-missing-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert_eq!(
+            sweep_older_than(&missing, Duration::from_secs(1))
+                .expect("missing root is not an error"),
+            0
+        );
+    }
+
+    #[test]
+    fn sweep_reports_non_notfound_read_errors() {
+        let path = std::env::temp_dir().join(format!(
+            "conductor-staging-not-a-dir-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, b"not a directory").expect("fixture file");
+        assert!(
+            sweep_older_than(&path, Duration::from_secs(1)).is_err(),
+            "a non-directory root must surface the read error"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn age_boundary_is_strictly_greater_than_the_ttl() {
+        let ttl = Duration::from_secs(60);
+        assert!(is_older_than(ttl + Duration::from_secs(1), ttl));
+        assert!(!is_older_than(ttl, ttl), "exactly at the TTL is fresh");
+        assert!(!is_older_than(ttl - Duration::from_secs(1), ttl));
     }
 }
