@@ -67,6 +67,27 @@ impl Host {
             .build()?;
 
         config.ensure_layout()?;
+        // Startup is single-writer, so stale crash leftovers can be removed
+        // before any request can race the sweep.
+        let swept_quarantine = crate::storage::quarantine::sweep_older_than(
+            &config.quarantine_dir(),
+            Duration::from_secs(config.quarantine_ttl_secs),
+        );
+        let swept_staging = match crate::storage::staging::sweep_older_than(
+            &config.staging_dir(),
+            Duration::from_secs(config.staging_ttl_secs),
+        ) {
+            Ok(removed) => removed,
+            Err(error) => {
+                tracing::warn!(error = %error, "staging sweep failed; continuing");
+                0
+            }
+        };
+        tracing::info!(
+            swept_quarantine,
+            swept_staging,
+            "startup workspace sweep complete"
+        );
         let database = Arc::new(Database::open(&config.database_path())?);
         database.migrate()?;
         let registry = Arc::new(ModuleRegistry::from_database(Arc::clone(&database)));
@@ -319,6 +340,43 @@ mod tests {
         assert!(!host.state().api_token.verify("wrong-token"));
         assert_eq!(host.state().request_timeout, Duration::from_secs(11));
         assert_eq!(host.state().upload_slots.available_permits(), 3);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn assemble_sweeps_stale_workspace_leftovers() {
+        let root = temp_root("startup-sweep");
+        let config = test_config(&root);
+        config
+            .ensure_layout()
+            .expect("layout must exist for fixtures");
+        let stale_upload = config.quarantine_dir().join("upload-stale.zip");
+        let fresh_upload = config.quarantine_dir().join("upload-fresh.zip");
+        let stale_stage = config.staging_dir().join("stale-stage");
+        let fresh_stage = config.staging_dir().join("fresh-stage");
+        std::fs::create_dir_all(&stale_stage).expect("stale stage");
+        std::fs::create_dir_all(&fresh_stage).expect("fresh stage");
+        std::fs::write(&stale_upload, b"stale").expect("stale upload");
+        std::fs::write(&fresh_upload, b"fresh").expect("fresh upload");
+
+        let old = SystemTime::now()
+            - Duration::from_secs(2 * config.quarantine_ttl_secs.max(config.staging_ttl_secs));
+        for path in [&stale_upload, &stale_stage] {
+            std::fs::File::open(path)
+                .expect("path must open")
+                .set_times(std::fs::FileTimes::new().set_modified(old))
+                .expect("mtime must be set");
+        }
+
+        let _host = Host::assemble(config.clone()).expect("config must assemble");
+
+        assert!(!stale_upload.exists(), "stale quarantine must be swept");
+        assert!(
+            !stale_stage.exists(),
+            "stale staging directory must be swept"
+        );
+        assert!(fresh_upload.exists(), "fresh quarantine must survive");
+        assert!(fresh_stage.is_dir(), "fresh staging directory must survive");
         cleanup(&root);
     }
 

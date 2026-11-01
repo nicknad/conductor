@@ -107,10 +107,10 @@ are independently shippable unless noted. Items 7 and 8 are planned in detail in
 
 ### Quick wins (self-contained, no prerequisites)
 
-1. **Wire the quarantine sweep, and add a staging sweep.** `sweep_older_than`
-   exists but has no caller (`src/storage/quarantine.rs`), and staged
-   directories leak when the host crashes mid-execution (`StagedPackage::keep`).
-   A startup sweep makes "leaks bound themselves" true instead of aspirational.
+1. **Wire the quarantine sweep, and add a staging sweep.** **Implemented after
+   this audit:** startup runs both sweeps against the configured
+   `quarantine_ttl_secs`/`staging_ttl_secs`, so crash leftovers and kept
+   staging directories no longer accumulate without bound.
 2. **Trusted-key loading so the binary can start.** **Implemented after this
    audit:** `server::run` loads operator configuration, assembles the trust
    store and shared database, and serves TLS-only; the upload API is reachable

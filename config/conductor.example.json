@@ -5,6 +5,8 @@
   "tls_cert_path": "tls/cert.pem",
   "tls_key_path": "tls/key.pem",
   "max_concurrent_uploads": 8,
+  "quarantine_ttl_secs": 3600,
+  "staging_ttl_secs": 3600,
   "api_token": "replace-with-a-long-random-token",
   "trusted_keys": [
     {

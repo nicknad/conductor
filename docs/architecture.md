@@ -52,10 +52,14 @@ state behind:
 3. The production validation policy must be ingestable; the validator is
    built around the configured trust store (no skip-verification path).
 4. `Config::ensure_layout` creates/tightens `quarantine/`, `artifacts/`,
-   `database/`, and `staging/` under the storage root.
-5. One `Database` is opened and migrated; the module registry and rejection
+   `database/`, and `staging/` under the storage root, refusing a symlinked
+   or world-writable existing root.
+5. Startup sweeps `quarantine/` files and `staging/` directories older than
+   their configured TTLs, removing crash/drop leftovers before any request
+   can race the sweep.
+6. One `Database` is opened and migrated; the module registry and rejection
    store share it through `Arc`, so one connection owns the WAL/pragma policy.
-6. The assembled `Host` builds the router (configured bearer token, upload
+7. The assembled `Host` builds the router (configured bearer token, upload
    slots, request timeout) and serves TLS-only on the configured bind.
 
 Failures at any step abort startup without binding a listener.

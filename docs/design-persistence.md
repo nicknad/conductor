@@ -147,7 +147,8 @@ the real path is exercised.
 - `database_path()` → `storage_root/database/conductor.db`
 - `staging_dir()` → `storage_root/staging` (configured and created at startup
   by `Config::ensure_layout`)
-- `quarantine_ttl`, `staging_ttl` for the sweeps
+- `quarantine_ttl_secs`, `staging_ttl_secs` for the startup sweeps
+  (implemented)
 
 ### 4.4 Schema v1
 
@@ -309,8 +310,9 @@ wait for the retention/GC work.
    `RejectionRecorder::new()` stays tracing-only; `with_store` attaches
    the `package_rejections` insert (best-effort, never alters the
    response).
-4. **PR4 — reconciliation**: integrity states, staging sweep, startup wiring,
-   `reconciliation_runs`.
+4. **PR4 — reconciliation**: integrity states and `reconciliation_runs`
+   remain; the quarantine/staging startup sweeps and their config wiring are
+   implemented.
 5. **PR5+** — activation persistence wiring, artifact GC and retention, backup,
    execution tables when the dispatcher lands.
 

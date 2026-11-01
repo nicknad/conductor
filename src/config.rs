@@ -33,6 +33,8 @@ const ENV_REQUEST_TIMEOUT_SECS: &str = "CONDUCTOR_REQUEST_TIMEOUT_SECS";
 const ENV_TLS_CERT_PATH: &str = "CONDUCTOR_TLS_CERT_PATH";
 const ENV_TLS_KEY_PATH: &str = "CONDUCTOR_TLS_KEY_PATH";
 const ENV_MAX_CONCURRENT_UPLOADS: &str = "CONDUCTOR_MAX_CONCURRENT_UPLOADS";
+const ENV_QUARANTINE_TTL_SECS: &str = "CONDUCTOR_QUARANTINE_TTL_SECS";
+const ENV_STAGING_TTL_SECS: &str = "CONDUCTOR_STAGING_TTL_SECS";
 // Environment variable names, not credentials.
 // nosemgrep: generic.hardcoded-secret
 const ENV_API_TOKEN: &str = "CONDUCTOR_API_TOKEN";
@@ -117,6 +119,10 @@ pub struct Config {
     /// Maximum simultaneous upload validations. Excess uploads are
     /// rejected with `503` instead of queueing unbounded work.
     pub max_concurrent_uploads: usize,
+    /// Age after which a leftover quarantine upload is removed at startup.
+    pub quarantine_ttl_secs: u64,
+    /// Age after which a leftover staging directory is removed at startup.
+    pub staging_ttl_secs: u64,
     /// Operator bearer token. Secret: never logged, never serialized into
     /// error messages. `None` is only valid before startup validation.
     pub api_token: Option<String>,
@@ -134,6 +140,8 @@ impl Default for Config {
             tls_cert_path: PathBuf::from("tls/cert.pem"),
             tls_key_path: PathBuf::from("tls/key.pem"),
             max_concurrent_uploads: 8,
+            quarantine_ttl_secs: 60 * 60,
+            staging_ttl_secs: 60 * 60,
             api_token: None,
             trusted_keys: Vec::new(),
         }
@@ -149,6 +157,8 @@ impl fmt::Debug for Config {
             .field("tls_cert_path", &self.tls_cert_path)
             .field("tls_key_path", &self.tls_key_path)
             .field("max_concurrent_uploads", &self.max_concurrent_uploads)
+            .field("quarantine_ttl_secs", &self.quarantine_ttl_secs)
+            .field("staging_ttl_secs", &self.staging_ttl_secs)
             .field("api_token", &self.api_token.as_ref().map(|_| "[redacted]"))
             .field("trusted_keys", &self.trusted_keys)
             .finish()
@@ -205,6 +215,12 @@ impl Config {
             if let Some(value) = file.max_concurrent_uploads {
                 config.max_concurrent_uploads = value;
             }
+            if let Some(value) = file.quarantine_ttl_secs {
+                config.quarantine_ttl_secs = value;
+            }
+            if let Some(value) = file.staging_ttl_secs {
+                config.staging_ttl_secs = value;
+            }
             if let Some(value) = file.trusted_keys {
                 config.trusted_keys = value;
             }
@@ -229,6 +245,12 @@ impl Config {
         }
         if let Some(value) = env_parse(&env, ENV_MAX_CONCURRENT_UPLOADS)? {
             config.max_concurrent_uploads = value;
+        }
+        if let Some(value) = env_parse(&env, ENV_QUARANTINE_TTL_SECS)? {
+            config.quarantine_ttl_secs = value;
+        }
+        if let Some(value) = env_parse(&env, ENV_STAGING_TTL_SECS)? {
+            config.staging_ttl_secs = value;
         }
         if let Some(path) = env.get(ENV_TRUSTED_KEYS_FILE) {
             let path = Path::new(path);
@@ -260,6 +282,18 @@ impl Config {
         if self.max_concurrent_uploads == 0 {
             return Err(ConfigError::Invalid {
                 field: "max_concurrent_uploads",
+                reason: "must be greater than zero".to_owned(),
+            });
+        }
+        if self.quarantine_ttl_secs == 0 {
+            return Err(ConfigError::Invalid {
+                field: "quarantine_ttl_secs",
+                reason: "must be greater than zero".to_owned(),
+            });
+        }
+        if self.staging_ttl_secs == 0 {
+            return Err(ConfigError::Invalid {
+                field: "staging_ttl_secs",
                 reason: "must be greater than zero".to_owned(),
             });
         }
@@ -454,6 +488,8 @@ struct ConfigFile {
     tls_cert_path: Option<PathBuf>,
     tls_key_path: Option<PathBuf>,
     max_concurrent_uploads: Option<usize>,
+    quarantine_ttl_secs: Option<u64>,
+    staging_ttl_secs: Option<u64>,
     api_token: Option<String>,
     api_token_file: Option<PathBuf>,
     trusted_keys: Option<Vec<TrustedKeyConfig>>,
@@ -797,10 +833,34 @@ mod tests {
     }
 
     #[test]
-    fn default_timeout_and_slots_are_nonzero() {
+    fn default_timeout_slots_and_ttls_are_nonzero() {
         let config = Config::default();
         assert!(config.request_timeout_secs > 0);
         assert!(config.max_concurrent_uploads > 0);
+        assert!(config.quarantine_ttl_secs > 0);
+        assert!(config.staging_ttl_secs > 0);
+    }
+
+    #[test]
+    fn zero_workspace_ttls_are_rejected() {
+        for config in [
+            Config {
+                quarantine_ttl_secs: 0,
+                ..startup_ready_config()
+            },
+            Config {
+                staging_ttl_secs: 0,
+                ..startup_ready_config()
+            },
+        ] {
+            assert!(matches!(
+                config.validate_for_startup(),
+                Err(ConfigError::Invalid {
+                    field: "quarantine_ttl_secs" | "staging_ttl_secs",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
@@ -947,6 +1007,8 @@ mod tests {
                 "tls_cert_path": "cert.pem",
                 "tls_key_path": "key.pem",
                 "max_concurrent_uploads": 3,
+                "quarantine_ttl_secs": 5,
+                "staging_ttl_secs": 6,
                 "api_token": "file-token",
                 "trusted_keys": [{
                     "key_id": "file-key",
@@ -964,6 +1026,8 @@ mod tests {
         assert_eq!(config.tls_cert_path, PathBuf::from("cert.pem"));
         assert_eq!(config.tls_key_path, PathBuf::from("key.pem"));
         assert_eq!(config.max_concurrent_uploads, 3);
+        assert_eq!(config.quarantine_ttl_secs, 5);
+        assert_eq!(config.staging_ttl_secs, 6);
         assert_eq!(config.api_token.as_deref(), Some("file-token"));
         assert_eq!(config.trusted_keys.len(), 1);
         assert_eq!(config.trusted_keys[0].key_id, "file-key");

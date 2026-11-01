@@ -16,7 +16,7 @@
 use std::io::Seek as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 
 use crate::control_plane::validate_package::ValidatedPackage;
@@ -84,6 +84,34 @@ impl Drop for StagedPackage {
             let _ = std::fs::remove_dir_all(root);
         }
     }
+}
+
+/// Removes stale staging directories left by a crash or a kept hand-off that
+/// was never cleaned up. Only directories directly under `dir` are
+/// considered; symlinks, files, and the root itself are left alone. Returns
+/// the number of directories removed; a missing root is not an error.
+pub fn sweep_older_than(dir: &Path, max_age: Duration) -> std::io::Result<usize> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .map(|modified| modified.elapsed().map(|age| age > max_age).unwrap_or(false))
+            .unwrap_or(false);
+        if stale && std::fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 /// Verifies the source against the validation verdict and extracts the
@@ -421,5 +449,35 @@ mod tests {
         let expected: [u8; 32] = Sha256DigestProvider.digest(PAYLOAD).expect("hash");
         assert_eq!(payload.sha256, expected);
         let _ = std::fs::remove_dir_all(&fixture.dir);
+    }
+
+    #[test]
+    fn sweep_removes_only_directories_older_than_the_bound() {
+        let root = std::env::temp_dir().join(format!(
+            "conductor-staging-sweep-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let stale = root.join("stale");
+        let fresh = root.join("fresh");
+        std::fs::create_dir_all(stale.join("nested")).expect("stale dir");
+        std::fs::create_dir_all(&fresh).expect("fresh dir");
+        std::fs::write(stale.join("payload"), b"stale").expect("stale payload");
+
+        let old = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+        std::fs::File::open(&stale)
+            .expect("stale dir must open")
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .expect("stale mtime must be set");
+        let removed =
+            sweep_older_than(&root, Duration::from_secs(60 * 60)).expect("sweep must succeed");
+
+        assert_eq!(removed, 1);
+        assert!(!stale.exists(), "stale staging dir must be removed");
+        assert!(fresh.is_dir(), "fresh staging dir must survive");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

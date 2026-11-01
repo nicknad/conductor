@@ -119,6 +119,8 @@ JSON file plus `CONDUCTOR_*` environment overrides produce an immutable
   (`storage_root`, `quarantine/`, `artifacts/`, `database/`, `staging/`) to
   owner-only permissions, and refuses a symlinked or world-writable existing
   root rather than silently adopting it.
+- Startup sweeps `quarantine/` and `staging/` entries older than their TTLs,
+  bounding space left by crashes and dropped requests.
 - `server::Host::assemble` validates the configuration, builds the validator
   from the trust store, creates the layout, opens and migrates one shared
   database, and wires the registry, durable rejection sink, bearer token,
@@ -136,6 +138,8 @@ configuration or key material.
 | `tls_cert_path` | `CONDUCTOR_TLS_CERT_PATH` | `tls/cert.pem` |
 | `tls_key_path` | `CONDUCTOR_TLS_KEY_PATH` | `tls/key.pem` |
 | `max_concurrent_uploads` | `CONDUCTOR_MAX_CONCURRENT_UPLOADS` | `8` |
+| `quarantine_ttl_secs` | `CONDUCTOR_QUARANTINE_TTL_SECS` | `3600` |
+| `staging_ttl_secs` | `CONDUCTOR_STAGING_TTL_SECS` | `3600` |
 | `api_token` | `CONDUCTOR_API_TOKEN` / `CONDUCTOR_API_TOKEN_FILE` | none (required) |
 | `trusted_keys` | `CONDUCTOR_TRUSTED_KEYS_FILE` | none (required) |
 
