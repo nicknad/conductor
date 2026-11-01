@@ -23,10 +23,10 @@
 | --- | --- | --- |
 | `incoming/` | Not built | No such directory and no URL ingestion; uploads stream straight into quarantine (`src/api/uploads.rs`) |
 | `quarantine/` | **Implemented** | `<storage_root>/quarantine`, `upload-<pid>-<nanos>-<counter>.zip`, `create_new`, guard deletes on every failure path (`src/storage/quarantine.rs`) |
-| `staging/` | **Partial** | `extract_verified` creates a caller-supplied root with `0700` permissions and drop-cleanup (`src/storage/staging.rs`); not invoked by the upload flow, no configured staging root, kept directories leak on crash — and see the conflict in §2 |
+| `staging/` | **Partial** | Configured at `storage_root/staging` (`Config::staging_dir`); `extract_verified` creates child roots with `0700` permissions and drop-cleanup (`src/storage/staging.rs`); not invoked by the upload flow, kept directories leak on crash — and see the conflict in §2 |
 | `artifacts/sha256/ab/<digest>/` | **Superseded** | Actual layout is `artifacts/{module_id}/{version}/{digest}.zip` (`src/config.rs`, `src/storage/artifact_store.rs`); the digest is the filename, not a pure digest fan-out, so identical digests are not shared across module versions |
-| `database/` | **Open** | No database; `ModuleRegistry` is in-memory, and its module docs say "Persistence is future work" (`src/modules/registry.rs`) |
-| `logs/` | **Open** | `tracing` to stderr only (`src/server.rs`); no log files, no durable audit |
+| `database/` | **Implemented** | SQLite at `storage_root/database/conductor.db`; the registry and rejection store share one migrated `Arc<Database>` (`src/modules/registry.rs`, `src/audit/store.rs`) |
+| `logs/` | **Partial** | `tracing` to stderr only (`src/server.rs`); package rejections are durable rows, but there are no log files and no full operator audit |
 
 ## 2. Area responsibilities and constraints
 
@@ -94,7 +94,7 @@ Genuinely open, in dependency order:
 2. **Staging execution invariant** — decide between "staging may host execution copies only after digest re-verification" (matches current code) and "execution always resolves artifact-store copies."
 3. **Activation, removal, and drain semantics** — persisted active version, reference counting, drain policy.
 4. **Retention, GC, and disk-pressure behavior** — wire the existing sweep, add artifact GC.
-5. **Trust key lifecycle** — on-disk key format, rotation, revocation, per-module authorization. Note that `server::run` currently refuses to start until this lands; the upload API is exercised through `router` in tests only.
+5. **Trust key lifecycle** — key rotation, revocation, and per-module authorization. Static operator configuration and startup trust-store assembly are implemented; what remains is lifecycle beyond a restart-only key set.
 6. **Download ingestion and SSRF model** — only if URL ingestion is still wanted.
 7. **Deduplication and refcounting** — resolvable only together with a layout change if pure digest-addressed storage is desired.
 8. **Backup/restore and durable audit.**
@@ -111,14 +111,15 @@ are independently shippable unless noted. Items 7 and 8 are planned in detail in
    exists but has no caller (`src/storage/quarantine.rs`), and staged
    directories leak when the host crashes mid-execution (`StagedPackage::keep`).
    A startup sweep makes "leaks bound themselves" true instead of aspirational.
-2. **Trusted-key loading so the binary can start.** `server::run` deliberately
-   refuses to serve until key loading lands (`src/server.rs`). Today the upload
-   API exists only inside tests; this is the largest distance between
-   "implemented" and "usable" that needs no new subsystem.
-3. **Explicit permissions on the artifact and quarantine roots.** Staging sets
-   `0700`; artifacts and quarantine rely on umask
-   (`src/storage/artifact_store.rs`). Align writable roots to owner-only and
-   refuse world-writable roots at startup.
+2. **Trusted-key loading so the binary can start.** **Implemented after this
+   audit:** `server::run` loads operator configuration, assembles the trust
+   store and shared database, and serves TLS-only; the upload API is reachable
+   outside tests (`tests/startup.rs` covers the wiring).
+3. **Explicit permissions on the artifact and quarantine roots.** **Implemented
+   after this audit:** `Config::ensure_layout` creates and tightens every
+   managed root to `0700` under `#[cfg(unix)]`. Remaining hardening: refuse
+   symlinked or world-writable pre-existing roots instead of silently
+   tightening them.
 4. **Directory fsync after promotion.** Promotion fsyncs the file but not the
    containing directory (`src/storage/artifact_store.rs`), so a crash can lose
    the name while the operation claimed success.

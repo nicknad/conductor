@@ -145,8 +145,8 @@ the real path is exercised.
 `src/config.rs` additions, all derived under the configured `storage_root`:
 
 - `database_path()` → `storage_root/database/conductor.db`
-- `staging_dir()` → `storage_root/staging` (the staging root is currently
-  caller-supplied and unconfigured)
+- `staging_dir()` → `storage_root/staging` (configured and created at startup
+  by `Config::ensure_layout`)
 - `quarantine_ttl`, `staging_ttl` for the sweeps
 
 ### 4.4 Schema v1
@@ -301,9 +301,9 @@ wait for the retention/GC work.
    `storage/database.rs` with the WAL/pragma policy and forward-only
    migrations, `ModuleRegistry::open` / `open_in_memory` whose records
    survive a reopen, `Config::database_path`, and a Rust CI workflow
-   (`fmt`, `clippy`, `test`, `cargo deny`). Wiring the store into
-   `server::run` happens with startup assembly (still gated on trust-key
-   loading).
+   (`fmt`, `clippy`, `test`, `cargo deny`). The store is wired into
+   `server::run` by `Host::assemble`, which shares one migrated database
+   between the registry and rejection store.
 3. **PR3 — rejection rows (implemented)**: DB sink
    (`src/audit/store.rs`), request-id plumbing, bounded detail.
    `RejectionRecorder::new()` stays tracing-only; `with_store` attaches
@@ -318,6 +318,7 @@ wait for the retention/GC work.
 
 - Rejection retention (the table is unbounded until then).
 - Full audit log (who/when for operator actions) beyond package rejections.
-- Artifact/quarantine permission hardening from audit item 3.
-- Trust-key loading (audit item 2) — a prerequisite for `server::run` to
-  actually serve, independent of this design.
+- Refusing symlinked or world-writable pre-existing storage roots; the managed
+  roots themselves are created/tightened to `0700` by `Config::ensure_layout`.
+- Trust-key lifecycle (rotation/revocation/per-module authorization); static
+  operator configuration and startup assembly are implemented.

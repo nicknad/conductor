@@ -32,12 +32,33 @@ src/
   modules/registry      Registered module versions (memory or SQLite); idempotent / conflict semantics
   storage/              Quarantine, artifact store, verified staging, SQLite connection + migrations
   executions/           Worker spawn + stdin/stdout IPC protocol + process-group teardown
-  audit/                Rejection-event taxonomy + recorder (tracing today, SQLite rows next)
+  audit/                Rejection-event taxonomy + recorder (tracing plus SQLite rows)
 ```
 
 Dependency direction: `api → control_plane → {packages, modules, storage}`;
 `executions` uses `packages` (digest, archive confinement) and `storage::staging`
 only. `packages` holds no lifecycle state and performs no directed writes.
+
+## Startup (`server::run`)
+
+Startup is fail-closed and ordered so a rejected configuration leaves no
+state behind:
+
+1. `Config::load` merges defaults, the `--config`/`CONDUCTOR_CONFIG` JSON
+   file, a token file, a trusted-keys file, and `CONDUCTOR_*` overrides.
+2. `Config::validate_for_startup` requires an operator token, usable bind,
+   timeout, slot count, and paths, and builds the trust store through
+   `Config::trust_store` (standard-base64, 32-byte Ed25519, unique key ids).
+3. The production validation policy must be ingestable; the validator is
+   built around the configured trust store (no skip-verification path).
+4. `Config::ensure_layout` creates/tightens `quarantine/`, `artifacts/`,
+   `database/`, and `staging/` under the storage root.
+5. One `Database` is opened and migrated; the module registry and rejection
+   store share it through `Arc`, so one connection owns the WAL/pragma policy.
+6. The assembled `Host` builds the router (configured bearer token, upload
+   slots, request timeout) and serves TLS-only on the configured bind.
+
+Failures at any step abort startup without binding a listener.
 
 ## Upload pipeline
 
@@ -137,11 +158,28 @@ stderr volume, and wall time are all bounded.
    unauthenticated, or saturated: refuse, never degrade.
 6. One rejection, one event; recording never changes a response.
 
+## Verification layers
+
+- **Example tests** (`tests/*.rs`, unit modules): exact status/body/cleanup
+  contracts, including startup assembly and a real TLS serve/upload round
+  trip.
+- **Property tests** (`tests/properties.rs`, `tests/upload_properties.rs`,
+  `proptest` blocks): generated inputs over bearer comparison, digest/hex,
+  canonical payload framing, archive path confinement, manifest bounds,
+  rejection-detail bounding, and arbitrary endpoint bodies/fields with
+  no-server-error, header, slot, and quarantine-cleanup oracles.
+- **Fuzzing** (`fuzz/`): libFuzzer targets for the HTTP upload endpoint, the
+  signed upload workflow, archive inspection, manifest parsing, and entry
+  paths. Oracles assert the same security invariants under arbitrary bytes.
+- **Mutation testing** (`mutants.toml`, `.github/workflows/mutants.yml`):
+  changed-code mutants gate pull requests; full runs publish survivors.
+- **DAST** (`tests/security/`, `.github/workflows/dast.yml`): builds the real
+  container, serves TLS-only, and runs OWASP ZAP's API scan with the operator
+  bearer attached.
+
 ## Not built yet
 
-Scheduler/triggering, CLI, startup assembly and operator trusted-key wiring
-(`server::run` refuses to serve until it lands — the API is exercised via
-`router` in tests), startup wiring of the durable rejection sink, startup
-reconciliation/leftover sweeps, artifact GC, and any execution-history or
-activation API beyond the persisted registry. `control_plane/lifecycle.rs` is
-currently a placeholder for deactivate/remove/rollback transitions.
+Scheduler/triggering, CLI, startup reconciliation/leftover sweeps, artifact
+GC, and any execution-history or activation API beyond the persisted
+registry. `control_plane/lifecycle.rs` is currently a placeholder for
+deactivate/remove/rollback transitions.

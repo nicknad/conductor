@@ -4,10 +4,10 @@
 > no API, no storage format, no CLI contract should be relied upon.
 
 > **Development is not finished:** this is an in-progress implementation, not a
-> complete job scheduler. Package ingestion and the worker execution library
-> exist, but host startup wiring, scheduling, lifecycle endpoints, execution
-> history, and the operator CLI are still outstanding. Do not treat it as a
-> finished or production-ready product.
+> complete job scheduler. Package ingestion, host startup wiring, and the
+> worker execution library exist, but scheduling, lifecycle endpoints,
+> execution history, and the operator CLI are still outstanding. Do not treat
+> it as a finished or production-ready product.
 
 A single-machine job execution platform supporting installing, validating, activating,
 updating, disabling, removing, and rolling back job plugin implementations **without
@@ -85,16 +85,20 @@ acceptance; `400` malformed, `401` unauthenticated (with the matching
 `WWW-Authenticate` challenge), `413` oversized, `422`
 semantically invalid, `503` saturated. Rejected bytes are deleted from
 quarantine (drop-guaranteed); accepted bytes are kept for the artifact
-store to promote. The binary still refuses to serve until operator
-trusted-key loading lands (`conductor::server::run` fails closed), so
-the API is exercised through `router` in `tests/upload_api.rs` (one
-test per hardening effort) and `tests/tls_only.rs`.
+store to promote. Startup loads operator configuration, builds the trust
+store, prepares the storage layout, opens and migrates the shared database,
+and only then binds the TLS listener (`conductor::server::run`). Any failure —
+bad configuration, unusable key material, non-ingestable policy, or a
+database/layout error — aborts before binding. `tests/startup.rs` drives that
+wiring end to end; `tests/upload_api.rs` and `tests/tls_only.rs` cover the
+API and transport hardening.
 
 ## Host configuration
 
-Configuration loading lives in `src/config.rs`; `server::run` will consume it
-when startup assembly lands. One JSON file plus `CONDUCTOR_*` environment
-overrides produce an immutable `Config`:
+Configuration loading lives in `src/config.rs` and is consumed at startup by
+`server::run`, which assembles the host and refuses to bind on any error. One
+JSON file plus `CONDUCTOR_*` environment overrides produce an immutable
+`Config`:
 
 - `--config <path>` (highest precedence) or `CONDUCTOR_CONFIG` selects the
   file; without either, built-in defaults apply.
@@ -113,6 +117,10 @@ overrides produce an immutable `Config`:
 - `Config::ensure_layout` creates and tightens the managed storage directories
   (`storage_root`, `quarantine/`, `artifacts/`, `database/`, `staging/`) to
   owner-only permissions.
+- `server::Host::assemble` validates the configuration, builds the validator
+  from the trust store, creates the layout, opens and migrates one shared
+  database, and wires the registry, durable rejection sink, bearer token,
+  timeout, and upload slots before `Host::serve` binds TLS.
 
 Example: [`config/conductor.example.json`](config/conductor.example.json).
 Its token and key are placeholders; generate your own and do not commit real
@@ -164,9 +172,10 @@ included), output bounds, and staged-file tamper detection at resolve time.
 
 - Active code: single-crate Rust modular monolith (`src/`, `tests/`).
 - In progress: package ingestion, validation, promotion, registry persistence,
-  and the worker execution library are implemented. Host startup wiring,
-  scheduler/triggering, lifecycle endpoints, execution history, and the
-  operator CLI are not built yet — see
+  startup assembly (configuration, trust store, storage layout, shared
+  database, durable rejection sink), and the worker execution library are
+  implemented. Scheduler/triggering, lifecycle endpoints, execution history,
+  and the operator CLI are not built yet — see
   [Not built yet](docs/architecture.md#not-built-yet).
 - Specification: [`docs/architecture.md`](docs/architecture.md) describes the
   Rust system as built. `docs/storage-reconciliation.md` and
@@ -194,8 +203,14 @@ tests/
   archive_security.rs       Archive security tests
   execution_worker.rs       Worker-process execution tests
   upload_api.rs             Upload API tests
+  upload_properties.rs      Generated endpoint input properties
+  properties.rs             Pure crypto/path/manifest properties
   tls_only.rs               TLS-only serving tests
   upload_workflow.rs        Upload workflow tests
+  startup.rs                Operator config → assembled host wiring tests
+  security/                 Container + OWASP ZAP DAST scan (see its README)
+fuzz/                       libFuzzer targets for endpoint and parsers
+.cargo/mutants.toml         Mutation-testing scope
 docs/                       Current architecture + background notes (see docs/README.md)
 .env.example                Environment variable template
 LICENSE                     Apache-2.0
@@ -211,6 +226,15 @@ LICENSE                     Apache-2.0
 cargo build
 cargo test
 python3 scripts/check_test_quality.py   # structural test checks (also run in CI)
+
+# Security-focused suites
+cargo test --test properties            # pure proptest invariants
+cargo test --test upload_properties     # generated endpoint inputs
+tests/security/scan.sh                  # container + OWASP ZAP API scan
+
+# Optional heavy checks (also automated in CI)
+cargo +nightly fuzz build               # libFuzzer targets under fuzz/
+cargo mutants --in-diff <diff>          # mutation testing (mutants.toml)
 ```
 
 ## License
