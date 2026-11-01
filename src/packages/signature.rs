@@ -54,6 +54,12 @@ impl TrustedSigningKey {
 /// interpretation; verifiers accept only listed versions.
 pub const SUPPORTED_SIGNATURE_FORMAT_VERSION: u16 = 1;
 
+/// Maximum accepted length of a trusted-key id. Operator configuration and
+/// the HTTP `key_id` field share this bound so every configured key is
+/// addressable by an upload and a config typo cannot create an id the API
+/// can never name.
+pub const MAX_KEY_ID_BYTES: usize = 256;
+
 /// Parsed detached-signature envelope: proves the exact package bytes match
 /// what the holder of `key_id` signed. The envelope itself is validated —
 /// arbitrary bytes are never treated as a signature.

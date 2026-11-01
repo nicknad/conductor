@@ -23,7 +23,7 @@ use base64::prelude::*;
 use serde::Deserialize;
 
 use crate::packages::signature::{
-    ConfiguredTrustedKeys, SignatureAlgorithm, TrustStoreError, TrustedSigningKey,
+    ConfiguredTrustedKeys, SignatureAlgorithm, TrustStoreError, TrustedSigningKey, MAX_KEY_ID_BYTES,
 };
 
 const ENV_CONFIG: &str = "CONDUCTOR_CONFIG";
@@ -55,15 +55,25 @@ pub struct TrustedKeyConfig {
 
 impl TrustedKeyConfig {
     /// Converts the operator-facing record into the runtime key type.
-    /// The key id must be non-empty, the public key must be standard base64
-    /// over exactly 32 raw bytes (the Ed25519 key size), and the algorithm
-    /// is the closed [`SignatureAlgorithm`] enum. Failures include the
-    /// offending field but never echo key material.
+    /// The key id is trimmed to the same form the HTTP `key_id` field is
+    /// trimmed to, so a configured key can always be selected and
+    /// whitespace cannot create a duplicate-looking id that is unreachable.
+    /// It must be non-empty and fit [`MAX_KEY_ID_BYTES`]; the public key must
+    /// be standard base64 over exactly 32 raw bytes (the Ed25519 key size),
+    /// and the algorithm is the closed [`SignatureAlgorithm`] enum. Failures
+    /// include the offending field but never echo key material.
     fn to_signing_key(&self) -> Result<TrustedSigningKey, ConfigError> {
-        if self.key_id.trim().is_empty() {
+        let key_id = self.key_id.trim();
+        if key_id.is_empty() {
             return Err(ConfigError::Invalid {
                 field: "trusted_keys.key_id",
                 reason: "must not be empty".to_owned(),
+            });
+        }
+        if key_id.len() > MAX_KEY_ID_BYTES {
+            return Err(ConfigError::Invalid {
+                field: "trusted_keys.key_id",
+                reason: format!("must be at most {MAX_KEY_ID_BYTES} bytes"),
             });
         }
         let public_key = BASE64_STANDARD
@@ -82,7 +92,7 @@ impl TrustedKeyConfig {
             });
         }
         Ok(TrustedSigningKey::new(
-            self.key_id.clone(),
+            key_id.to_owned(),
             self.algorithm,
             public_key,
         ))
@@ -251,6 +261,17 @@ impl Config {
             return Err(ConfigError::Invalid {
                 field: "max_concurrent_uploads",
                 reason: "must be greater than zero".to_owned(),
+            });
+        }
+        // `Semaphore::new` panics above its own permit ceiling; keep an
+        // absurd configuration value a startup error instead of a panic.
+        if self.max_concurrent_uploads > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(ConfigError::Invalid {
+                field: "max_concurrent_uploads",
+                reason: format!(
+                    "must be at most {} (semaphore permit ceiling)",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                ),
             });
         }
         if self.storage_root.as_os_str().is_empty() {
@@ -766,6 +787,61 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_padded_key_ids_are_trimmed_to_the_http_selectable_form() {
+        let mut config = startup_ready_config();
+        config.trusted_keys[0].key_id = "  k1 \n".to_owned();
+
+        let store = config
+            .trust_store()
+            .expect("surrounding whitespace must not make the key unusable");
+        assert!(
+            store.key("k1").is_some(),
+            "the HTTP key_id is trimmed before lookup"
+        );
+        assert!(store.key("  k1 \n").is_none());
+    }
+
+    #[test]
+    fn whitespace_variants_of_one_key_id_are_duplicates_after_trimming() {
+        let mut config = startup_ready_config();
+        let mut duplicate = config.trusted_keys[0].clone();
+        duplicate.key_id = " k1 ".to_owned();
+        config.trusted_keys.push(duplicate);
+
+        assert!(matches!(
+            config.trust_store(),
+            Err(ConfigError::Invalid {
+                field: "trusted_keys.key_id",
+                ref reason,
+            }) if reason.contains("duplicate")
+        ));
+    }
+
+    #[test]
+    fn overlong_key_ids_are_rejected_at_startup() {
+        let mut config = startup_ready_config();
+        config.trusted_keys[0].key_id = "k".repeat(MAX_KEY_ID_BYTES + 1);
+
+        assert!(matches!(
+            config.validate_for_startup(),
+            Err(ConfigError::Invalid {
+                field: "trusted_keys.key_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn key_id_at_the_byte_bound_is_accepted() {
+        let mut config = startup_ready_config();
+        config.trusted_keys[0].key_id = "k".repeat(MAX_KEY_ID_BYTES);
+
+        config
+            .validate_for_startup()
+            .expect("exactly MAX_KEY_ID_BYTES is selectable through the HTTP field");
+    }
+
+    #[test]
     fn duplicate_trusted_key_ids_are_rejected() {
         let mut config = startup_ready_config();
         let mut duplicate = config.trusted_keys[0].clone();
@@ -1019,6 +1095,33 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn upload_slots_above_the_semaphore_ceiling_are_rejected() {
+        let config = Config {
+            max_concurrent_uploads: tokio::sync::Semaphore::MAX_PERMITS.saturating_add(1),
+            ..startup_ready_config()
+        };
+        assert!(matches!(
+            config.validate_for_startup(),
+            Err(ConfigError::Invalid {
+                field: "max_concurrent_uploads",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn upload_slots_at_the_semaphore_ceiling_are_accepted() {
+        let config = Config {
+            max_concurrent_uploads: tokio::sync::Semaphore::MAX_PERMITS,
+            ..startup_ready_config()
+        };
+
+        config
+            .validate_for_startup()
+            .expect("the semaphore ceiling itself is valid");
     }
 
     #[test]
