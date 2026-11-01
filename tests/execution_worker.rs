@@ -384,7 +384,10 @@ async fn cancellation_terminates_the_worker() {
 #[tokio::test]
 async fn early_exit_is_a_worker_error_with_the_exit_status() {
     let scratch = Scratch::new("early-exit");
-    let target = resolved_target(&scratch, "#!/bin/sh\nexit 7\n");
+    // Read the request before exiting. Exiting before the host writes it
+    // races with the broken-pipe path and intermittently surfaces a
+    // protocol/I/O error instead of the clean "exit code 7" worker error.
+    let target = resolved_target(&scratch, "#!/bin/sh\nread -r line\nexit 7\n");
     let report = WorkerExecutor::new(ExecutionLimits::default())
         .execute(&target, request(Duration::from_secs(10)))
         .await
