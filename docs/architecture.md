@@ -98,9 +98,11 @@ Failures at any step abort startup without binding a listener.
 Every refusal handled by `post_package` or `require_bearer` produces
 exactly one structured `RejectionEvent` (stage, caller-facing code,
 internal detail, attribution-so-far) via `audit/`, as a tracing event
-plus one `package_rejections` row. Responses produced before the handler
-runs (extractor rejections, tower timeout/body-limit/panic pages) are not
-audited. Quarantine bytes are deleted on failure.
+plus one `package_rejections` row. The route's transport mapper also
+audits and JSON-renders multipart-extractor 400s and body-limit 413s.
+Tower timeout 503, panic 500, and hyper's own 431 pages still bypass the
+mapper. Quarantine bytes are deleted on failure, including when the
+request future is dropped after streaming.
 
 ## Storage layout (`storage_root`, default `data/`)
 

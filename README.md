@@ -76,9 +76,10 @@ Transport security, all fail-closed with no opt-outs:
   queueing). Oversized header sections are rejected at the hyper socket
   layer; slow bodies are bounded by the total per-request timeout.
 - **Silent responses.** No `Server`/`Via`/`X-Powered-By` identity
-  headers; `nosniff`, `DENY` framing, `no-referrer`, `no-store`, and a
-  server-generated `x-request-id` on every response; panics become a bare
-  `500`; error bodies are `{code, message}` only.
+  headers; `nosniff`, `DENY` framing, `no-referrer`, `same-origin` CORP,
+  `no-store, no-cache, must-revalidate`, and a server-generated
+  `x-request-id` on every response; panics become a bare `500`; error bodies
+  are `{code, message}` only.
 
 Responses: `201` with `{module_id, version, digest, signer_key_id}` on
 acceptance; `400` malformed, `401` unauthenticated (with the matching
@@ -116,7 +117,8 @@ JSON file plus `CONDUCTOR_*` environment overrides produce an immutable
   size, and non-empty unique key ids.
 - `Config::ensure_layout` creates and tightens the managed storage directories
   (`storage_root`, `quarantine/`, `artifacts/`, `database/`, `staging/`) to
-  owner-only permissions.
+  owner-only permissions, and refuses a symlinked or world-writable existing
+  root rather than silently adopting it.
 - `server::Host::assemble` validates the configuration, builds the validator
   from the trust store, creates the layout, opens and migrates one shared
   database, and wires the registry, durable rejection sink, bearer token,

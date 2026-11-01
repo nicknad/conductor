@@ -77,10 +77,10 @@ pub enum RejectionStage {
 | `post_package` (`src/api/uploads.rs`) | multipart shape, streaming, timeout, validation stages, promotion, registration conflict |
 | `require_bearer` (`src/api/uploads.rs`) | 401 unauthenticated |
 
-Typed events record the error's stable code. Responses produced before the
-handler runs (wrong content type rejected by the multipart extractor, tower
-timeout 503 / body-limit 413 / panic 500 pages, hyper's own 431) are not
-audited: there is no fallback middleware.
+Typed events record the error's stable code. The route's transport mapper
+audits and JSON-renders multipart-extractor 400s and body-limit 413s; tower
+timeout 503, panic 500, and hyper's own 431 pages still bypass the handler
+and its mapper.
 
 Two rules encode behavior that would otherwise erode:
 
@@ -318,7 +318,5 @@ wait for the retention/GC work.
 
 - Rejection retention (the table is unbounded until then).
 - Full audit log (who/when for operator actions) beyond package rejections.
-- Refusing symlinked or world-writable pre-existing storage roots; the managed
-  roots themselves are created/tightened to `0700` by `Config::ensure_layout`.
 - Trust-key lifecycle (rotation/revocation/per-module authorization); static
   operator configuration and startup assembly are implemented.

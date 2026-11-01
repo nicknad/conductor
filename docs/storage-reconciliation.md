@@ -117,9 +117,8 @@ are independently shippable unless noted. Items 7 and 8 are planned in detail in
    outside tests (`tests/startup.rs` covers the wiring).
 3. **Explicit permissions on the artifact and quarantine roots.** **Implemented
    after this audit:** `Config::ensure_layout` creates and tightens every
-   managed root to `0700` under `#[cfg(unix)]`. Remaining hardening: refuse
-   symlinked or world-writable pre-existing roots instead of silently
-   tightening them.
+   managed root to `0700` under `#[cfg(unix)]`, and refuses symlinked or
+   world-writable pre-existing roots rather than silently tightening them.
 4. **Directory fsync after promotion.** Promotion fsyncs the file but not the
    containing directory (`src/storage/artifact_store.rs`), so a crash can lose
    the name while the operation claimed success.
