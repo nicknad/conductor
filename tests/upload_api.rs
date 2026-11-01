@@ -823,6 +823,13 @@ async fn missing_key_after_package_discards_quarantine() {
         0,
         "a field failure after streaming must delete the quarantine file"
     );
+    let rows = rejection_rows(&state);
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].key_id.is_none(), "no key id was supplied");
+    assert!(
+        rows[0].byte_count.is_some(),
+        "streamed bytes must be attributed"
+    );
     cleanup(&state.quarantine_dir);
 }
 
@@ -854,6 +861,13 @@ async fn missing_signature_discards_quarantine() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(json["code"], "missing_signature");
     assert_eq!(quarantine_zip_count(&state.quarantine_dir), 0);
+    let rows = rejection_rows(&state);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].key_id.as_deref(), Some("k1"));
+    assert!(
+        rows[0].byte_count.is_some(),
+        "streamed bytes must be attributed"
+    );
     cleanup(&state.quarantine_dir);
 }
 
@@ -870,6 +884,10 @@ async fn invalid_base64_signature_discards_quarantine() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(json["code"], "invalid_signature_encoding");
     assert_eq!(quarantine_zip_count(&state.quarantine_dir), 0);
+    let rows = rejection_rows(&state);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].key_id.as_deref(), Some("k1"));
+    assert!(rows[0].byte_count.is_some());
     cleanup(&state.quarantine_dir);
 }
 
@@ -1022,9 +1040,9 @@ async fn bearer_auth_runs_before_the_body_limit() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    // Authenticated: the limit responds, and transport rejections still carry
-    // the request id and security headers.
-    let (status, headers, _) = send_upload(
+    // Authenticated: the limit responds with the JSON contract, the full
+    // security-header set, and one durable transport audit row.
+    let (status, headers, bytes) = send_upload(
         &state,
         Body::from(body),
         Some("test-bearer-upload"),
@@ -1032,9 +1050,48 @@ async fn bearer_auth_runs_before_the_body_limit() {
     )
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-    assert!(headers.contains_key("x-request-id"));
-    assert!(headers.contains_key("strict-transport-security"));
-    assert!(headers.contains_key("x-content-type-options"));
+    assert_security_headers(&headers);
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("body must be JSON");
+    assert_eq!(json["code"], "payload_too_large");
+    let rows = rejection_rows(&state);
+    assert_eq!(
+        rows.len(),
+        2,
+        "the earlier 401 and the limited 413 must each be audited once"
+    );
+    let body_limit_row = rows.last().expect("413 row must exist");
+    assert_eq!(body_limit_row.stage, "transport");
+    assert_eq!(body_limit_row.code, "payload_too_large");
+    assert!(body_limit_row.request_id.is_some());
+    cleanup(&state.quarantine_dir);
+    cleanup(&state.artifact_dir);
+}
+
+#[tokio::test]
+async fn missing_multipart_content_type_is_json_and_audited() {
+    let state = test_state(PackageValidationPolicy::production(), "extractor-json");
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/packages")
+        .header("authorization", "Bearer test-bearer-upload")
+        .body(Body::from(golden_body(&golden_package_bytes())))
+        .expect("request must build");
+    let response = router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("router must respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body must read");
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("body must be JSON");
+    assert_eq!(json["code"], "invalid_multipart");
+    let rows = rejection_rows(&state);
+    assert_eq!(rows.len(), 1, "extractor refusal must be audited once");
+    assert_eq!(rows[0].stage, "multipart");
+    assert_eq!(rows[0].code, "invalid_multipart");
+    assert_eq!(quarantine_zip_count(&state.quarantine_dir), 0);
     cleanup(&state.quarantine_dir);
     cleanup(&state.artifact_dir);
 }

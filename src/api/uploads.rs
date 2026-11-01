@@ -38,7 +38,7 @@
 //! tracing-only recorder. Status codes and bodies are unchanged by
 //! recording.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -240,6 +240,23 @@ impl UploadFailure {
             digest: None,
             byte_count: None,
         })
+    }
+
+    /// Adds attribution that became known after the failure was created
+    /// (for example the package byte count once streaming completed).
+    /// Existing values win.
+    fn with_attribution(
+        mut self: Box<Self>,
+        key_id: Option<String>,
+        byte_count: Option<u64>,
+    ) -> Box<Self> {
+        if self.key_id.is_none() {
+            self.key_id = key_id;
+        }
+        if self.byte_count.is_none() {
+            self.byte_count = byte_count;
+        }
+        self
     }
 
     fn respond(self, recorder: &RejectionRecorder, request_id: Option<String>) -> Response {
@@ -491,6 +508,7 @@ async fn process_upload(
                     "multipart field `key_id` is required".to_owned(),
                 ),
             )
+            .with_attribution(None, package_bytes)
         })?;
     let signature_text = signature_text.ok_or_else(|| {
         UploadFailure::from_api(
@@ -500,6 +518,7 @@ async fn process_upload(
                 "multipart field `signature` is required".to_owned(),
             ),
         )
+        .with_attribution(Some(key_id.clone()), package_bytes)
     })?;
     let signature_bytes = BASE64_STANDARD.decode(signature_text.trim()).map_err(|e| {
         UploadFailure::from_api(
@@ -509,6 +528,7 @@ async fn process_upload(
                 format!("signature is not valid base64: {e}"),
             ),
         )
+        .with_attribution(Some(key_id.clone()), package_bytes)
     })?;
     // The write handle was closed by the streaming helper before the path
     // was stored, so validation opens the quarantined file itself with no
@@ -523,6 +543,12 @@ async fn process_upload(
             ),
         ));
     };
+    // A second guard covers the window between `keep()` and the final
+    // response. If the handler future is dropped (client disconnect or the
+    // outer timeout layer), no error branch runs and the streaming guard is
+    // already disarmed; this guard still deletes the file.
+    let kept = KeptQuarantine::new(path);
+    let path = kept.path().to_path_buf();
     let audit_key_id = key_id.clone();
     let audit_key_id_outer = key_id.clone();
     let envelope = PackageSignature {
@@ -665,23 +691,22 @@ async fn process_upload(
     })?;
 
     match outcome {
-        Ok(verdict) => Ok((
-            StatusCode::CREATED,
-            Json(UploadResponse {
-                module_id: verdict.artifact().module_id().to_owned(),
-                version: verdict.artifact().version().to_owned(),
-                digest: verdict.artifact().digest().to_hex(),
-                signer_key_id: verdict.signer().key_id.clone(),
-            }),
-        )
-            .into_response()),
-        Err(failure) => {
-            // Validation failures already carry their internal reason for
-            // the audit record; promotion failures already discarded their
-            // quarantine file. Best-effort discard covers both (idempotent).
-            crate::storage::quarantine::discard(&path);
-            Err(failure)
+        Ok(verdict) => {
+            // Promotion consumed the quarantine file; disarm the drop guard
+            // so cleanup is not attempted after a successful response.
+            kept.keep();
+            Ok((
+                StatusCode::CREATED,
+                Json(UploadResponse {
+                    module_id: verdict.artifact().module_id().to_owned(),
+                    version: verdict.artifact().version().to_owned(),
+                    digest: verdict.artifact().digest().to_hex(),
+                    signer_key_id: verdict.signer().key_id.clone(),
+                }),
+            )
+                .into_response())
         }
+        Err(failure) => Err(failure),
     }
 }
 
@@ -716,6 +741,40 @@ impl QuarantineGuard {
 }
 
 impl Drop for QuarantineGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            crate::storage::quarantine::discard(&path);
+        }
+    }
+}
+
+/// Owns a quarantine path after streaming has finished. The [`QuarantineGuard`]
+/// can only cover the streaming phase (it is disarmed by `keep`), but the
+/// handler future can still be dropped while validation runs. This guard
+/// deletes the file on drop unless the success path disarms it, so
+/// cancellation and outer timeouts cannot leak quarantine bytes.
+struct KeptQuarantine {
+    path: Option<PathBuf>,
+}
+
+impl KeptQuarantine {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> &Path {
+        self.path
+            .as_deref()
+            .expect("kept quarantine is armed until `keep`")
+    }
+
+    /// Disarms the guard, leaving the file in place.
+    fn keep(mut self) {
+        self.path.take();
+    }
+}
+
+impl Drop for KeptQuarantine {
     fn drop(&mut self) {
         if let Some(path) = self.path.take() {
             crate::storage::quarantine::discard(&path);
@@ -893,6 +952,35 @@ mod tests {
                 "must reject {bad:?} as non-canonical"
             );
         }
+    }
+
+    #[test]
+    fn kept_quarantine_deletes_on_drop_and_keeps_when_disarmed() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "conductor-kept-quarantine-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("test dir must be created");
+
+        let dropped = dir.join("dropped.zip");
+        std::fs::write(&dropped, b"quarantine").expect("file must be writable");
+        {
+            let _guard = KeptQuarantine::new(dropped.clone());
+        }
+        assert!(!dropped.exists(), "drop must delete the quarantined file");
+
+        let kept_path = dir.join("kept.zip");
+        std::fs::write(&kept_path, b"quarantine").expect("file must be writable");
+        let guard = KeptQuarantine::new(kept_path.clone());
+        assert_eq!(guard.path(), kept_path.as_path());
+        guard.keep();
+        assert!(kept_path.exists(), "an explicitly kept file must survive");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     proptest! {

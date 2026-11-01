@@ -31,10 +31,10 @@
 
 use std::time::Duration;
 
-use axum::extract::{DefaultBodyLimit, Request};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -44,8 +44,10 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::api::errors::ApiError;
 use crate::api::uploads::{post_package, require_bearer, AppState};
 use crate::api::PACKAGE_UPLOAD_PATH;
+use crate::audit::event::{RejectionEvent, RejectionStage};
 
 /// Multipart framing slack over the policy package bound for the outer
 /// body limit. The handler's streaming check remains authoritative; this
@@ -79,8 +81,14 @@ pub fn router(state: AppState) -> Router {
             post(post_package)
                 // Added first, so bearer auth below stays outermost: an
                 // unauthenticated caller cannot probe or reach the body
-                // limit and parser.
+                // limit and parser. The mapper sits between auth and the
+                // limit so layer/extractor refusals are still recorded and
+                // rendered as the JSON error contract.
                 .route_layer(RequestBodyLimitLayer::new(max_body))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    map_transport_rejection,
+                ))
                 .route_layer(middleware::from_fn_with_state(
                     state.clone(),
                     require_bearer,
@@ -136,6 +144,54 @@ pub fn router(state: AppState) -> Router {
 async fn strip_client_request_id(mut request: Request, next: Next) -> Response {
     request.headers_mut().remove("x-request-id");
     next.run(request).await
+}
+
+/// Rewrites refusals produced before the handler (extractor rejection and
+/// `RequestBodyLimitLayer`) into the API's JSON error contract and records
+/// them once. Handler refusals are already JSON and were already recorded by
+/// `post_package`, so they pass through untouched.
+async fn map_transport_rejection(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let response = next.run(request).await;
+    let status = response.status();
+    if status != StatusCode::BAD_REQUEST && status != StatusCode::PAYLOAD_TOO_LARGE {
+        return response;
+    }
+    let already_json = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    if already_json {
+        return response;
+    }
+
+    let (stage, api) = if status == StatusCode::PAYLOAD_TOO_LARGE {
+        (
+            RejectionStage::Transport,
+            ApiError::PayloadTooLarge("request body exceeds the allowed size".to_owned()),
+        )
+    } else {
+        (
+            RejectionStage::Multipart,
+            ApiError::BadRequest(
+                "invalid_multipart",
+                "malformed multipart/form-data request".to_owned(),
+            ),
+        )
+    };
+    state
+        .recorder
+        .record(&RejectionEvent::new(stage, api.code(), api.message()).with_request_id(request_id));
+    api.into_response()
 }
 
 async fn healthz() -> &'static str {
