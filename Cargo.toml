@@ -31,5 +31,5 @@ libc = "0.2"
 [dev-dependencies]
 proptest = "1"
 rcgen = "0.14.10"
-serial_test = "3"
+serial_test = "4"
 tokio-rustls = "0.26"
