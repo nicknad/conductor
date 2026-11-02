@@ -32,7 +32,11 @@ without command output or a concrete artifact to support it.
    - `cargo test`
    - `python3 scripts/check_test_quality.py`
    - any task-specific test or scan
-6. When a command fails, report the failure and either fix it or say the task
+6. Keep tests scoped and fast: put branch coverage in unit/service tests, keep
+   at most one end-to-end test per slice, and use `#[serial(group)]` only for
+   tests that actually spawn processes. Report the isolated runtime of any new
+   test over roughly 2 seconds and distinguish real work from serial-lock wait.
+7. When a command fails, report the failure and either fix it or say the task
    is incomplete. Do not summarize a red run as green.
 
 ## Evidence rules

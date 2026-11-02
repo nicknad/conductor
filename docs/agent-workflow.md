@@ -43,6 +43,31 @@ parsing, filesystem or artifact paths, process spawning, secrets, audit, or
 persistence. Its FAIL or unexplained HIGH finding blocks completion even when
 functional criteria pass.
 
+## Test cost and scope
+
+Keep the system under test visible in the test layout:
+
+- Put branch and contract coverage in unit or service tests. Keep at most one
+  true end-to-end test per vertical slice; do not re-run upload → activate →
+  execute in every read-only branch test. Seed registry/history state directly
+  when the test is about a read path.
+- Use `#[serial(group)]` only for tests that actually spawn processes and can
+  race exec/write. Never blanket-serialize an entire integration file; a
+  read-only test waiting behind a 3-second timeout test is not 3 seconds of
+  work.
+- Implementation inner loop: `cargo test --lib` plus the impacted integration
+  target. Before commit, run the full default gates above.
+- Verification runs each new test in isolation and in the full suite, and
+  reports actual body time separately from serial-lock wait. Investigate any
+  test over roughly 2 seconds and say whether it is inherently timed, broad
+  e2e, or accidental.
+- When the suite grows, produce a slow-test table with
+  `cargo +nightly test -- -Z unstable-options --report-time` (or an equivalent
+  timing tool) and use it to decide what to split or seed directly.
+- Mutation runs use `--in-diff` for the changed slice and a scratch directory
+  on a filesystem with room for a full tree copy; excluded build directories
+  must not be copied into the mutation workspace.
+
 ## Adaptation log
 
 The orchestration agent updates this section when evidence shows the workflow
@@ -78,3 +103,12 @@ is insufficient. Each entry names the observed failure and the process change.
   `AppState` fields broke the fuzz target and would have failed CI. Endpoint
   changes now must compile fuzz targets and run a short fuzz smoke as part of
   the gate, not only `cargo test`.
+- **2026-11-02 — test cost is measured, not guessed.** A timing audit of the
+  execution-history slice found 11.8s of test execution: `execution_worker`
+  6.46s (targeted process/timing tests), `execution_api` 3.68s (broad e2e,
+  dominated by a 3.14s timeout test), while the history unit suite ran in
+  0.09s and the history API tests took 0.11–0.39s in isolation. The 3.2s
+  per-history-test figure in the full report was serial-lock wait, not work.
+  New tests are now classified as unit/service/e2e, new tests are timed both
+  alone and in the full suite, and `#[serial]` is limited to named
+  process-spawning groups instead of whole files.

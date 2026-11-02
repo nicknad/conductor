@@ -36,6 +36,11 @@ not modify repository files.
    Read-only probes may use temporary files outside the repository.
 6. Check that tests would actually fail on regression: identify tautologies,
    tests that only assert setup, and claims not covered by a test.
+7. Measure test scope and cost. Classify the new tests as unit, service, or
+   end-to-end; run each new test alone and in the full suite. Report wall time
+   separately from serial-lock wait, and flag any test over roughly 2 seconds
+   that is not inherently timed (deadline/process teardown). Do not accept a
+   broad e2e test as proof of an unrelated narrow branch.
 
 ## Verdict rules
 
@@ -56,5 +61,7 @@ if individual criteria pass.
 2. **Environment** — commit/working-tree state and commands run.
 3. **Criteria table** — criterion, verdict, evidence (command + result).
 4. **Adversarial probes** — what you tried to break and what happened.
-5. **Findings** — CRITICAL/HIGH/MEDIUM/LOW with file:line.
-6. **What would change the verdict** — concrete missing evidence.
+5. **Test scope and timing** — unit/service/e2e classification, isolated
+   runtime, full-suite runtime, and any serial-wait explanation.
+6. **Findings** — CRITICAL/HIGH/MEDIUM/LOW with file:line.
+7. **What would change the verdict** — concrete missing evidence.

@@ -51,6 +51,10 @@ their evidence, and change the process when the evidence shows it is weak.
    - Any FAIL: send the failing evidence back for a scoped fix.
    - Any UNPROVEN: either add a probe/test, narrow the claim, or mark the task
      incomplete. Never promote UNPROVEN to PASS by argument.
+   - Check test scope and cost: new branch coverage belongs in unit/service
+     tests, with at most one true e2e per slice; a reported duration that is
+     actually serial-lock wait is not work. Investigate new tests over roughly
+     2 seconds unless they are inherently timed.
    - All PASS and no unexplained HIGH/CRITICAL security finding: run a final
      independent gate yourself before declaring done.
 6. **Adapt** — update this workflow when reality disagrees with it. Examples:
