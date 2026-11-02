@@ -35,6 +35,9 @@ const ENV_TLS_KEY_PATH: &str = "CONDUCTOR_TLS_KEY_PATH";
 const ENV_MAX_CONCURRENT_UPLOADS: &str = "CONDUCTOR_MAX_CONCURRENT_UPLOADS";
 const ENV_QUARANTINE_TTL_SECS: &str = "CONDUCTOR_QUARANTINE_TTL_SECS";
 const ENV_STAGING_TTL_SECS: &str = "CONDUCTOR_STAGING_TTL_SECS";
+const ENV_ALLOWED_RUNTIMES: &str = "CONDUCTOR_ALLOWED_RUNTIMES";
+const ENV_MAX_EXECUTION_DEADLINE_SECS: &str = "CONDUCTOR_MAX_EXECUTION_DEADLINE_SECS";
+const ENV_MAX_CONCURRENT_EXECUTIONS: &str = "CONDUCTOR_MAX_CONCURRENT_EXECUTIONS";
 // Environment variable names, not credentials.
 // nosemgrep: generic.hardcoded-secret
 const ENV_API_TOKEN: &str = "CONDUCTOR_API_TOKEN";
@@ -110,7 +113,10 @@ pub struct Config {
     pub http_bind: String,
     pub storage_root: PathBuf,
     /// Per-request timeout in seconds, enforced by the HTTP timeout layer
-    /// and the blocking validation task.
+    /// and the blocking validation task. It includes request preparation as
+    /// well as the worker run, and must exceed
+    /// `max_execution_deadline_secs` plus the worker termination grace so a
+    /// request cannot time out while its worker is still being reaped.
     pub request_timeout_secs: u64,
     /// PEM certificate and private key for the TLS-only listener. There is
     /// deliberately no plaintext option: this service never serves HTTP.
@@ -123,6 +129,16 @@ pub struct Config {
     pub quarantine_ttl_secs: u64,
     /// Age after which a leftover staging directory is removed at startup.
     pub staging_ttl_secs: u64,
+    /// Runtime names that activation and execution may run. Non-empty
+    /// metadata filter, not a sandbox; checked again by `ActivationPolicy`
+    /// when the host assembles.
+    pub allowed_runtimes: Vec<String>,
+    /// Host ceiling for any requested execution deadline. An omitted request
+    /// deadline defaults to 30 seconds clamped down to this value.
+    pub max_execution_deadline_secs: u64,
+    /// Maximum simultaneous worker processes. Excess requests fail fast
+    /// with `503` instead of queueing.
+    pub max_concurrent_executions: usize,
     /// Operator bearer token. Secret: never logged, never serialized into
     /// error messages. `None` is only valid before startup validation.
     pub api_token: Option<String>,
@@ -136,12 +152,15 @@ impl Default for Config {
         Self {
             http_bind: "127.0.0.1:8080".to_owned(),
             storage_root: PathBuf::from("data"),
-            request_timeout_secs: 30,
+            request_timeout_secs: 360,
             tls_cert_path: PathBuf::from("tls/cert.pem"),
             tls_key_path: PathBuf::from("tls/key.pem"),
             max_concurrent_uploads: 8,
             quarantine_ttl_secs: 60 * 60,
             staging_ttl_secs: 60 * 60,
+            allowed_runtimes: vec!["rust".to_owned()],
+            max_execution_deadline_secs: 300,
+            max_concurrent_executions: 4,
             api_token: None,
             trusted_keys: Vec::new(),
         }
@@ -159,6 +178,12 @@ impl fmt::Debug for Config {
             .field("max_concurrent_uploads", &self.max_concurrent_uploads)
             .field("quarantine_ttl_secs", &self.quarantine_ttl_secs)
             .field("staging_ttl_secs", &self.staging_ttl_secs)
+            .field("allowed_runtimes", &self.allowed_runtimes)
+            .field(
+                "max_execution_deadline_secs",
+                &self.max_execution_deadline_secs,
+            )
+            .field("max_concurrent_executions", &self.max_concurrent_executions)
             .field("api_token", &self.api_token.as_ref().map(|_| "[redacted]"))
             .field("trusted_keys", &self.trusted_keys)
             .finish()
@@ -221,6 +246,15 @@ impl Config {
             if let Some(value) = file.staging_ttl_secs {
                 config.staging_ttl_secs = value;
             }
+            if let Some(value) = file.allowed_runtimes {
+                config.allowed_runtimes = normalize_runtimes(value);
+            }
+            if let Some(value) = file.max_execution_deadline_secs {
+                config.max_execution_deadline_secs = value;
+            }
+            if let Some(value) = file.max_concurrent_executions {
+                config.max_concurrent_executions = value;
+            }
             if let Some(value) = file.trusted_keys {
                 config.trusted_keys = value;
             }
@@ -251,6 +285,15 @@ impl Config {
         }
         if let Some(value) = env_parse(&env, ENV_STAGING_TTL_SECS)? {
             config.staging_ttl_secs = value;
+        }
+        if let Some(value) = env.get(ENV_ALLOWED_RUNTIMES) {
+            config.allowed_runtimes = parse_runtime_env(value);
+        }
+        if let Some(value) = env_parse(&env, ENV_MAX_EXECUTION_DEADLINE_SECS)? {
+            config.max_execution_deadline_secs = value;
+        }
+        if let Some(value) = env_parse(&env, ENV_MAX_CONCURRENT_EXECUTIONS)? {
+            config.max_concurrent_executions = value;
         }
         if let Some(path) = env.get(ENV_TRUSTED_KEYS_FILE) {
             let path = Path::new(path);
@@ -295,6 +338,66 @@ impl Config {
             return Err(ConfigError::Invalid {
                 field: "staging_ttl_secs",
                 reason: "must be greater than zero".to_owned(),
+            });
+        }
+        if self.allowed_runtimes.is_empty() {
+            return Err(ConfigError::Invalid {
+                field: "allowed_runtimes",
+                reason: "must not be empty".to_owned(),
+            });
+        }
+        if self
+            .allowed_runtimes
+            .iter()
+            .any(|runtime| runtime.trim().is_empty())
+        {
+            return Err(ConfigError::Invalid {
+                field: "allowed_runtimes",
+                reason: "must not contain empty runtime names".to_owned(),
+            });
+        }
+        if self.max_execution_deadline_secs == 0 {
+            return Err(ConfigError::Invalid {
+                field: "max_execution_deadline_secs",
+                reason: "must be greater than zero".to_owned(),
+            });
+        }
+        // A request must be able to run its worker to the configured deadline
+        // and then reap the process group inside the termination grace before
+        // the HTTP timeout cancels the request. Requiring a strict margin also
+        // keeps the default request deadline (`deadline_secs` omitted) usable.
+        let termination_grace_secs = crate::executions::executor::ExecutionLimits::default()
+            .terminate_grace
+            .as_secs();
+        let minimum_timeout_secs = self
+            .max_execution_deadline_secs
+            .saturating_add(termination_grace_secs)
+            .saturating_add(1);
+        if self.request_timeout_secs < minimum_timeout_secs {
+            return Err(ConfigError::Invalid {
+                field: "max_execution_deadline_secs",
+                reason: format!(
+                    "must be less than request_timeout_secs minus the {termination_grace_secs}s \
+                     worker termination grace (request_timeout_secs must be at least \
+                     {minimum_timeout_secs})"
+                ),
+            });
+        }
+        if self.max_concurrent_executions == 0 {
+            return Err(ConfigError::Invalid {
+                field: "max_concurrent_executions",
+                reason: "must be greater than zero".to_owned(),
+            });
+        }
+        // Same fail-closed rule as upload slots: a value above the
+        // semaphore ceiling is a startup error, not a runtime panic.
+        if self.max_concurrent_executions > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(ConfigError::Invalid {
+                field: "max_concurrent_executions",
+                reason: format!(
+                    "must be at most {} (semaphore permit ceiling)",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                ),
             });
         }
         // `Semaphore::new` panics above its own permit ceiling; keep an
@@ -490,6 +593,9 @@ struct ConfigFile {
     max_concurrent_uploads: Option<usize>,
     quarantine_ttl_secs: Option<u64>,
     staging_ttl_secs: Option<u64>,
+    allowed_runtimes: Option<Vec<String>>,
+    max_execution_deadline_secs: Option<u64>,
+    max_concurrent_executions: Option<usize>,
     api_token: Option<String>,
     api_token_file: Option<PathBuf>,
     trusted_keys: Option<Vec<TrustedKeyConfig>>,
@@ -613,6 +719,24 @@ where
             })
         })
         .transpose()
+}
+
+/// Normalizes a JSON runtime list: surrounding whitespace is removed and
+/// empty entries are dropped. An all-empty list then fails startup validation
+/// instead of silently allowing nothing.
+fn normalize_runtimes(runtimes: Vec<String>) -> Vec<String> {
+    runtimes
+        .into_iter()
+        .map(|runtime| runtime.trim().to_owned())
+        .filter(|runtime| !runtime.is_empty())
+        .collect()
+}
+
+/// Parses the comma-separated `CONDUCTOR_ALLOWED_RUNTIMES` form. Empty
+/// entries are ignored, matching the JSON normalization above; the result is
+/// still subject to startup validation.
+fn parse_runtime_env(raw: &str) -> Vec<String> {
+    normalize_runtimes(raw.split(',').map(ToOwned::to_owned).collect())
 }
 
 /// Resolves the token from the highest-precedence source: environment value,
@@ -842,6 +966,129 @@ mod tests {
     }
 
     #[test]
+    fn execution_defaults_are_safe_and_nonzero() {
+        let config = Config::default();
+        assert_eq!(config.allowed_runtimes, vec!["rust".to_owned()]);
+        assert_eq!(config.max_execution_deadline_secs, 300);
+        assert_eq!(config.max_concurrent_executions, 4);
+        assert!(matches!(
+            config.validate_for_startup(),
+            Err(ConfigError::Missing("api_token"))
+        ));
+    }
+
+    #[test]
+    fn empty_allowed_runtimes_are_rejected() {
+        let config = Config {
+            allowed_runtimes: Vec::new(),
+            ..startup_ready_config()
+        };
+        assert!(matches!(
+            config.validate_for_startup(),
+            Err(ConfigError::Invalid {
+                field: "allowed_runtimes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn zero_execution_deadline_is_rejected() {
+        let config = Config {
+            max_execution_deadline_secs: 0,
+            ..startup_ready_config()
+        };
+        assert!(matches!(
+            config.validate_for_startup(),
+            Err(ConfigError::Invalid {
+                field: "max_execution_deadline_secs",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn execution_deadline_must_fit_inside_the_request_timeout() {
+        let grace = crate::executions::executor::ExecutionLimits::default()
+            .terminate_grace
+            .as_secs();
+
+        let invalid = Config {
+            max_execution_deadline_secs: 300,
+            request_timeout_secs: 30,
+            ..startup_ready_config()
+        };
+        assert!(matches!(
+            invalid.validate_for_startup(),
+            Err(ConfigError::Invalid {
+                field: "max_execution_deadline_secs",
+                ref reason,
+            }) if reason.contains("request_timeout_secs")
+        ));
+
+        // The boundary is strict: deadline + grace must be less than the
+        // request timeout, because teardown needs the remaining second.
+        let boundary = Config {
+            max_execution_deadline_secs: 30,
+            request_timeout_secs: 30 + grace,
+            ..startup_ready_config()
+        };
+        assert!(matches!(
+            boundary.validate_for_startup(),
+            Err(ConfigError::Invalid {
+                field: "max_execution_deadline_secs",
+                ..
+            })
+        ));
+
+        let accepted = Config {
+            max_execution_deadline_secs: 30,
+            request_timeout_secs: 30 + grace + 1,
+            ..startup_ready_config()
+        };
+        accepted
+            .validate_for_startup()
+            .expect("one second beyond the grace boundary must be accepted");
+    }
+
+    #[test]
+    fn default_execution_deadline_has_room_for_grace_and_request_teardown() {
+        let config = Config {
+            api_token: Some("startup-token".to_owned()),
+            trusted_keys: startup_ready_config().trusted_keys,
+            ..Config::default()
+        };
+        config
+            .validate_for_startup()
+            .expect("default execution deadline and request timeout must agree");
+    }
+
+    #[test]
+    fn execution_slots_outside_the_semaphore_range_are_rejected() {
+        for value in [0, tokio::sync::Semaphore::MAX_PERMITS.saturating_add(1)] {
+            let config = Config {
+                max_concurrent_executions: value,
+                ..startup_ready_config()
+            };
+            assert!(matches!(
+                config.validate_for_startup(),
+                Err(ConfigError::Invalid {
+                    field: "max_concurrent_executions",
+                    ..
+                })
+            ));
+        }
+
+        let config = Config {
+            max_concurrent_executions: tokio::sync::Semaphore::MAX_PERMITS,
+            ..startup_ready_config()
+        };
+        config
+            .validate_for_startup()
+            .expect("the semaphore ceiling itself is valid");
+    }
+
+    #[test]
     fn zero_workspace_ttls_are_rejected() {
         for config in [
             Config {
@@ -1009,6 +1256,9 @@ mod tests {
                 "max_concurrent_uploads": 3,
                 "quarantine_ttl_secs": 5,
                 "staging_ttl_secs": 6,
+                "allowed_runtimes": ["rust", "python"],
+                "max_execution_deadline_secs": 90,
+                "max_concurrent_executions": 2,
                 "api_token": "file-token",
                 "trusted_keys": [{
                     "key_id": "file-key",
@@ -1028,6 +1278,12 @@ mod tests {
         assert_eq!(config.max_concurrent_uploads, 3);
         assert_eq!(config.quarantine_ttl_secs, 5);
         assert_eq!(config.staging_ttl_secs, 6);
+        assert_eq!(
+            config.allowed_runtimes,
+            vec!["rust".to_owned(), "python".to_owned()]
+        );
+        assert_eq!(config.max_execution_deadline_secs, 90);
+        assert_eq!(config.max_concurrent_executions, 2);
         assert_eq!(config.api_token.as_deref(), Some("file-token"));
         assert_eq!(config.trusted_keys.len(), 1);
         assert_eq!(config.trusted_keys[0].key_id, "file-key");
@@ -1089,6 +1345,29 @@ mod tests {
     }
 
     #[test]
+    fn environment_parses_execution_settings() {
+        let config = Config::load_with(
+            None,
+            [
+                (
+                    ENV_ALLOWED_RUNTIMES.to_owned(),
+                    " rust, python ,,".to_owned(),
+                ),
+                (ENV_MAX_EXECUTION_DEADLINE_SECS.to_owned(), "45".to_owned()),
+                (ENV_MAX_CONCURRENT_EXECUTIONS.to_owned(), "2".to_owned()),
+            ],
+        )
+        .expect("execution environment overrides must load");
+
+        assert_eq!(
+            config.allowed_runtimes,
+            vec!["rust".to_owned(), "python".to_owned()]
+        );
+        assert_eq!(config.max_execution_deadline_secs, 45);
+        assert_eq!(config.max_concurrent_executions, 2);
+    }
+
+    #[test]
     fn invalid_numeric_environment_value_is_reported() {
         let result = Config::load_with(
             None,
@@ -1098,6 +1377,21 @@ mod tests {
             result,
             Err(ConfigError::Invalid {
                 field: ENV_REQUEST_TIMEOUT_SECS,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn invalid_numeric_execution_environment_value_is_reported() {
+        let result = Config::load_with(
+            None,
+            [(ENV_MAX_CONCURRENT_EXECUTIONS.to_owned(), "many".to_owned())],
+        );
+        assert!(matches!(
+            result,
+            Err(ConfigError::Invalid {
+                field: ENV_MAX_CONCURRENT_EXECUTIONS,
                 ..
             })
         ));

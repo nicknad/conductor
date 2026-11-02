@@ -1,9 +1,10 @@
 openapi: 3.0.3
 info:
-  title: Conductor upload API
+  title: Conductor API
   description: >-
-    Scan surface for OWASP ZAP. The upload body is multipart, so the spec
-    describes the real fields without claiming a JSON contract.
+    Scan surface for OWASP ZAP. The upload body is multipart; activation and
+    execution accept bounded JSON. Every /v1 route requires the operator
+    bearer token.
   version: 0.1.0
 servers:
   - url: https://conductor:8443
@@ -54,6 +55,152 @@ paths:
           description: Well-formed but semantically invalid package.
         "503":
           description: Upload slots saturated or validation timed out.
+  /v1/modules/{module_id}/activate:
+    post:
+      operationId: activateModule
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: module_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [version]
+              properties:
+                version:
+                  type: string
+                  minLength: 1
+                  maxLength: 256
+      responses:
+        "200":
+          description: Active version persisted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [module_id, version, digest, signer_key_id]
+                properties:
+                  module_id:
+                    type: string
+                  version:
+                    type: string
+                  digest:
+                    type: string
+                    pattern: "^[0-9a-f]{64}$"
+                  signer_key_id:
+                    type: string
+        "400":
+          description: Malformed or oversized JSON body.
+        "401":
+          description: Missing or invalid bearer token.
+        "404":
+          description: The requested module version is not registered.
+        "413":
+          description: JSON body exceeds the 1 MiB route bound.
+        "422":
+          description: Registered version is not intact or its runtime is not allowed.
+        "500":
+          description: Internal host, storage, or missing-artifact failure; generic body only.
+        "503":
+          description: Request timed out or activation capacity is saturated.
+  /v1/modules/{module_id}/executions:
+    post:
+      operationId: executeModule
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: module_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [function]
+              properties:
+                version:
+                  type: string
+                  minLength: 1
+                  maxLength: 256
+                  description: Omit to use the module's active version.
+                function:
+                  type: string
+                  minLength: 1
+                  maxLength: 256
+                configuration:
+                  type: object
+                  description: Job configuration; never recorded in audit.
+                deadline_secs:
+                  type: integer
+                  format: int64
+                  minimum: 1
+                  description: Omitted means 30 seconds, clamped to the host maximum when that is lower; explicit values above the host maximum are refused.
+      responses:
+        "200":
+          description: Execution completed or a spawned worker reported an outcome.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  [execution_id, module_id, version, digest, outcome, stdout, stderr, duration_ms]
+                properties:
+                  execution_id:
+                    type: string
+                  module_id:
+                    type: string
+                  version:
+                    type: string
+                  digest:
+                    type: string
+                    pattern: "^[0-9a-f]{64}$"
+                  outcome:
+                    type: string
+                    enum:
+                      - succeeded
+                      - failed
+                      - timed_out
+                      - cancelled
+                      - worker_error
+                      - protocol_violation
+                  stdout:
+                    type: string
+                  stderr:
+                    type: string
+                  duration_ms:
+                    type: integer
+                    format: int64
+        "400":
+          description: Malformed JSON, invalid identity, or over-maximum deadline.
+        "401":
+          description: Missing or invalid bearer token.
+        "404":
+          description: Module/version is not registered or has no active version.
+        "413":
+          description: JSON body exceeds the 1 MiB route bound.
+        "422":
+          description: Legacy manifest, runtime/integrity/manifest/archive refusal.
+        "500":
+          description: Internal host, storage, or missing-artifact failure; generic body only.
+        "503":
+          description: Execution capacity saturated.
 components:
   securitySchemes:
     bearerAuth:

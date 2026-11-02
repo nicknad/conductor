@@ -90,7 +90,7 @@ cat >"$generated/config.json" <<JSON
 {
   "http_bind": "0.0.0.0:8443",
   "storage_root": "/data",
-  "request_timeout_secs": 30,
+  "request_timeout_secs": 360,
   "tls_cert_path": "/tls/cert.pem",
   "tls_key_path": "/tls/key.pem",
   "max_concurrent_uploads": 8,

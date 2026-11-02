@@ -10,6 +10,7 @@
 //! and bind TLS. Any failure aborts startup with no listener and no
 //! partially wired state.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -22,7 +23,10 @@ use crate::api::uploads::{ApiToken, AppState};
 use crate::audit::recorder::RejectionRecorder;
 use crate::audit::store::RejectionStore;
 use crate::config::{Config, ConfigError};
+use crate::control_plane::activate_module::{ActivationError, ActivationPolicy};
+use crate::control_plane::execute_module::{ExecutionError, ExecutionService};
 use crate::control_plane::validate_package::{BuildError, PackageValidationBuilder};
+use crate::executions::executor::ExecutionLimits;
 use crate::modules::registry::ModuleRegistry;
 use crate::packages::policy::{PackageValidationPolicy, PolicyError};
 use crate::storage::database::{Database, DatabaseError};
@@ -39,6 +43,10 @@ pub enum StartupError {
     Database(#[from] DatabaseError),
     #[error(transparent)]
     Validator(#[from] BuildError),
+    #[error(transparent)]
+    Activation(#[from] ActivationError),
+    #[error(transparent)]
+    Execution(#[from] ExecutionError),
 }
 
 /// Fully assembled host: one immutable configuration plus the state the
@@ -60,11 +68,12 @@ impl Host {
     /// one [`Database`] handle and therefore one WAL/pragma policy.
     pub fn assemble(config: Config) -> Result<Self, StartupError> {
         config.validate_for_startup()?;
-        let policy = PackageValidationPolicy::production();
-        policy.ensure_production_ingest()?;
-        let validator = PackageValidationBuilder::new(policy)
+        let package_policy = PackageValidationPolicy::production();
+        package_policy.ensure_production_ingest()?;
+        let validator = PackageValidationBuilder::new(package_policy.clone())
             .trusted_keys(config.trust_store()?)
             .build()?;
+        let activation_policy = ActivationPolicy::new(config.allowed_runtimes.clone())?;
 
         config.ensure_layout()?;
         // Startup is single-writer, so stale crash leftovers can be removed
@@ -93,6 +102,26 @@ impl Host {
         let registry = Arc::new(ModuleRegistry::from_database(Arc::clone(&database)));
         let rejection_store = Arc::new(RejectionStore::new(database));
 
+        // The signer allowlist is the configured trust-store ids, trimmed to
+        // the same form uploads and activation use. Trust-store construction
+        // above already rejected empty and duplicate ids.
+        let allowed_signers: HashSet<String> = config
+            .trusted_keys
+            .iter()
+            .map(|key| key.key_id.trim().to_owned())
+            .collect();
+        let execution_service = Arc::new(ExecutionService::new(
+            Arc::clone(&registry),
+            config.artifact_dir(),
+            config.staging_dir(),
+            activation_policy,
+            ExecutionLimits::default(),
+            Duration::from_secs(config.max_execution_deadline_secs),
+            package_policy,
+            allowed_signers,
+            config.max_concurrent_executions,
+        )?);
+
         // `validate_for_startup` guarantees a token; do not panic if that
         // invariant is ever weakened — fail closed instead.
         let api_token = config
@@ -108,6 +137,7 @@ impl Host {
             request_timeout: Duration::from_secs(config.request_timeout_secs),
             api_token: ApiToken::new(api_token),
             upload_slots: Arc::new(Semaphore::new(config.max_concurrent_uploads)),
+            execution_service,
         };
         Ok(Self { config, state })
     }
@@ -307,6 +337,7 @@ mod tests {
             }],
             storage_root: root.to_path_buf(),
             request_timeout_secs: 11,
+            max_execution_deadline_secs: 5,
             max_concurrent_uploads: 3,
             ..Config::default()
         }

@@ -17,12 +17,15 @@ pub const REJECTION_EVENT_VERSION: u16 = 1;
 /// boundary and flagged with [`RejectionEvent::detail_truncated`].
 pub const MAX_DETAIL_BYTES: usize = 4096;
 
-/// Where the upload pipeline stopped. `Transport` covers responses
+/// Where the request pipeline stopped. `Transport` covers responses
 /// produced by transport layers (auth, headers, timeouts, body limits) that
-/// never reached the handler.
+/// never reached the handler; `Request` covers malformed activation or
+/// execution bodies; `Activation` and `Execution` cover control-plane
+/// refusals after the handler accepted the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectionStage {
     Transport,
+    Request,
     Multipart,
     Streaming,
     Policy,
@@ -33,6 +36,8 @@ pub enum RejectionStage {
     Inventory,
     Promotion,
     Registration,
+    Activation,
+    Execution,
     Internal,
 }
 
@@ -42,6 +47,7 @@ impl RejectionStage {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Transport => "transport",
+            Self::Request => "request",
             Self::Multipart => "multipart",
             Self::Streaming => "streaming",
             Self::Policy => "policy",
@@ -52,6 +58,8 @@ impl RejectionStage {
             Self::Inventory => "inventory",
             Self::Promotion => "promotion",
             Self::Registration => "registration",
+            Self::Activation => "activation",
+            Self::Execution => "execution",
             Self::Internal => "internal",
         }
     }
@@ -160,6 +168,7 @@ mod tests {
     fn stage_wire_names_are_stable() {
         for (stage, name) in [
             (RejectionStage::Transport, "transport"),
+            (RejectionStage::Request, "request"),
             (RejectionStage::Multipart, "multipart"),
             (RejectionStage::Streaming, "streaming"),
             (RejectionStage::Policy, "policy"),
@@ -170,6 +179,8 @@ mod tests {
             (RejectionStage::Inventory, "inventory"),
             (RejectionStage::Promotion, "promotion"),
             (RejectionStage::Registration, "registration"),
+            (RejectionStage::Activation, "activation"),
+            (RejectionStage::Execution, "execution"),
             (RejectionStage::Internal, "internal"),
         ] {
             assert_eq!(stage.as_str(), name);

@@ -162,6 +162,33 @@ async fn post_upload(
         .status()
 }
 
+async fn post_json(
+    state: &conductor::api::uploads::AppState,
+    uri: &str,
+    body: serde_json::Value,
+    bearer: &str,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {bearer}"))
+        .body(Body::from(
+            serde_json::to_vec(&body).expect("request body must serialize"),
+        ))
+        .expect("request must build");
+    let response = router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("router must respond");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body must read");
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
 #[tokio::test]
 async fn assembled_host_uses_the_operator_token_key_and_storage() {
     let root = temp_root("wired");
@@ -289,6 +316,54 @@ async fn assembled_host_serves_tls_on_the_configured_bind_and_identity() {
         .expect("server must shut down promptly")
         .expect("serve task must not panic");
     assert!(served.is_ok(), "graceful shutdown must succeed: {served:?}");
+    cleanup(&root);
+}
+
+#[tokio::test]
+async fn assembled_host_persists_activation_through_its_service() {
+    let root = temp_root("activation-wiring");
+    let config = Config::from_file(&write_config(&root)).expect("operator config must parse");
+    let first = Host::assemble(config.clone())
+        .expect("valid operator config must assemble")
+        .into_state();
+    let package = golden_package_bytes();
+    let status = post_upload(&first, &package, Some(OPERATOR_TOKEN)).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = post_json(
+        &first,
+        "/v1/modules/reporting-service/activate",
+        serde_json::json!({"version": "1.2.0"}),
+        OPERATOR_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "activation body: {body}");
+    assert_eq!(body["module_id"], "reporting-service");
+    assert_eq!(body["signer_key_id"], "k1");
+    assert_eq!(
+        first
+            .registry
+            .get_active("reporting-service")
+            .expect("active lookup must succeed")
+            .expect("activation must persist the pointer")
+            .version,
+        "1.2.0"
+    );
+    drop(first);
+
+    let second = Host::assemble(config)
+        .expect("restart assembly must succeed")
+        .into_state();
+    assert_eq!(
+        second
+            .registry
+            .get_active("reporting-service")
+            .expect("active lookup must succeed")
+            .expect("activation must survive the restart")
+            .version,
+        "1.2.0",
+        "the assembled execution service must use the shared persistent registry"
+    );
     cleanup(&root);
 }
 

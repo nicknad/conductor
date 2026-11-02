@@ -7,6 +7,7 @@
 //! file. Container-format correctness is covered by the example tests; this
 //! suite looks for crashes and cleanup leaks across generated inputs.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -17,7 +18,10 @@ use axum::http::{HeaderMap, Request, StatusCode};
 use conductor::api::routes::router;
 use conductor::api::uploads::{ApiToken, AppState};
 use conductor::audit::recorder::RejectionRecorder;
+use conductor::control_plane::activate_module::ActivationPolicy;
+use conductor::control_plane::execute_module::ExecutionService;
 use conductor::control_plane::validate_package::PackageValidationBuilder;
+use conductor::executions::executor::ExecutionLimits;
 use conductor::modules::registry::ModuleRegistry;
 use conductor::packages::policy::PackageValidationPolicy;
 use conductor::packages::signature::{
@@ -44,12 +48,31 @@ fn temp_dir(tag: &str) -> PathBuf {
     ))
 }
 
+/// Tightens fixture directories to the owner-only mode ExecutionService
+/// validates, independent of the runner's umask.
+#[cfg(unix)]
+fn tighten_private(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .expect("fixture directory permissions must be settable");
+}
+
+#[cfg(not(unix))]
+fn tighten_private(_path: &Path) {}
+
 fn test_state(tag: &str) -> (AppState, PathBuf) {
     let root = temp_dir(tag);
     let quarantine_dir = root.join("quarantine");
     let artifact_dir = root.join("artifacts");
+    let staging_dir = root.join("staging");
     std::fs::create_dir_all(&quarantine_dir).expect("quarantine dir must be created");
     std::fs::create_dir_all(&artifact_dir).expect("artifact dir must be created");
+    std::fs::create_dir_all(&staging_dir).expect("staging dir must be created");
+    tighten_private(&root);
+    tighten_private(&quarantine_dir);
+    tighten_private(&artifact_dir);
+    tighten_private(&staging_dir);
 
     let keys = ConfiguredTrustedKeys::new(vec![TrustedSigningKey::new(
         "k1",
@@ -61,16 +84,32 @@ fn test_state(tag: &str) -> (AppState, PathBuf) {
         .trusted_keys(keys)
         .build()
         .expect("test validator must build");
+    let registry = Arc::new(ModuleRegistry::new());
+    let execution_service = Arc::new(
+        ExecutionService::new(
+            Arc::clone(&registry),
+            artifact_dir.clone(),
+            staging_dir,
+            ActivationPolicy::new(vec!["rust".to_owned()]).expect("activation policy"),
+            ExecutionLimits::default(),
+            Duration::from_secs(30),
+            PackageValidationPolicy::production(),
+            HashSet::from(["k1".to_owned()]),
+            UPLOAD_SLOTS,
+        )
+        .expect("execution service must build"),
+    );
 
     let state = AppState {
         validator: Arc::new(validator),
         quarantine_dir,
         artifact_dir,
-        registry: Arc::new(ModuleRegistry::new()),
+        registry,
         recorder: Arc::new(RejectionRecorder::new()),
         request_timeout: Duration::from_secs(10),
         api_token: ApiToken::new(TOKEN),
         upload_slots: Arc::new(Semaphore::new(UPLOAD_SLOTS)),
+        execution_service,
     };
     (state, root)
 }

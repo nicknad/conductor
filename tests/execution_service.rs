@@ -15,7 +15,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use conductor::control_plane::activate_module::{ActivationError, ActivationPolicy};
-use conductor::control_plane::execute_module::{ExecutionError, ExecutionService, PreparationHook};
+use conductor::control_plane::execute_module::{
+    ActivationHook, ExecutionError, ExecutionService, PreparationHook,
+};
 use conductor::control_plane::register_package::register;
 use conductor::control_plane::validate_package::{PackageValidationBuilder, ValidatedPackage};
 use conductor::executions::executor::{ExecutionLimits, ExecutionOutcome};
@@ -509,6 +511,7 @@ async fn activate_persists_the_active_version_across_a_reopen() {
         let service = fixture.service(Arc::clone(&registry), Duration::from_secs(30));
         let activated = service
             .activate(MODULE_ID, VERSION)
+            .await
             .expect("activation must succeed");
         assert_eq!(activated.version, VERSION);
     }
@@ -519,6 +522,78 @@ async fn activate_persists_the_active_version_across_a_reopen() {
         .expect("active lookup")
         .expect("the service must have persisted the pointer");
     assert_eq!(active.version, VERSION);
+}
+
+#[tokio::test]
+async fn activation_capacity_is_bounded_and_released() {
+    let scratch = Scratch::new("activation-capacity");
+    let fixture = fixture(&scratch, MODULE_ID, VERSION, "#!/bin/sh\nexit 0\n");
+    let registry = Arc::new(ModuleRegistry::new());
+    registry
+        .record(fixture.record())
+        .expect("record must register");
+    let service = fixture.service_with(
+        Arc::clone(&registry),
+        Duration::from_secs(30),
+        HashSet::from(["k1".to_owned()]),
+        1,
+        PackageValidationPolicy::production(),
+    );
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let started_tx = std::sync::Mutex::new(Some(started_tx));
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let first_activation = Arc::new(AtomicBool::new(true));
+    let hook = ActivationHook::new({
+        let first_activation = Arc::clone(&first_activation);
+        move || {
+            if first_activation.swap(false, Ordering::SeqCst) {
+                if let Some(started_tx) = started_tx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                {
+                    let _ = started_tx.send(());
+                }
+                let _ = release_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recv();
+            }
+        }
+    });
+    let service = service.with_activation_hook(hook);
+
+    let first = tokio::spawn({
+        let service = service.clone();
+        async move { service.activate(MODULE_ID, VERSION).await }
+    });
+    started_rx
+        .await
+        .expect("the first activation must start before capacity is probed");
+
+    let err = service.activate(MODULE_ID, VERSION).await.unwrap_err();
+    assert!(
+        matches!(err, ExecutionError::Overloaded { maximum: 1 }),
+        "activation must fail fast at its bound: {err:?}"
+    );
+
+    release_tx
+        .send(())
+        .expect("activation must still be waiting");
+    let activated = first
+        .await
+        .expect("background task must join")
+        .expect("the first activation must succeed");
+    assert_eq!(activated.version, VERSION);
+
+    // The permit is returned after both success and failure paths.
+    let again = service
+        .activate(MODULE_ID, VERSION)
+        .await
+        .expect("capacity must return after the first activation");
+    assert_eq!(again.version, VERSION);
 }
 
 #[tokio::test]

@@ -10,6 +10,7 @@
 //! production `server::serve_with_handle` path and probing it with
 //! plaintext.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -18,13 +19,30 @@ use axum_server::tls_rustls::RustlsConfig;
 use conductor::api::routes::router;
 use conductor::api::uploads::{ApiToken, AppState};
 use conductor::audit::recorder::RejectionRecorder;
+use conductor::control_plane::activate_module::ActivationPolicy;
+use conductor::control_plane::execute_module::ExecutionService;
 use conductor::control_plane::validate_package::PackageValidationBuilder;
+use conductor::executions::executor::ExecutionLimits;
+use conductor::modules::registry::ModuleRegistry;
 use conductor::packages::policy::PackageValidationPolicy;
 use conductor::packages::signature::{
     ConfiguredTrustedKeys, SignatureAlgorithm, TrustedSigningKey,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::Semaphore;
+
+/// Tightens a fixture directory to the owner-only mode ExecutionService
+/// validates, independent of the runner's umask.
+#[cfg(unix)]
+fn tighten_private(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .expect("fixture directory permissions must be settable");
+}
+
+#[cfg(not(unix))]
+fn tighten_private(_path: &std::path::Path) {}
 
 /// Generates a self-signed `localhost` identity and writes it to a
 /// process-unique temp directory. Returns the cert path, key path, and
@@ -78,16 +96,37 @@ fn minimal_state(tag: &str) -> (AppState, PathBuf, PathBuf) {
         nanos
     ));
     std::fs::create_dir_all(&artifact_dir).expect("artifact dir must be created");
+    let staging_dir = artifact_dir.join("staging");
+    std::fs::create_dir_all(&staging_dir).expect("staging dir must be created");
+    tighten_private(&quarantine_dir);
+    tighten_private(&artifact_dir);
+    tighten_private(&staging_dir);
+    let registry = Arc::new(ModuleRegistry::new());
+    let execution_service = Arc::new(
+        ExecutionService::new(
+            Arc::clone(&registry),
+            artifact_dir.clone(),
+            staging_dir,
+            ActivationPolicy::new(vec!["rust".to_owned()]).expect("activation policy"),
+            ExecutionLimits::default(),
+            Duration::from_secs(30),
+            PackageValidationPolicy::production(),
+            HashSet::from(["k1".to_owned()]),
+            4,
+        )
+        .expect("execution service must build"),
+    );
     (
         AppState {
             validator: Arc::new(validator),
             quarantine_dir: quarantine_dir.clone(),
             artifact_dir: artifact_dir.clone(),
-            registry: Arc::new(conductor::modules::registry::ModuleRegistry::new()),
+            registry,
             recorder: Arc::new(RejectionRecorder::new()),
             request_timeout: Duration::from_secs(10),
             api_token: ApiToken::new("test-bearer-upload"),
             upload_slots: Arc::new(Semaphore::new(8)),
+            execution_service,
         },
         quarantine_dir,
         artifact_dir,

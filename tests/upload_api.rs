@@ -11,6 +11,7 @@
 //! concurrency bound, minimum upload speed, and TLS-only serving (see
 //! `tests/tls_only.rs` for the socket proof; HSTS is asserted here).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -22,7 +23,10 @@ use conductor::api::routes::router;
 use conductor::api::uploads::{ApiToken, AppState};
 use conductor::audit::recorder::RejectionRecorder;
 use conductor::audit::store::RejectionStore;
+use conductor::control_plane::activate_module::ActivationPolicy;
+use conductor::control_plane::execute_module::ExecutionService;
 use conductor::control_plane::validate_package::PackageValidationBuilder;
+use conductor::executions::executor::ExecutionLimits;
 use conductor::modules::registry::ModuleRegistry;
 use conductor::packages::artifact::ArtifactDigest;
 use conductor::packages::digest::Sha256DigestProvider;
@@ -37,6 +41,19 @@ use tower::ServiceExt as _;
 const TEST_SIGNING_KEY: [u8; 32] = [42u8; 32];
 const BOUNDARY: &str = "conductor-test-boundary";
 
+/// Tightens fixture directories to the owner-only mode ExecutionService
+/// validates, independent of the runner's umask.
+#[cfg(unix)]
+fn tighten_private(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .expect("fixture directory permissions must be settable");
+}
+
+#[cfg(not(unix))]
+fn tighten_private(_path: &Path) {}
+
 fn test_state(policy: PackageValidationPolicy, tag: &str) -> AppState {
     use ed25519_dalek::SigningKey;
 
@@ -47,7 +64,7 @@ fn test_state(policy: PackageValidationPolicy, tag: &str) -> AppState {
         signing.verifying_key().to_bytes().to_vec(),
     )])
     .expect("distinct test keys must build");
-    let validator = PackageValidationBuilder::new(policy)
+    let validator = PackageValidationBuilder::new(policy.clone())
         .trusted_keys(keys)
         .build()
         .expect("test validator must build");
@@ -67,6 +84,29 @@ fn test_state(policy: PackageValidationPolicy, tag: &str) -> AppState {
     ));
     std::fs::create_dir_all(&quarantine_dir).expect("quarantine dir must be created");
     std::fs::create_dir_all(&artifact_dir).expect("artifact dir must be created");
+    // Test-only staging root inside the artifact fixture so both are removed
+    // by the existing cleanup calls. ExecutionService only requires a real,
+    // non-writable directory; production uses the configured staging root.
+    let staging_dir = artifact_dir.join("staging");
+    std::fs::create_dir_all(&staging_dir).expect("staging dir must be created");
+    tighten_private(&quarantine_dir);
+    tighten_private(&artifact_dir);
+    tighten_private(&staging_dir);
+    let registry = Arc::new(ModuleRegistry::new());
+    let execution_service = Arc::new(
+        ExecutionService::new(
+            Arc::clone(&registry),
+            artifact_dir.clone(),
+            staging_dir,
+            ActivationPolicy::new(vec!["rust".to_owned()]).expect("activation policy"),
+            ExecutionLimits::default(),
+            Duration::from_secs(30),
+            policy,
+            HashSet::from(["k1".to_owned()]),
+            4,
+        )
+        .expect("execution service must build"),
+    );
     // Durable rejection sink: a private in-memory store per test so rows
     // can be asserted without sharing state. Recorder failures stay
     // invisible to the response path by contract.
@@ -76,11 +116,12 @@ fn test_state(policy: PackageValidationPolicy, tag: &str) -> AppState {
         validator: Arc::new(validator),
         quarantine_dir,
         artifact_dir,
-        registry: Arc::new(ModuleRegistry::new()),
+        registry,
         recorder: Arc::new(RejectionRecorder::with_store(rejection_store)),
         request_timeout: Duration::from_secs(10),
         api_token: ApiToken::new("test-bearer-upload"),
         upload_slots: Arc::new(Semaphore::new(8)),
+        execution_service,
     }
 }
 
@@ -658,6 +699,49 @@ async fn signature_failure_records_typed_event_with_internal_reason() {
         rows[0].detail
     );
     cleanup(&state.quarantine_dir);
+}
+
+#[tokio::test]
+async fn control_characters_in_key_id_never_reach_the_durable_row() {
+    let state = test_state(PackageValidationPolicy::production(), "audit-key-controls");
+    let package = golden_package_bytes();
+    let mut body = Vec::new();
+    file_part(&mut body, "package", "pkg.zip", "application/zip", &package);
+    // Unsafe attribution attempted through an unsigned/unknown package: the
+    // response stays generic, and neither the key id nor the internal detail
+    // may persist ESC, newline, or BEL bytes in the rejection row.
+    text_part(&mut body, "key_id", "k1\u{1b}[31m\n\u{7}x");
+    text_part(&mut body, "signature", &signature_base64_for(&package));
+
+    let (status, json) = post_custom_body(&state, finish_body(&mut body)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(json["code"], "signature_verification_failed");
+
+    let rows = rejection_rows(&state);
+    assert_eq!(rows.len(), 1, "one rejection must persist exactly one row");
+    let row = &rows[0];
+    assert!(
+        row.key_id.is_none(),
+        "an unsafe key id must be suppressed, not persisted: {:?}",
+        row.key_id
+    );
+    assert!(
+        row.detail.contains("unknown signing key"),
+        "the diagnostic reason must survive sanitization: {}",
+        row.detail
+    );
+    assert!(
+        !row.detail.chars().any(char::is_control),
+        "detail contains a control character: {:?}",
+        row.detail
+    );
+    assert!(
+        !row.detail.contains('\u{1b}'),
+        "detail contains an ANSI escape: {:?}",
+        row.detail
+    );
+    cleanup(&state.quarantine_dir);
+    cleanup(&state.artifact_dir);
 }
 
 #[tokio::test]

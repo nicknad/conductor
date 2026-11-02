@@ -45,8 +45,11 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::api::errors::ApiError;
-use crate::api::uploads::{post_package, require_bearer, AppState};
-use crate::api::PACKAGE_UPLOAD_PATH;
+use crate::api::executions::{post_activate, post_execute};
+use crate::api::uploads::{post_package, request_id, require_bearer, AppState};
+use crate::api::{
+    ACTIVATE_MODULE_PATH, EXECUTE_MODULE_PATH, JSON_BODY_LIMIT_BYTES, PACKAGE_UPLOAD_PATH,
+};
 use crate::audit::event::{RejectionEvent, RejectionStage};
 
 /// Multipart framing slack over the policy package bound for the outer
@@ -88,6 +91,36 @@ pub fn router(state: AppState) -> Router {
                 .route_layer(middleware::from_fn_with_state(
                     state.clone(),
                     map_transport_rejection,
+                ))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_bearer,
+                )),
+        )
+        .route(
+            ACTIVATE_MODULE_PATH,
+            post(post_activate)
+                // Same order as the upload route: bearer auth outermost so
+                // an unauthenticated caller cannot probe the JSON body
+                // limit, then the mapper turns limit refusals into the JSON
+                // error contract.
+                .route_layer(RequestBodyLimitLayer::new(JSON_BODY_LIMIT_BYTES))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    map_json_rejection,
+                ))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_bearer,
+                )),
+        )
+        .route(
+            EXECUTE_MODULE_PATH,
+            post(post_execute)
+                .route_layer(RequestBodyLimitLayer::new(JSON_BODY_LIMIT_BYTES))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    map_json_rejection,
                 ))
                 .route_layer(middleware::from_fn_with_state(
                     state.clone(),
@@ -194,6 +227,72 @@ async fn map_transport_rejection(
     api.into_response()
 }
 
+/// Pure decision for the JSON route's transport-refusal mapper. Kept
+/// separate so the status/content-type matrix is directly testable: only a
+/// non-JSON 400/413 is rewritten; handler JSON and every other status pass
+/// through.
+fn json_rejection_for(status: StatusCode, already_json: bool) -> Option<ApiError> {
+    if already_json {
+        return None;
+    }
+    match status {
+        StatusCode::PAYLOAD_TOO_LARGE => Some(ApiError::PayloadTooLarge(
+            "request body exceeds the allowed size".to_owned(),
+        )),
+        StatusCode::BAD_REQUEST => Some(ApiError::BadRequest(
+            "invalid_request_body",
+            "request body must be valid JSON matching the documented schema".to_owned(),
+        )),
+        _ => None,
+    }
+}
+
 async fn healthz() -> &'static str {
     "ok"
+}
+
+/// Rewrites refusals produced before the JSON handlers (body limit or a
+/// request the extractor could not read) into the API's JSON error contract
+/// and records them once. Handler-produced JSON refusals pass through
+/// unchanged because they already carry `application/json`.
+async fn map_json_rejection(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let id = request_id(request.headers());
+    let response = next.run(request).await;
+    let already_json = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    let Some(api) = json_rejection_for(response.status(), already_json) else {
+        return response;
+    };
+    let code = api.code();
+    state.recorder.record(
+        &RejectionEvent::new(RejectionStage::Request, code, api.message()).with_request_id(id),
+    );
+    api.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_rejection_matrix_is_exact() {
+        assert!(matches!(
+            json_rejection_for(StatusCode::BAD_REQUEST, false),
+            Some(ApiError::BadRequest("invalid_request_body", _))
+        ));
+        assert!(matches!(
+            json_rejection_for(StatusCode::PAYLOAD_TOO_LARGE, false),
+            Some(ApiError::PayloadTooLarge(_))
+        ));
+        assert!(json_rejection_for(StatusCode::UNPROCESSABLE_ENTITY, false).is_none());
+        assert!(json_rejection_for(StatusCode::BAD_REQUEST, true).is_none());
+        assert!(json_rejection_for(StatusCode::PAYLOAD_TOO_LARGE, true).is_none());
+    }
 }

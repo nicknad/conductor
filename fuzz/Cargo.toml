@@ -52,6 +52,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "http_execution"
+path = "fuzz_targets/http_execution.rs"
+test = false
+doc = false
+bench = false
+
 # Standalone workspace: keep the root crate's `cargo test`/clippy from
 # building libFuzzer, and let cargo-fuzz own the target directory.
 [workspace]

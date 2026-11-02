@@ -1,5 +1,6 @@
 #![no_main]
 
+use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -8,7 +9,10 @@ use axum::http::{Request, StatusCode};
 use conductor::api::routes::router;
 use conductor::api::uploads::{ApiToken, AppState};
 use conductor::audit::recorder::RejectionRecorder;
+use conductor::control_plane::activate_module::ActivationPolicy;
+use conductor::control_plane::execute_module::ExecutionService;
 use conductor::control_plane::validate_package::PackageValidationBuilder;
+use conductor::executions::executor::ExecutionLimits;
 use conductor::modules::registry::ModuleRegistry;
 use conductor::packages::policy::PackageValidationPolicy;
 use conductor::packages::signature::{
@@ -31,8 +35,13 @@ fn state() -> &'static AppState {
         let root = std::env::temp_dir().join(format!("conductor-fuzz-http-{}", std::process::id()));
         let quarantine_dir = root.join("quarantine");
         let artifact_dir = root.join("artifacts");
+        let staging_dir = root.join("staging");
         std::fs::create_dir_all(&quarantine_dir).expect("quarantine dir");
         std::fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        std::fs::create_dir_all(&staging_dir).expect("staging dir");
+        for dir in [&quarantine_dir, &artifact_dir, &staging_dir] {
+            private_dir(dir);
+        }
 
         let keys = ConfiguredTrustedKeys::new(vec![TrustedSigningKey::new(
             "k1",
@@ -44,19 +53,46 @@ fn state() -> &'static AppState {
             .trusted_keys(keys)
             .build()
             .expect("fixed validator");
+        let registry = Arc::new(ModuleRegistry::new());
+        let execution_service = Arc::new(
+            ExecutionService::new(
+                Arc::clone(&registry),
+                artifact_dir.clone(),
+                staging_dir,
+                ActivationPolicy::new(vec!["rust".to_owned()]).expect("fixed policy"),
+                ExecutionLimits::default(),
+                Duration::from_secs(30),
+                PackageValidationPolicy::production(),
+                HashSet::from(["k1".to_owned()]),
+                4,
+            )
+            .expect("fixed execution service"),
+        );
 
         AppState {
             validator: Arc::new(validator),
             quarantine_dir,
             artifact_dir,
-            registry: Arc::new(ModuleRegistry::new()),
+            registry,
             recorder: Arc::new(RejectionRecorder::new()),
             request_timeout: Duration::from_secs(10),
             api_token: ApiToken::new(TOKEN),
             upload_slots: Arc::new(Semaphore::new(4)),
+            execution_service,
         }
     })
 }
+
+#[cfg(unix)]
+fn private_dir(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .expect("fuzz fixture directory must be owner-only");
+}
+
+#[cfg(not(unix))]
+fn private_dir(_path: &std::path::Path) {}
 
 fuzz_target!(|data: &[u8]| {
     let runtime = tokio::runtime::Builder::new_current_thread()

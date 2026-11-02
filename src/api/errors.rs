@@ -4,10 +4,11 @@
 //! underlying message. Signature failures map to `401 Unauthorized`
 //! (the request is unauthenticated) except malformed envelopes, which are
 //! `400`; semantic validation failures are `422`; oversized bodies are
-//! `413`. All key-lookup and cryptographic failures (`UnknownKey`,
-//! `UnsupportedAlgorithm`, `VerificationFailed`) map to one generic
-//! `signature_verification_failed` body so the response cannot be used to
-//! enumerate trusted key ids.
+//! `413`; missing module/state is `404`. All key-lookup and cryptographic
+//! failures (`UnknownKey`, `UnsupportedAlgorithm`, `VerificationFailed`)
+//! map to one generic `signature_verification_failed` body so the response
+//! cannot be used to enumerate trusted key ids. Execution refusals never
+//! echo registry paths, manifest text, or OS errors.
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -25,7 +26,7 @@ pub struct ErrorBody {
     pub message: String,
 }
 
-/// HTTP-mapped failures for the upload API.
+/// HTTP-mapped failures for the API.
 #[derive(Debug)]
 pub enum ApiError {
     /// Malformed request: missing fields, bad base64, bad envelope shape.
@@ -41,6 +42,8 @@ pub enum ApiError {
     },
     /// Well-formed but semantically invalid package.
     Unprocessable(&'static str, String),
+    /// Requested module, version, or active pointer does not exist.
+    NotFound(&'static str, String),
     /// The request conflicts with existing state (e.g. a module version
     /// already registered with a different digest).
     Conflict(&'static str, String),
@@ -61,6 +64,7 @@ impl ApiError {
             Self::BadRequest(..) => StatusCode::BAD_REQUEST,
             Self::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
             Self::Unprocessable(..) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::NotFound(..) => StatusCode::NOT_FOUND,
             Self::Conflict(..) => StatusCode::CONFLICT,
             Self::PayloadTooLarge(..) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Overloaded(..) | Self::Timeout => StatusCode::SERVICE_UNAVAILABLE,
@@ -75,6 +79,7 @@ impl ApiError {
             Self::BadRequest(code, _)
             | Self::Unauthorized { code, .. }
             | Self::Unprocessable(code, _)
+            | Self::NotFound(code, _)
             | Self::Conflict(code, _) => code,
             Self::PayloadTooLarge(..) => "payload_too_large",
             Self::Overloaded(..) => "server_busy",
@@ -88,6 +93,7 @@ impl ApiError {
         match self {
             Self::BadRequest(_, message)
             | Self::Unprocessable(_, message)
+            | Self::NotFound(_, message)
             | Self::Conflict(_, message)
             | Self::PayloadTooLarge(message)
             | Self::Overloaded(message)
@@ -97,7 +103,7 @@ impl ApiError {
         }
     }
 
-    fn status_and_body(&self) -> (StatusCode, ErrorBody) {
+    pub(crate) fn status_and_body(&self) -> (StatusCode, ErrorBody) {
         // Internal failures keep their verbose reason in `message()` for the
         // audit event, but the caller-facing body is a generic sentinel so
         // I/O paths and OS errors never leak to clients.

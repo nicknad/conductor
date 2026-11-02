@@ -55,6 +55,7 @@ use tokio::sync::Semaphore;
 use crate::api::errors::ApiError;
 use crate::audit::event::{RejectionEvent, RejectionStage};
 use crate::audit::recorder::RejectionRecorder;
+use crate::control_plane::execute_module::ExecutionService;
 use crate::control_plane::upload_package::run_upload_workflow;
 use crate::control_plane::validate_package::{PackageValidator, ValidationError};
 use crate::modules::registry::{ModuleRegistry, RegistryError};
@@ -129,6 +130,9 @@ pub struct AppState {
     pub api_token: ApiToken,
     /// Concurrency slots: one permit per in-flight upload.
     pub upload_slots: Arc<Semaphore>,
+    /// Registered-artifact execution service. Built once at startup around
+    /// the shared registry, immutable policy, and artifact/staging roots.
+    pub execution_service: Arc<ExecutionService>,
 }
 
 /// `201` body for an accepted package.
@@ -145,7 +149,7 @@ pub struct UploadResponse {
 /// Server-issued request id (`x-request-id`), for incident correlation.
 /// Absent when the request-id layer has not run (tests calling the handler
 /// directly).
-fn request_id(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn request_id(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-request-id")
         .and_then(|value| value.to_str().ok())
@@ -182,17 +186,44 @@ fn reject(
     byte_count: Option<u64>,
 ) -> Response {
     let code = api.code();
-    let detail = detail.unwrap_or_else(|| api.message().to_owned());
+    let detail = sanitize_audit_detail(detail.unwrap_or_else(|| api.message().to_owned()));
     recorder.record(
         &RejectionEvent::new(stage, code, detail)
             .with_request_id(request_id)
-            .with_key_id(key_id.map(str::to_owned))
+            .with_key_id(key_id.and_then(safe_audit_key_id))
             .with_module_id(module_id)
             .with_version(version)
             .with_digest(digest)
             .with_byte_count(byte_count),
     );
     api.into_response()
+}
+
+/// Audit attribution for a claimed key id, using the same portable charset as
+/// execution identities: `[A-Za-z0-9._+-]`, bounded, no leading/trailing dot.
+/// A key id outside that set is suppressed rather than rewritten, so a
+/// malicious bearer holder cannot persist control or ANSI bytes in a
+/// rejection row. Signature lookup still uses the raw trimmed value.
+fn safe_audit_key_id(key_id: &str) -> Option<String> {
+    let safe = !key_id.is_empty()
+        && key_id.len() <= MAX_KEY_ID_BYTES
+        && !key_id.starts_with('.')
+        && !key_id.ends_with('.')
+        && key_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+'));
+    safe.then(|| key_id.to_owned())
+}
+
+/// Free-form audit detail keeps its diagnostic text but never control bytes:
+/// ESC, newlines, BEL, DEL, and C1 controls become `?`. Error displays can
+/// embed a client-supplied key id, so this is applied at the one recording
+/// boundary rather than trusting every upstream message.
+fn sanitize_audit_detail(detail: String) -> String {
+    detail
+        .chars()
+        .map(|ch| if ch.is_control() { '?' } else { ch })
+        .collect()
 }
 
 /// Rejects a repeated known text field. `package` is handled separately by

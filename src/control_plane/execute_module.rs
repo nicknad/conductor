@@ -256,6 +256,43 @@ impl std::fmt::Debug for PreparationHook {
     }
 }
 
+/// Test-only synchronization seam run at the start of blocking activation.
+/// Production callers never install one; it lets a test hold activation open
+/// and prove `/healthz` keeps being served while the blocking registry and
+/// artifact work runs.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ActivationHook(Arc<dyn Fn() + Send + Sync>);
+
+impl ActivationHook {
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new(run: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(run))
+    }
+
+    fn run(&self) {
+        (self.0)();
+    }
+}
+
+impl std::fmt::Debug for ActivationHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ActivationHook").finish()
+    }
+}
+
+#[cfg(test)]
+mod hook_tests {
+    use super::*;
+
+    #[test]
+    fn activation_hook_debug_is_stable() {
+        let hook = ActivationHook::new(|| {});
+        assert_eq!(format!("{hook:?}"), "ActivationHook");
+    }
+}
+
 /// Reusable execution service: resolve a registered version, re-verify its
 /// artifact, stage it, and run the worker.
 #[derive(Debug, Clone)]
@@ -269,10 +306,15 @@ pub struct ExecutionService {
     allowed_signers: Arc<HashSet<String>>,
     max_concurrent_executions: usize,
     execution_slots: Arc<Semaphore>,
+    /// Bounds in-flight activation work. Activation reads and writes the
+    /// registry and stats the artifact on the blocking pool; callers that
+    /// arrive beyond this bound get `503` instead of an unbounded queue.
+    activation_slots: Arc<Semaphore>,
     limits: ExecutionLimits,
     max_deadline: Duration,
     package_policy: PackageValidationPolicy,
     preparation_hook: Option<PreparationHook>,
+    activation_hook: Option<ActivationHook>,
 }
 
 impl ExecutionService {
@@ -326,10 +368,12 @@ impl ExecutionService {
             allowed_signers: Arc::new(allowed_signers),
             max_concurrent_executions,
             execution_slots: Arc::new(Semaphore::new(max_concurrent_executions)),
+            activation_slots: Arc::new(Semaphore::new(max_concurrent_executions)),
             limits,
             max_deadline,
             package_policy,
             preparation_hook: None,
+            activation_hook: None,
         })
     }
 
@@ -342,19 +386,77 @@ impl ExecutionService {
         self
     }
 
-    /// Activates a registered version and persists the active pointer.
+    /// Installs a test-only activation hook. Production code must not call
+    /// this; it exists to make the blocking-pool test deterministic.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_activation_hook(mut self, hook: ActivationHook) -> Self {
+        self.activation_hook = Some(hook);
+        self
+    }
+
+    /// Host ceiling for any requested execution deadline.
+    #[must_use]
+    pub fn max_deadline(&self) -> Duration {
+        self.max_deadline
+    }
+
+    /// Activates a registered version, verifies its artifact is present and
+    /// intact, and persists the active pointer.
     ///
-    /// [`activate`] performs the policy checks; [`set_active`] records the
-    /// same version so a later `execute` without a pinned version survives a
-    /// restart. A failure to persist is reported, never silently ignored.
-    pub fn activate(
+    /// The registry reads, artifact stat/hash, and pointer write all run
+    /// inside [`tokio::task::spawn_blocking`] under a bounded activation
+    /// permit, so a slow disk cannot occupy an async runtime worker. The
+    /// artifact check happens before [`set_active`](ModuleRegistry::set_active)
+    /// so activation cannot report success for an unrunnable version.
+    pub async fn activate(
         &self,
         module_id: &str,
         version: &str,
     ) -> Result<ActivatedModule, ExecutionError> {
-        let activated = activate(&self.registry, module_id, version, &self.activation_policy)?;
-        self.registry.set_active(module_id, version)?;
-        Ok(activated)
+        let permit = Arc::clone(&self.activation_slots)
+            .try_acquire_owned()
+            .map_err(|_| ExecutionError::Overloaded {
+                maximum: self.max_concurrent_executions,
+            })?;
+        let registry = Arc::clone(&self.registry);
+        let artifact_dir = self.artifact_dir.clone();
+        let activation_policy = self.activation_policy.clone();
+        let activation_hook = self.activation_hook.clone();
+        let module_id_owned = module_id.to_owned();
+        let version_owned = version.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            if let Some(hook) = &activation_hook {
+                hook.run();
+            }
+            let activated = activate(
+                &registry,
+                &module_id_owned,
+                &version_owned,
+                &activation_policy,
+            )?;
+            let record = registry
+                .get(&activated.module_id, &activated.version)?
+                .ok_or_else(|| ActivationError::NotRegistered {
+                    module_id: activated.module_id.clone(),
+                    version: activated.version.clone(),
+                })?;
+            if record.digest != activated.digest {
+                return Err(ExecutionError::RecordDigestMismatch {
+                    module_id: activated.module_id,
+                    version: activated.version,
+                });
+            }
+            // Bind activation to runnable bytes: a missing, tampered, or
+            // unreadable artifact must not persist an active pointer.
+            let artifact_path = confine_artifact_path(&artifact_dir, &record)?;
+            verify_artifact(&artifact_path, &record)?;
+            registry.set_active(&activated.module_id, &activated.version)?;
+            Ok(activated)
+        })
+        .await
+        .map_err(|err| ExecutionError::BlockingTask(err.to_string()))?
     }
 
     /// Executes one function of the active (or pinned) module version.

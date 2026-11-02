@@ -7,6 +7,7 @@ either a panic or a violated security property.
 | Target | Input | Oracle |
 | --- | --- | --- |
 | `http_upload` | Arbitrary request body as `multipart/form-data` with a valid bearer | Never a server error; transport headers and request id present; upload slot returned |
+| `http_execution` | Arbitrary JSON body sent to activation or execution with a valid bearer | Never a server error; transport headers and request id present |
 | `upload_workflow` | Arbitrary package bytes, signed by a fixed harness key | A verdict's digest equals the signed digest; identity/inventory non-empty |
 | `archive_inspect` | Arbitrary ZIP bytes | Accepted listings are bounded, duplicate-free, normalized/confined |
 | `manifest_parse` | Arbitrary manifest JSON | Accepted manifests have non-empty identity, bounded identity, non-empty files, declared entrypoint |
