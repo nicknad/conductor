@@ -23,6 +23,7 @@ use conductor::control_plane::activate_module::ActivationPolicy;
 use conductor::control_plane::execute_module::ExecutionService;
 use conductor::control_plane::validate_package::PackageValidationBuilder;
 use conductor::executions::executor::ExecutionLimits;
+use conductor::executions::history::ExecutionHistoryStore;
 use conductor::modules::registry::ModuleRegistry;
 use conductor::packages::policy::PackageValidationPolicy;
 use conductor::packages::signature::{
@@ -113,6 +114,7 @@ fn minimal_state(tag: &str) -> (AppState, PathBuf, PathBuf) {
             PackageValidationPolicy::production(),
             HashSet::from(["k1".to_owned()]),
             4,
+            Arc::new(ExecutionHistoryStore::open_in_memory().expect("execution history must open")),
         )
         .expect("execution service must build"),
     );

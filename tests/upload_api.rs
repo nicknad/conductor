@@ -27,6 +27,7 @@ use conductor::control_plane::activate_module::ActivationPolicy;
 use conductor::control_plane::execute_module::ExecutionService;
 use conductor::control_plane::validate_package::PackageValidationBuilder;
 use conductor::executions::executor::ExecutionLimits;
+use conductor::executions::history::ExecutionHistoryStore;
 use conductor::modules::registry::ModuleRegistry;
 use conductor::packages::artifact::ArtifactDigest;
 use conductor::packages::digest::Sha256DigestProvider;
@@ -104,6 +105,7 @@ fn test_state(policy: PackageValidationPolicy, tag: &str) -> AppState {
             policy,
             HashSet::from(["k1".to_owned()]),
             4,
+            Arc::new(ExecutionHistoryStore::open_in_memory().expect("execution history must open")),
         )
         .expect("execution service must build"),
     );

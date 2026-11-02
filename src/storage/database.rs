@@ -20,17 +20,18 @@ use thiserror::Error;
 
 /// Schema version this build produces. Bump alongside a new entry in
 /// `MIGRATIONS`; never edit an entry that has shipped.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Forward-only migrations; index `n` applies version `n + 1`, each string
 /// one statement. The v1 schema backs the module registry, activation, and
-/// rejection records.
-const MIGRATIONS: &[&[&str]] = &[&[
-    "CREATE TABLE modules (
+/// rejection records. The v2 schema adds durable execution metadata.
+const MIGRATIONS: &[&[&str]] = &[
+    &[
+        "CREATE TABLE modules (
         module_id  TEXT PRIMARY KEY,
         created_at INTEGER NOT NULL
      )",
-    "CREATE TABLE module_versions (
+        "CREATE TABLE module_versions (
         module_id        TEXT NOT NULL REFERENCES modules(module_id) ON DELETE CASCADE,
         version          TEXT NOT NULL,
         digest           TEXT NOT NULL CHECK (length(digest) = 64),
@@ -44,14 +45,14 @@ const MIGRATIONS: &[&[&str]] = &[&[
         registered_at    INTEGER NOT NULL,
         PRIMARY KEY (module_id, version)
      )",
-    "CREATE TABLE active_versions (
+        "CREATE TABLE active_versions (
         module_id    TEXT PRIMARY KEY REFERENCES modules(module_id) ON DELETE CASCADE,
         version      TEXT NOT NULL,
         activated_at INTEGER NOT NULL,
         FOREIGN KEY (module_id, version)
             REFERENCES module_versions(module_id, version)
      )",
-    "CREATE TABLE package_rejections (
+        "CREATE TABLE package_rejections (
         id               INTEGER PRIMARY KEY AUTOINCREMENT,
         occurred_at      INTEGER NOT NULL,
         event_version    INTEGER NOT NULL,
@@ -66,8 +67,40 @@ const MIGRATIONS: &[&[&str]] = &[&[
         digest           TEXT,
         byte_count       INTEGER
      )",
-    "CREATE INDEX idx_rejections_occurred_at ON package_rejections(occurred_at)",
-]];
+        "CREATE INDEX idx_rejections_occurred_at ON package_rejections(occurred_at)",
+    ],
+    &[
+        // Bounded, non-empty identity fields and a strict outcome/digest
+        // vocabulary. `length(CAST(... AS BLOB))` counts bytes, matching the
+        // Rust-side `MAX_FIELD_BYTES`/execution-id bounds. Negative timing
+        // values and the outcome set are refused at insert time; reads
+        // re-validate so a row tampered afterwards still fails closed.
+        "CREATE TABLE executions (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            execution_id TEXT NOT NULL UNIQUE
+                         CHECK (length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 128),
+            module_id    TEXT NOT NULL
+                         CHECK (length(CAST(module_id AS BLOB)) BETWEEN 1 AND 256),
+            version      TEXT NOT NULL
+                         CHECK (length(CAST(version AS BLOB)) BETWEEN 1 AND 256),
+            digest       TEXT NOT NULL
+                         CHECK (length(digest) = 64
+                                AND digest NOT GLOB '*[^0-9a-f]*'),
+            function     TEXT NOT NULL
+                         CHECK (length(CAST(function AS BLOB)) BETWEEN 1 AND 256),
+            outcome      TEXT NOT NULL
+                         CHECK (outcome IN (
+                             'succeeded', 'failed', 'timed_out', 'cancelled',
+                             'worker_error', 'protocol_violation'
+                         )),
+            started_at   INTEGER NOT NULL CHECK (started_at >= 0),
+            finished_at  INTEGER NOT NULL CHECK (finished_at >= 0),
+            duration_ms  INTEGER NOT NULL CHECK (duration_ms >= 0)
+         )",
+        "CREATE INDEX idx_executions_started_at ON executions(started_at)",
+        "CREATE INDEX idx_executions_module_version ON executions(module_id, version)",
+    ],
+];
 
 /// Storage failures. All variants are server-side conditions; callers
 /// decide whether they are fatal (startup) or a rejected request.
@@ -243,12 +276,13 @@ mod tests {
             .expect("schema version must read");
         assert_eq!(version, SCHEMA_VERSION);
 
-        // The v1 tables are usable.
+        // Every schema table is usable at the current version.
         for table in [
             "modules",
             "module_versions",
             "active_versions",
             "package_rejections",
+            "executions",
         ] {
             let count: i64 = db
                 .with_connection(|conn| {
@@ -260,6 +294,136 @@ mod tests {
                 .expect("table must exist");
             assert_eq!(count, 0);
         }
+
+        // Both v2 indexes exist after migration.
+        let indexes: Vec<String> = db
+            .with_connection(|conn| {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT name FROM sqlite_master
+                         WHERE type = 'index' AND name LIKE 'idx_executions_%'
+                         ORDER BY name",
+                    )
+                    .map_err(DatabaseError::from)?;
+                let rows = statement
+                    .query_map([], |row| row.get(0))
+                    .map_err(DatabaseError::from)?;
+                let mut names = Vec::new();
+                for row in rows {
+                    names.push(row.map_err(DatabaseError::from)?);
+                }
+                Ok::<_, DatabaseError>(names)
+            })
+            .expect("execution indexes must read");
+        assert_eq!(
+            indexes,
+            [
+                "idx_executions_module_version".to_owned(),
+                "idx_executions_started_at".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn migrate_upgrades_a_v1_schema_preserving_existing_rows() {
+        use rusqlite::params;
+
+        let db = Database::open_in_memory().expect("in-memory database must open");
+        let digest = "a".repeat(64);
+        // Build the shipped v1 schema and rows exactly as an older binary
+        // would have left them, then run the current migration.
+        db.with_connection(|conn| {
+            for statement in MIGRATIONS[0] {
+                conn.execute_batch(statement)?;
+            }
+            conn.pragma_update(None, "user_version", 1)?;
+            conn.execute(
+                "INSERT INTO modules (module_id, created_at) VALUES ('reporting-service', 100)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO module_versions (
+                    module_id, version, digest, signer_key_id, runtime,
+                    manifest_version, manifest_json, artifact_relpath,
+                    artifact_size, integrity_state, registered_at
+                 ) VALUES ('reporting-service', '1.2.0', ?1, 'k1', 'rust',
+                    2, '{}', 'reporting-service/1.2.0/pkg.zip', 123, 'ok', 200)",
+                params![digest],
+            )?;
+            conn.execute(
+                "INSERT INTO active_versions (module_id, version, activated_at)
+                 VALUES ('reporting-service', '1.2.0', 300)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO package_rejections (
+                    occurred_at, event_version, stage, code, detail
+                 ) VALUES (400, 1, 'transport', 'denied', 'kept')",
+                [],
+            )?;
+            Ok::<(), DatabaseError>(())
+        })
+        .expect("v1 schema and rows must be written");
+
+        db.migrate().expect("v1 database must upgrade to v2");
+
+        let version: i64 = db
+            .with_connection(|conn| {
+                conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                    .map_err(DatabaseError::from)
+            })
+            .expect("schema version must read");
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let counts: (i64, i64, i64, i64, i64) = db
+            .with_connection(|conn| {
+                let count = |table: &str| -> rusqlite::Result<i64> {
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                };
+                Ok::<_, DatabaseError>((
+                    count("modules")?,
+                    count("module_versions")?,
+                    count("active_versions")?,
+                    count("package_rejections")?,
+                    count("executions")?,
+                ))
+            })
+            .expect("upgraded table counts must read");
+        assert_eq!(counts, (1, 1, 1, 1, 0));
+
+        let stored: (String, String, String, String) = db
+            .with_connection(|conn| {
+                let digest: String = conn.query_row(
+                    "SELECT digest FROM module_versions
+                     WHERE module_id = 'reporting-service' AND version = '1.2.0'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let signer: String = conn.query_row(
+                    "SELECT signer_key_id FROM module_versions
+                     WHERE module_id = 'reporting-service' AND version = '1.2.0'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let active: String = conn.query_row(
+                    "SELECT version FROM active_versions WHERE module_id = 'reporting-service'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let detail: String = conn.query_row(
+                    "SELECT detail FROM package_rejections WHERE code = 'denied'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok::<_, DatabaseError>((digest, signer, active, detail))
+            })
+            .expect("existing rows must survive the upgrade");
+        assert_eq!(stored.0, "a".repeat(64));
+        assert_eq!(stored.1, "k1");
+        assert_eq!(stored.2, "1.2.0");
+        assert_eq!(stored.3, "kept");
     }
 
     #[test]

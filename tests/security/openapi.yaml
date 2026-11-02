@@ -201,7 +201,131 @@ paths:
           description: Internal host, storage, or missing-artifact failure; generic body only.
         "503":
           description: Execution capacity saturated.
+  /v1/executions:
+    get:
+      operationId: listExecutions
+      description: >-
+        Durable execution metadata, newest first. No stdout, stderr, or
+        configuration is stored or returned.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            maximum: 1000000
+            default: 0
+      responses:
+        "200":
+          description: Newest-first page of execution receipts.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [executions, limit, offset]
+                properties:
+                  executions:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ExecutionRecord"
+                  limit:
+                    type: integer
+                    format: int64
+                  offset:
+                    type: integer
+                    format: int64
+        "400":
+          description: Invalid pagination (stable `invalid_pagination` code).
+        "401":
+          description: Missing or invalid bearer token.
+        "500":
+          description: History read failure; generic body only.
+  /v1/executions/{execution_id}:
+    get:
+      operationId: getExecution
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: execution_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+            pattern: "^[A-Za-z0-9_-]+$"
+      responses:
+        "200":
+          description: One durable execution receipt.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExecutionRecord"
+        "400":
+          description: Invalid execution id (stable `invalid_execution_id` code).
+        "401":
+          description: Missing or invalid bearer token.
+        "404":
+          description: No execution with that id (stable `execution_not_found` code).
+        "500":
+          description: History read failure; generic body only.
 components:
+  schemas:
+    ExecutionRecord:
+      type: object
+      required:
+        - execution_id
+        - module_id
+        - version
+        - digest
+        - function
+        - outcome
+        - started_at_ms
+        - finished_at_ms
+        - duration_ms
+      properties:
+        execution_id:
+          type: string
+        module_id:
+          type: string
+        version:
+          type: string
+        digest:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        function:
+          type: string
+        outcome:
+          type: string
+          enum:
+            - succeeded
+            - failed
+            - timed_out
+            - cancelled
+            - worker_error
+            - protocol_violation
+        started_at_ms:
+          type: integer
+          format: int64
+        finished_at_ms:
+          type: integer
+          format: int64
+        duration_ms:
+          type: integer
+          format: int64
   securitySchemes:
     bearerAuth:
       type: http

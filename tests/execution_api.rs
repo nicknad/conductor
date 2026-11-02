@@ -231,6 +231,42 @@ async fn post_bytes(
     (status, json)
 }
 
+async fn get_json(
+    state: &AppState,
+    uri: &str,
+    bearer: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    let (status, _, json) = get_json_with_content_type(state, uri, bearer).await;
+    (status, json)
+}
+
+async fn get_json_with_content_type(
+    state: &AppState,
+    uri: &str,
+    bearer: Option<&str>,
+) -> (StatusCode, String, serde_json::Value) {
+    let mut builder = Request::builder().method("GET").uri(uri);
+    if let Some(token) = bearer {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let response = router(state.clone())
+        .oneshot(builder.body(Body::empty()).expect("request must build"))
+        .await
+        .expect("router must respond");
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body must read");
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, content_type, json)
+}
+
 fn activate_uri(module_id: &str) -> String {
     format!("/v1/modules/{module_id}/activate")
 }
@@ -323,6 +359,23 @@ async fn authenticated_upload_activate_and_execute_round_trip() {
             .as_str()
             .is_some_and(|err| err.contains("diag-one")),
         "stderr must carry worker diagnostics: {executed}"
+    );
+    // The durable record is the same metadata view: duration comes from the
+    // same report duration as the execute response.
+    let execution_id = executed["execution_id"]
+        .as_str()
+        .expect("execution id must be a string");
+    let (status, history_record) = get_json(
+        &state,
+        &format!("/v1/executions/{execution_id}"),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "history body: {history_record}");
+    assert_eq!(history_record["execution_id"], executed["execution_id"]);
+    assert_eq!(
+        history_record["duration_ms"], executed["duration_ms"],
+        "history duration must equal the execute response duration"
     );
 
     // Pinned execution overrides the active pointer for this one request.
@@ -501,6 +554,15 @@ async fn v1_manifest_is_refused_for_execution_but_activates() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(json["code"], "legacy_manifest");
     assert_generic_error(&json, &root);
+    assert!(
+        state
+            .execution_service
+            .list_executions(10, 0)
+            .await
+            .expect("history list must succeed")
+            .is_empty(),
+        "a legacy-manifest refusal must not create a history row"
+    );
     cleanup(&root);
 }
 
@@ -709,6 +771,21 @@ async fn execution_capacity_exhaustion_is_service_unavailable() {
         .expect("the first execution task must not panic");
     assert_eq!(first_status, StatusCode::OK, "first body: {first_body}");
     assert_eq!(first_body["outcome"], "timed_out");
+    let timed_out_id = first_body["execution_id"]
+        .as_str()
+        .expect("timed-out execution id must be a string");
+    let (status, record) = get_json(
+        &state,
+        &format!("/v1/executions/{timed_out_id}"),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "timed-out history body: {record}");
+    assert_eq!(record["execution_id"], first_body["execution_id"]);
+    assert_eq!(
+        record["outcome"], "timed_out",
+        "a timed-out worker must persist its own outcome"
+    );
     cleanup(&root);
 }
 
@@ -1083,5 +1160,502 @@ async fn blocked_activation_does_not_starve_the_health_probe() {
         .expect("activation must finish after release")
         .expect("activation task must not panic");
     assert_eq!(status, StatusCode::OK, "activation body: {body}");
+    cleanup(&root);
+}
+
+#[tokio::test]
+#[serial]
+async fn execution_history_lists_and_fetches_metadata_only() {
+    let root = temp_root("history-api");
+    let state = assembled_state(&root, 30, 4);
+
+    let (status, first_upload) = post_upload(
+        &state,
+        &package_bytes(MODULE_ID, "1.2.0", 2, SCRIPT_ROWS_3),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = post_upload(
+        &state,
+        &package_bytes(MODULE_ID, "1.3.0", 2, SCRIPT_ROWS_4),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = post_json(
+        &state,
+        &activate_uri(MODULE_ID),
+        serde_json::json!({"version": "1.2.0"}),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, active) = post_json(
+        &state,
+        &execute_uri(MODULE_ID),
+        serde_json::json!({
+            "function": "run",
+            "configuration": {"batch": 7, "secret": "do-not-store-me"},
+            "deadline_secs": 5
+        }),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "active execution body: {active}");
+    let active_id = active["execution_id"]
+        .as_str()
+        .expect("execution id must be a string")
+        .to_owned();
+
+    // Before the pinned run, exactly one execution exists and it matches the
+    // execute response field-for-field.
+    let (status, single) = get_json(&state, "/v1/executions", Some(TOKEN)).await;
+    assert_eq!(status, StatusCode::OK, "single history body: {single}");
+    let single_records = single["executions"]
+        .as_array()
+        .expect("history list must carry an executions array");
+    assert_eq!(single_records.len(), 1, "exactly one execution must exist");
+    let single_record = &single_records[0];
+    assert_eq!(single_record["execution_id"], active_id);
+    assert_eq!(single_record["module_id"], MODULE_ID);
+    assert_eq!(single_record["version"], "1.2.0");
+    assert_eq!(single_record["digest"], first_upload["digest"]);
+    assert_eq!(single_record["function"], "run");
+    assert_eq!(single_record["outcome"], "succeeded");
+    assert!(
+        single_record["started_at_ms"]
+            .as_i64()
+            .expect("started_at_ms must be an integer")
+            <= single_record["finished_at_ms"]
+                .as_i64()
+                .expect("finished_at_ms must be an integer"),
+        "started_at_ms must not be after finished_at_ms"
+    );
+    assert!(single_record["duration_ms"].is_u64());
+    for forbidden in ["stdout", "stderr", "configuration"] {
+        assert!(
+            single_record.get(forbidden).is_none(),
+            "history must not expose {forbidden}: {single_record}"
+        );
+    }
+    let (status, single_detail) =
+        get_json(&state, &format!("/v1/executions/{active_id}"), Some(TOKEN)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(single_detail, *single_record);
+
+    let (status, pinned) = post_json(
+        &state,
+        &execute_uri(MODULE_ID),
+        serde_json::json!({
+            "version": "1.3.0",
+            "function": "run",
+            "configuration": {"batch": 9, "secret": "do-not-store-me"},
+            "deadline_secs": 5
+        }),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "pinned execution body: {pinned}");
+    let pinned_id = pinned["execution_id"]
+        .as_str()
+        .expect("execution id must be a string")
+        .to_owned();
+
+    let (status, list) = get_json(&state, "/v1/executions", Some(TOKEN)).await;
+    assert_eq!(status, StatusCode::OK, "history list body: {list}");
+    assert_eq!(list["limit"].as_u64(), Some(50), "default limit");
+    assert_eq!(list["offset"].as_u64(), Some(0), "default offset");
+    let records = list["executions"]
+        .as_array()
+        .expect("history list must carry an executions array");
+    assert_eq!(records.len(), 2, "two executions must be recorded");
+    assert_eq!(
+        records[0]["execution_id"], pinned_id,
+        "history must be newest first"
+    );
+    assert_eq!(records[1]["execution_id"], active_id);
+
+    let (status, detail_active) =
+        get_json(&state, &format!("/v1/executions/{active_id}"), Some(TOKEN)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail_active, records[1]);
+
+    let (status, detail_pinned) =
+        get_json(&state, &format!("/v1/executions/{pinned_id}"), Some(TOKEN)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail_pinned, records[0]);
+
+    // Offset selects the older record while the page size stays bounded.
+    let (status, page) = get_json(&state, "/v1/executions?limit=1&offset=1", Some(TOKEN)).await;
+    assert_eq!(status, StatusCode::OK, "offset page body: {page}");
+    assert_eq!(page["limit"].as_u64(), Some(1));
+    assert_eq!(page["offset"].as_u64(), Some(1));
+    let page_records = page["executions"]
+        .as_array()
+        .expect("offset page must carry an executions array");
+    assert_eq!(page_records.len(), 1);
+    assert_eq!(page_records[0]["execution_id"], active_id);
+
+    let active_record = &records[1];
+    assert_eq!(active_record["module_id"], MODULE_ID);
+    assert_eq!(active_record["version"], "1.2.0");
+    assert_eq!(active_record["digest"], first_upload["digest"]);
+    assert_eq!(active_record["function"], "run");
+    assert_eq!(active_record["outcome"], "succeeded");
+    assert_eq!(records[0]["version"], "1.3.0");
+    let started = active_record["started_at_ms"]
+        .as_i64()
+        .expect("started_at_ms must be an integer");
+    let finished = active_record["finished_at_ms"]
+        .as_i64()
+        .expect("finished_at_ms must be an integer");
+    assert!(
+        started <= finished,
+        "started_at_ms must not be after finished_at_ms"
+    );
+    assert!(
+        active_record["duration_ms"].is_u64(),
+        "duration_ms must be a non-negative integer"
+    );
+    for forbidden in ["stdout", "stderr", "configuration"] {
+        assert!(
+            active_record.get(forbidden).is_none(),
+            "history must not expose {forbidden}: {active_record}"
+        );
+    }
+
+    let serialized = serde_json::to_string(&list).expect("history must serialize");
+    let root_text = root.to_str().expect("temp root must be UTF-8");
+    for forbidden in [
+        root_text,
+        ".zip",
+        "os error",
+        "do-not-store-me",
+        "\"batch\"",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "history response leaked {forbidden}: {serialized}"
+        );
+    }
+    assert!(
+        !serialized.chars().any(char::is_control),
+        "history response contains a control character: {serialized:?}"
+    );
+
+    let rows = state
+        .execution_service
+        .list_executions(10, 0)
+        .await
+        .expect("history rows must read");
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        for field in [
+            &row.module_id,
+            &row.version,
+            &row.digest,
+            &row.function,
+            &row.outcome,
+        ] {
+            assert!(!field.contains('/'), "history row leaked a path: {field}");
+            assert!(
+                !field.contains(".zip"),
+                "history row leaked a path: {field}"
+            );
+            assert!(
+                !field.chars().any(char::is_control),
+                "history row contains a control character: {field:?}"
+            );
+        }
+        assert_eq!(row.digest.len(), 64);
+    }
+    cleanup(&root);
+}
+
+#[tokio::test]
+#[serial]
+async fn execution_history_survives_an_assembled_host_restart() {
+    let root = temp_root("history-restart");
+    let config = config_for(&root, 30, 4);
+    let first = Host::assemble(config.clone())
+        .expect("first assembly must succeed")
+        .into_state();
+    let (status, _) = post_upload(
+        &first,
+        &package_bytes(MODULE_ID, "1.2.0", 2, SCRIPT_ROWS_3),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = post_json(
+        &first,
+        &activate_uri(MODULE_ID),
+        serde_json::json!({"version": "1.2.0"}),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, executed) = post_json(
+        &first,
+        &execute_uri(MODULE_ID),
+        serde_json::json!({"function": "run", "deadline_secs": 5}),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "execution body: {executed}");
+    let execution_id = executed["execution_id"]
+        .as_str()
+        .expect("execution id must be a string")
+        .to_owned();
+    drop(first);
+
+    let second = Host::assemble(config)
+        .expect("restart assembly must succeed")
+        .into_state();
+    let (status, record) = get_json(
+        &second,
+        &format!("/v1/executions/{execution_id}"),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "history must survive a restart: {record}"
+    );
+    assert_eq!(record["execution_id"], execution_id);
+    assert_eq!(record["module_id"], MODULE_ID);
+    assert_eq!(record["version"], "1.2.0");
+    assert_eq!(record["outcome"], "succeeded");
+    cleanup(&root);
+}
+
+#[tokio::test]
+#[serial]
+async fn execution_history_routes_require_the_bearer_token() {
+    let root = temp_root("history-bearer");
+    let state = assembled_state(&root, 30, 4);
+
+    for uri in [
+        "/v1/executions",
+        "/v1/executions/exec-known",
+        "/v1/executions/%FF",
+    ] {
+        for bearer in [None, Some("wrong-token")] {
+            let (status, json) = get_json(&state, uri, bearer).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "uri {uri}");
+            assert_eq!(json["code"], "missing_or_invalid_bearer", "uri {uri}");
+            assert_generic_error(&json, &root);
+        }
+    }
+    cleanup(&root);
+}
+
+#[tokio::test]
+#[serial]
+async fn execution_history_lookup_and_pagination_reject_invalid_input() {
+    let root = temp_root("history-invalid");
+    let state = assembled_state(&root, 30, 4);
+
+    let (status, missing) =
+        get_json(&state, "/v1/executions/exec-does-not-exist", Some(TOKEN)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(missing["code"], "execution_not_found");
+    assert_generic_error(&missing, &root);
+
+    let overlong = "a".repeat(129);
+    for uri in [
+        "/v1/executions/exec%2Fescape".to_owned(),
+        "/v1/executions/exec%0Acontrol".to_owned(),
+        "/v1/executions/exec.with.dots".to_owned(),
+        format!("/v1/executions/{overlong}"),
+        // Percent-decoded bytes that are not valid UTF-8 must reach the JSON
+        // error contract, not axum's text/plain extractor rejection.
+        "/v1/executions/%FF".to_owned(),
+        "/v1/executions/%C3%28".to_owned(),
+        "/v1/executions/%80".to_owned(),
+        "/v1/executions/%ED%A0%80".to_owned(),
+        "/v1/executions/%2e%2e%2f".to_owned(),
+    ] {
+        let (status, content_type, json) =
+            get_json_with_content_type(&state, &uri, Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "uri {uri}: {json}");
+        assert!(
+            content_type.starts_with("application/json"),
+            "uri {uri} must use the JSON contract, got {content_type:?}"
+        );
+        assert_eq!(json["code"], "invalid_execution_id", "uri {uri}: {json}");
+        assert_eq!(
+            json["message"], "execution id is not valid",
+            "uri {uri} must not leak extractor text: {json}"
+        );
+        assert_generic_error(&json, &root);
+    }
+
+    for query in [
+        "limit=0",
+        "limit=201",
+        "limit=-1",
+        "limit=abc",
+        "limit=1.5",
+        "limit=999999999999999999999999",
+        "offset=1000001",
+        "limit=1&limit=2",
+        "offset=0&offset=1",
+    ] {
+        let uri = format!("/v1/executions?{query}");
+        let (status, json) = get_json(&state, &uri, Some(TOKEN)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "query {query} must be a JSON 400: {json}"
+        );
+        assert_eq!(json["code"], "invalid_pagination", "query {query}: {json}");
+    }
+
+    // Unknown query fields are ignored, not rejected.
+    let (status, json) = get_json(
+        &state,
+        "/v1/executions?limit=1&offset=0&unexpected=value",
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "unknown query field: {json}");
+    assert_eq!(json["limit"].as_u64(), Some(1));
+    cleanup(&root);
+}
+
+#[tokio::test]
+#[serial]
+async fn history_write_failure_is_a_generic_internal_error() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use conductor::control_plane::activate_module::ActivationPolicy;
+    use conductor::control_plane::execute_module::ExecutionService;
+    use conductor::executions::executor::ExecutionLimits;
+    use conductor::executions::history::ExecutionHistoryStore;
+    use conductor::packages::policy::PackageValidationPolicy;
+    use conductor::storage::database::Database;
+
+    let root = temp_root("history-write-failure-api");
+    let mut state = assembled_state(&root, 30, 4);
+    // Replace only the service's history store with an unmigrated database:
+    // the worker still runs, but the receipt insert can only fail.
+    let unmigrated = Database::open_in_memory().expect("in-memory database must open");
+    state.execution_service = Arc::new(
+        ExecutionService::new(
+            Arc::clone(&state.registry),
+            state.artifact_dir.clone(),
+            root.join("staging"),
+            ActivationPolicy::new(vec!["rust".to_owned()]).expect("activation policy"),
+            ExecutionLimits::default(),
+            Duration::from_secs(30),
+            PackageValidationPolicy::production(),
+            HashSet::from(["k1".to_owned()]),
+            4,
+            Arc::new(ExecutionHistoryStore::new(Arc::new(unmigrated))),
+        )
+        .expect("execution service must build"),
+    );
+
+    let (status, _) = post_upload(
+        &state,
+        &package_bytes(MODULE_ID, "1.2.0", 2, SCRIPT_ROWS_3),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = post_json(
+        &state,
+        &activate_uri(MODULE_ID),
+        serde_json::json!({"version": "1.2.0"}),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, json) = post_json(
+        &state,
+        &execute_uri(MODULE_ID),
+        serde_json::json!({"function": "run", "deadline_secs": 5}),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a failed history write must be a 500, not a successful receipt: {json}"
+    );
+    assert_eq!(json["code"], "internal");
+    assert_eq!(json["message"], "internal error");
+    assert!(
+        json.get("execution_id").is_none(),
+        "a failed history write must not return a receipt: {json}"
+    );
+    assert_generic_error(&json, &root);
+    cleanup(&root);
+}
+
+#[tokio::test]
+#[serial]
+async fn history_read_failure_is_a_generic_internal_error() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use conductor::control_plane::activate_module::ActivationPolicy;
+    use conductor::control_plane::execute_module::ExecutionService;
+    use conductor::executions::executor::ExecutionLimits;
+    use conductor::executions::history::ExecutionHistoryStore;
+    use conductor::packages::policy::PackageValidationPolicy;
+    use conductor::storage::database::Database;
+
+    let root = temp_root("history-read-failure-api");
+    let mut state = assembled_state(&root, 30, 4);
+    // An unmigrated database has no `executions` table, so both history
+    // reads can only fail. The API must still speak the generic JSON 500.
+    let unmigrated = Database::open_in_memory().expect("in-memory database must open");
+    state.execution_service = Arc::new(
+        ExecutionService::new(
+            Arc::clone(&state.registry),
+            state.artifact_dir.clone(),
+            root.join("staging"),
+            ActivationPolicy::new(vec!["rust".to_owned()]).expect("activation policy"),
+            ExecutionLimits::default(),
+            Duration::from_secs(30),
+            PackageValidationPolicy::production(),
+            HashSet::from(["k1".to_owned()]),
+            4,
+            Arc::new(ExecutionHistoryStore::new(Arc::new(unmigrated))),
+        )
+        .expect("execution service must build"),
+    );
+
+    let root_text = root.to_str().expect("temp root must be UTF-8");
+    for uri in ["/v1/executions", "/v1/executions/exec-known"] {
+        let (status, content_type, json) =
+            get_json_with_content_type(&state, uri, Some(TOKEN)).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "uri {uri} must be a generic 500: {json}"
+        );
+        assert!(
+            content_type.starts_with("application/json"),
+            "uri {uri} must use the JSON contract, got {content_type:?}"
+        );
+        assert_eq!(json["code"], "internal", "uri {uri}: {json}");
+        assert_eq!(json["message"], "internal error", "uri {uri}: {json}");
+        assert_generic_error(&json, &root);
+        let serialized = json.to_string();
+        for leaked in ["no such table", "executions", "SELECT", root_text] {
+            assert!(
+                !serialized.contains(leaked),
+                "uri {uri} leaked {leaked:?}: {serialized}"
+            );
+        }
+    }
     cleanup(&root);
 }

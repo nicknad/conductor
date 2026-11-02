@@ -45,10 +45,11 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::api::errors::ApiError;
-use crate::api::executions::{post_activate, post_execute};
+use crate::api::executions::{get_execution, get_executions, post_activate, post_execute};
 use crate::api::uploads::{post_package, request_id, require_bearer, AppState};
 use crate::api::{
-    ACTIVATE_MODULE_PATH, EXECUTE_MODULE_PATH, JSON_BODY_LIMIT_BYTES, PACKAGE_UPLOAD_PATH,
+    ACTIVATE_MODULE_PATH, EXECUTE_MODULE_PATH, EXECUTIONS_PATH, EXECUTION_DETAIL_PATH,
+    JSON_BODY_LIMIT_BYTES, PACKAGE_UPLOAD_PATH,
 };
 use crate::audit::event::{RejectionEvent, RejectionStage};
 
@@ -126,6 +127,24 @@ pub fn router(state: AppState) -> Router {
                     state.clone(),
                     require_bearer,
                 )),
+        )
+        // Execution history is read-only metadata. Get routes need no body
+        // limit, but bearer auth stays outermost on both paths. The exact
+        // list path and the `{execution_id}` detail path are distinct axum
+        // routes, so neither shadows the other.
+        .route(
+            EXECUTIONS_PATH,
+            get(get_executions).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_bearer,
+            )),
+        )
+        .route(
+            EXECUTION_DETAIL_PATH,
+            get(get_execution).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_bearer,
+            )),
         )
         .route("/healthz", get(healthz))
         // axum's extractor default is 2 MiB; disabling it keeps the

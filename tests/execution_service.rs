@@ -21,6 +21,7 @@ use conductor::control_plane::execute_module::{
 use conductor::control_plane::register_package::register;
 use conductor::control_plane::validate_package::{PackageValidationBuilder, ValidatedPackage};
 use conductor::executions::executor::{ExecutionLimits, ExecutionOutcome};
+use conductor::executions::history::ExecutionHistoryStore;
 use conductor::modules::registry::{IntegrityState, ModuleRecord, ModuleRegistry};
 use conductor::packages::archive::QuarantinedFile;
 use conductor::packages::digest::Sha256DigestProvider;
@@ -32,6 +33,7 @@ use conductor::packages::signature::{
 use conductor::storage::artifact_store::{
     artifact_relative_path, canonical_artifact_relpath, promote_quarantined,
 };
+use conductor::storage::database::Database;
 
 /// Test-only signing key. This private key must never sign anything outside
 /// these tests.
@@ -321,6 +323,25 @@ impl Fixture {
         max_concurrent_executions: usize,
         package_policy: PackageValidationPolicy,
     ) -> Result<ExecutionService, ExecutionError> {
+        self.try_service_with_history(
+            registry,
+            max_deadline,
+            allowed_signers,
+            max_concurrent_executions,
+            package_policy,
+            Arc::new(ExecutionHistoryStore::open_in_memory().expect("execution history must open")),
+        )
+    }
+
+    fn try_service_with_history(
+        &self,
+        registry: Arc<ModuleRegistry>,
+        max_deadline: Duration,
+        allowed_signers: HashSet<String>,
+        max_concurrent_executions: usize,
+        package_policy: PackageValidationPolicy,
+        history: Arc<ExecutionHistoryStore>,
+    ) -> Result<ExecutionService, ExecutionError> {
         ExecutionService::new(
             registry,
             self.artifact_dir.clone(),
@@ -331,6 +352,7 @@ impl Fixture {
             package_policy,
             allowed_signers,
             max_concurrent_executions,
+            history,
         )
     }
 
@@ -498,6 +520,198 @@ async fn registered_worker_executes_after_the_registry_is_reopened() {
         .stderr
         .text_lossy()
         .contains("diagnostic: reopened worker"));
+}
+
+#[tokio::test]
+async fn completed_execution_persists_a_metadata_receipt() {
+    let scratch = Scratch::new("history-receipt");
+    let fixture = fixture(&scratch, MODULE_ID, VERSION, SCRIPT_OK);
+    let service = fixture.service(
+        Arc::clone(&fixture.active_registry(fixture.record())),
+        Duration::from_secs(30),
+    );
+
+    let receipt = service
+        .execute(
+            MODULE_ID,
+            None,
+            "run",
+            serde_json::json!({"batch": 7}),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("execution must succeed");
+
+    let record = service
+        .find_execution(&receipt.execution_id)
+        .await
+        .expect("history lookup must succeed")
+        .expect("a completed execution must persist a receipt");
+    assert_eq!(record.execution_id, receipt.execution_id);
+    assert_eq!(record.module_id, MODULE_ID);
+    assert_eq!(record.version, VERSION);
+    assert_eq!(record.digest, receipt.digest.to_hex());
+    assert_eq!(record.function, "run");
+    assert_eq!(record.outcome, "succeeded");
+    assert!(
+        record.started_at <= record.finished_at,
+        "started_at must not be after finished_at"
+    );
+    assert!(
+        record.duration_ms < 60_000,
+        "a fixture worker cannot run for a minute: {}",
+        record.duration_ms
+    );
+
+    let listed = service
+        .list_executions(10, 0)
+        .await
+        .expect("history list must succeed");
+    assert_eq!(listed, vec![record]);
+}
+
+#[tokio::test]
+async fn failed_worker_persists_a_failed_outcome() {
+    const SCRIPT_FAILED: &str = r#"#!/bin/sh
+read -r line
+printf '{"protocol_version":1,"status":"failed","message":"boom"}\n'
+"#;
+    let scratch = Scratch::new("history-failed");
+    let fixture = fixture(&scratch, MODULE_ID, VERSION, SCRIPT_FAILED);
+    let service = fixture.service(
+        Arc::clone(&fixture.active_registry(fixture.record())),
+        Duration::from_secs(30),
+    );
+
+    let receipt = service
+        .execute(
+            MODULE_ID,
+            None,
+            "run",
+            serde_json::json!({}),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("a spawned worker reports through its outcome, not an error");
+    assert_eq!(receipt.outcome.as_str(), "failed");
+
+    let record = service
+        .find_execution(&receipt.execution_id)
+        .await
+        .expect("history lookup must succeed")
+        .expect("a failed worker must still persist a receipt");
+    assert_eq!(record.outcome, "failed");
+    assert_eq!(record.execution_id, receipt.execution_id);
+}
+
+#[tokio::test]
+async fn nonzero_worker_exit_persists_worker_error() {
+    let scratch = Scratch::new("history-nonzero-exit");
+    let fixture = fixture(
+        &scratch,
+        MODULE_ID,
+        VERSION,
+        "#!/bin/sh\nread -r line\nexit 3\n",
+    );
+    let service = fixture.service(
+        Arc::clone(&fixture.active_registry(fixture.record())),
+        Duration::from_secs(30),
+    );
+
+    let receipt = service
+        .execute(
+            MODULE_ID,
+            None,
+            "run",
+            serde_json::json!({}),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("a spawned worker reports through its outcome, not an error");
+    assert_eq!(receipt.outcome.as_str(), "worker_error");
+
+    let record = service
+        .find_execution(&receipt.execution_id)
+        .await
+        .expect("history lookup must succeed")
+        .expect("a nonzero worker exit must still persist a receipt");
+    assert_eq!(record.outcome, "worker_error");
+}
+
+#[tokio::test]
+async fn pre_spawn_refusals_do_not_create_history_rows() {
+    let scratch = Scratch::new("history-refusals");
+    let fixture = fixture(&scratch, MODULE_ID, VERSION, SCRIPT_OK);
+    let service = fixture.service(
+        Arc::clone(&fixture.active_registry(fixture.record())),
+        Duration::from_secs(30),
+    );
+
+    let err = refused_execution(&service, "missing-module").await;
+    assert!(matches!(
+        err,
+        ExecutionError::Activation(ActivationError::NoActiveVersion { .. })
+    ));
+    assert!(
+        service
+            .list_executions(10, 0)
+            .await
+            .expect("history list must succeed")
+            .is_empty(),
+        "a pre-spawn refusal must not create a history row"
+    );
+
+    let mut bytes = std::fs::read(&fixture.artifact_path).expect("artifact must be readable");
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xFF;
+    std::fs::write(&fixture.artifact_path, &bytes).expect("tampered bytes must be writable");
+    let err = refused_execution(&service, MODULE_ID).await;
+    assert!(matches!(err, ExecutionError::ArtifactDigestMismatch { .. }));
+    assert!(
+        service
+            .list_executions(10, 0)
+            .await
+            .expect("history list must succeed")
+            .is_empty(),
+        "an integrity refusal must not create a history row"
+    );
+}
+
+#[tokio::test]
+async fn history_write_failure_fails_the_execution_without_a_receipt() {
+    let scratch = Scratch::new("history-write-failure");
+    let fixture = fixture(&scratch, MODULE_ID, VERSION, SCRIPT_OK);
+    // An unmigrated database has no `executions` table, so the insert can
+    // only fail. The worker still runs; the missing durable receipt must
+    // fail the request instead of returning a successful receipt.
+    let unmigrated = Database::open_in_memory().expect("in-memory database must open");
+    let history = Arc::new(ExecutionHistoryStore::new(Arc::new(unmigrated)));
+    let service = fixture
+        .try_service_with_history(
+            Arc::clone(&fixture.active_registry(fixture.record())),
+            Duration::from_secs(30),
+            HashSet::from(["k1".to_owned()]),
+            4,
+            PackageValidationPolicy::production(),
+            history,
+        )
+        .expect("execution service must build");
+
+    let err = service
+        .execute(
+            MODULE_ID,
+            None,
+            "run",
+            serde_json::json!({}),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect_err("a history write failure must not return a receipt");
+    assert!(
+        matches!(err, ExecutionError::History(_)),
+        "expected a typed history failure, got {err:?}"
+    );
+    assert_eq!(err.to_string(), "failed to record execution history");
 }
 
 #[tokio::test]
@@ -1908,6 +2122,7 @@ async fn execution_service_rejects_unusable_storage_directories() {
             PackageValidationPolicy::production(),
             HashSet::from(["k1".to_owned()]),
             4,
+            Arc::new(ExecutionHistoryStore::open_in_memory().expect("execution history must open")),
         )
     };
 

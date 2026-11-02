@@ -160,6 +160,53 @@ pub enum ExecutionOutcome {
     ProtocolViolation { detail: String },
 }
 
+impl ExecutionOutcome {
+    /// Stable lowercase name used by the API contract and the persisted
+    /// execution history. Changing one of these is a breaking change.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Succeeded { .. } => "succeeded",
+            Self::Failed { .. } => "failed",
+            Self::TimedOut { .. } => "timed_out",
+            Self::Cancelled { .. } => "cancelled",
+            Self::WorkerError { .. } => "worker_error",
+            Self::ProtocolViolation { .. } => "protocol_violation",
+        }
+    }
+
+    /// True when `name` is one of the stable names returned by [`Self::as_str`].
+    ///
+    /// Persisted history rows are untrusted input on read: a row whose
+    /// `outcome` is outside this vocabulary must fail closed instead of being
+    /// served. Deriving the set from `as_str` keeps one source of truth.
+    #[must_use]
+    pub fn is_name(name: &str) -> bool {
+        [
+            Self::Succeeded {
+                result: serde_json::Value::Null,
+            },
+            Self::Failed {
+                message: String::new(),
+            },
+            Self::TimedOut {
+                deadline: Duration::ZERO,
+            },
+            Self::Cancelled {
+                reason: String::new(),
+            },
+            Self::WorkerError {
+                detail: String::new(),
+            },
+            Self::ProtocolViolation {
+                detail: String::new(),
+            },
+        ]
+        .iter()
+        .any(|outcome| outcome.as_str() == name)
+    }
+}
+
 /// What one execution produced, for the execution record.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionReport {
@@ -907,6 +954,39 @@ fn describe_exit(status: &ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outcome_name_predicate_matches_as_str() {
+        for outcome in [
+            ExecutionOutcome::Succeeded {
+                result: serde_json::Value::Null,
+            },
+            ExecutionOutcome::Failed {
+                message: String::new(),
+            },
+            ExecutionOutcome::TimedOut {
+                deadline: Duration::from_secs(1),
+            },
+            ExecutionOutcome::Cancelled {
+                reason: String::new(),
+            },
+            ExecutionOutcome::WorkerError {
+                detail: String::new(),
+            },
+            ExecutionOutcome::ProtocolViolation {
+                detail: String::new(),
+            },
+        ] {
+            assert!(
+                ExecutionOutcome::is_name(outcome.as_str()),
+                "{:?} must be a stable name",
+                outcome.as_str()
+            );
+        }
+        for name in ["", "TimedOut", "timeout", "succeeded "] {
+            assert!(!ExecutionOutcome::is_name(name), "{name:?} must be refused");
+        }
+    }
 
     #[test]
     fn default_limits_are_nonzero_and_bounded() {

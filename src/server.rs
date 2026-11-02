@@ -27,6 +27,7 @@ use crate::control_plane::activate_module::{ActivationError, ActivationPolicy};
 use crate::control_plane::execute_module::{ExecutionError, ExecutionService};
 use crate::control_plane::validate_package::{BuildError, PackageValidationBuilder};
 use crate::executions::executor::ExecutionLimits;
+use crate::executions::history::ExecutionHistoryStore;
 use crate::modules::registry::ModuleRegistry;
 use crate::packages::policy::{PackageValidationPolicy, PolicyError};
 use crate::storage::database::{Database, DatabaseError};
@@ -100,7 +101,8 @@ impl Host {
         let database = Arc::new(Database::open(&config.database_path())?);
         database.migrate()?;
         let registry = Arc::new(ModuleRegistry::from_database(Arc::clone(&database)));
-        let rejection_store = Arc::new(RejectionStore::new(database));
+        let rejection_store = Arc::new(RejectionStore::new(Arc::clone(&database)));
+        let execution_history = Arc::new(ExecutionHistoryStore::new(Arc::clone(&database)));
 
         // The signer allowlist is the configured trust-store ids, trimmed to
         // the same form uploads and activation use. Trust-store construction
@@ -120,6 +122,7 @@ impl Host {
             package_policy,
             allowed_signers,
             config.max_concurrent_executions,
+            execution_history,
         )?);
 
         // `validate_for_startup` guarantees a token; do not panic if that
@@ -431,6 +434,43 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].stage, "transport");
         assert_eq!(rows[0].code, "startup_wiring_test");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn assemble_wires_execution_history_to_the_shared_database() {
+        use crate::executions::history::ExecutionRecord;
+
+        let root = temp_root("history-wiring");
+        let host = Host::assemble(test_config(&root)).expect("valid config must assemble");
+        let database_path = host.config().database_path();
+
+        // Write through a separate handle to the assembled database file. If
+        // the service were backed by a different database (or an in-memory
+        // store), it could not read this row.
+        let database = Arc::new(Database::open(&database_path).expect("database must open"));
+        database.migrate().expect("database must migrate");
+        let store = ExecutionHistoryStore::new(Arc::clone(&database));
+        let record = ExecutionRecord {
+            execution_id: "exec-startup-wiring".to_owned(),
+            module_id: "reporting-service".to_owned(),
+            version: "1.2.0".to_owned(),
+            digest: "ab".repeat(32),
+            function: "run".to_owned(),
+            outcome: "succeeded".to_owned(),
+            started_at: SystemTime::UNIX_EPOCH + Duration::from_millis(1_000),
+            finished_at: SystemTime::UNIX_EPOCH + Duration::from_millis(1_025),
+            duration_ms: 25,
+        };
+        store.record(&record).expect("history insert must succeed");
+
+        let rows = host
+            .state()
+            .execution_service
+            .list_executions(10, 0)
+            .await
+            .expect("the assembled service must read execution history");
+        assert_eq!(rows, vec![record]);
         cleanup(&root);
     }
 

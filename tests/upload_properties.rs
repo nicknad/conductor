@@ -22,6 +22,7 @@ use conductor::control_plane::activate_module::ActivationPolicy;
 use conductor::control_plane::execute_module::ExecutionService;
 use conductor::control_plane::validate_package::PackageValidationBuilder;
 use conductor::executions::executor::ExecutionLimits;
+use conductor::executions::history::ExecutionHistoryStore;
 use conductor::modules::registry::ModuleRegistry;
 use conductor::packages::policy::PackageValidationPolicy;
 use conductor::packages::signature::{
@@ -96,6 +97,7 @@ fn test_state(tag: &str) -> (AppState, PathBuf) {
             PackageValidationPolicy::production(),
             HashSet::from(["k1".to_owned()]),
             UPLOAD_SLOTS,
+            Arc::new(ExecutionHistoryStore::open_in_memory().expect("execution history must open")),
         )
         .expect("execution service must build"),
     );

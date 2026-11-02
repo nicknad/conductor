@@ -37,4 +37,7 @@
 //! handed.
 
 pub mod executor;
+pub mod history;
 pub mod protocol;
+
+pub use history::{ExecutionHistoryStore, ExecutionRecord};

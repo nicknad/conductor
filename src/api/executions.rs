@@ -23,8 +23,8 @@
 
 use std::time::Duration;
 
-use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, State};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -36,13 +36,22 @@ use crate::audit::event::{RejectionEvent, RejectionStage};
 use crate::control_plane::activate_module::{ActivatedModule, ActivationError};
 use crate::control_plane::execute_module::{ExecutionError, ExecutionReceipt};
 use crate::executions::executor::{ExecutionError as ExecutorError, ExecutionOutcome, TargetError};
+use crate::executions::history::{ExecutionRecord, MAX_EXECUTION_ID_BYTES, MAX_LIST_LIMIT};
 use crate::executions::protocol::MAX_FIELD_BYTES;
 use crate::modules::activation::ActiveError;
+use crate::storage::database::to_millis;
 use crate::storage::staging::StagingError;
 
 /// Deadline applied when the caller omits `deadline_secs`, clamped down to
 /// the host maximum when that maximum is lower.
 const DEFAULT_EXECUTION_DEADLINE_SECS: u64 = 30;
+
+/// Default page size for `GET /v1/executions` when `limit` is omitted.
+const DEFAULT_EXECUTION_LIST_LIMIT: u64 = 50;
+
+/// Upper bound on `offset` for `GET /v1/executions`; keeps the parameter
+/// bounded while allowing deep history paging.
+const MAX_EXECUTION_LIST_OFFSET: u64 = 1_000_000;
 
 /// Request body for activation. Only the registered version is selectable.
 #[derive(Debug, Deserialize)]
@@ -91,18 +100,44 @@ pub struct ExecuteResponse {
     pub duration_ms: u64,
 }
 
-/// Stable wire names for [`ExecutionOutcome`]. These are part of the API
-/// contract; changing one is a breaking change.
+/// Query parameters for the execution-history list. Unknown fields are
+/// ignored; duplicate or malformed values become a stable `400`.
+#[derive(Debug, Deserialize)]
+pub struct ListExecutionsQuery {
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+/// `200` body for an execution-history page.
+#[derive(Debug, Serialize)]
+pub struct ListExecutionsResponse {
+    pub executions: Vec<ExecutionResponse>,
+    pub limit: usize,
+    pub offset: usize,
+}
+
+/// One durable execution receipt as returned by the history API. Metadata
+/// only: stdout, stderr, configuration, and secrets are never stored or
+/// returned.
+#[derive(Debug, Serialize)]
+pub struct ExecutionResponse {
+    pub execution_id: String,
+    pub module_id: String,
+    pub version: String,
+    pub digest: String,
+    pub function: String,
+    pub outcome: String,
+    pub started_at_ms: i64,
+    pub finished_at_ms: i64,
+    pub duration_ms: u64,
+}
+
+/// Stable wire names for [`ExecutionOutcome`]. Delegates to the outcome's
+/// own `as_str` so the API contract and persisted history rows cannot drift.
+/// Changing a name is a breaking change.
 #[must_use]
 pub fn outcome_name(outcome: &ExecutionOutcome) -> &'static str {
-    match outcome {
-        ExecutionOutcome::Succeeded { .. } => "succeeded",
-        ExecutionOutcome::Failed { .. } => "failed",
-        ExecutionOutcome::TimedOut { .. } => "timed_out",
-        ExecutionOutcome::Cancelled { .. } => "cancelled",
-        ExecutionOutcome::WorkerError { .. } => "worker_error",
-        ExecutionOutcome::ProtocolViolation { .. } => "protocol_violation",
-    }
+    outcome.as_str()
 }
 
 /// Activates and persists a registered module version.
@@ -323,6 +358,91 @@ pub async fn post_execute(
     }
 }
 
+/// Lists durable execution receipts, newest first. Authentication is
+/// enforced by the route's bearer layer; failures to read history map to a
+/// generic `500` with no database or OS detail.
+#[tracing::instrument(name = "list_executions", skip(state))]
+pub async fn get_executions(
+    State(state): State<AppState>,
+    query: Result<Query<ListExecutionsQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return invalid_pagination();
+    };
+    let limit = query.limit.unwrap_or(DEFAULT_EXECUTION_LIST_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+    let maximum_limit = u64::try_from(MAX_LIST_LIMIT).unwrap_or(u64::MAX);
+    if limit == 0 || limit > maximum_limit || offset > MAX_EXECUTION_LIST_OFFSET {
+        return invalid_pagination();
+    }
+    // The range check above makes both conversions lossless.
+    let limit = usize::try_from(limit).unwrap_or(MAX_LIST_LIMIT);
+    let offset = usize::try_from(offset).unwrap_or(0);
+
+    match state.execution_service.list_executions(limit, offset).await {
+        Ok(executions) => Json(ListExecutionsResponse {
+            executions: executions
+                .into_iter()
+                .map(ExecutionResponse::from)
+                .collect(),
+            limit,
+            offset,
+        })
+        .into_response(),
+        Err(_) => internal().into_response(),
+    }
+}
+
+/// Returns one durable execution receipt by id.
+#[tracing::instrument(name = "get_execution", skip(state, execution_id))]
+pub async fn get_execution(
+    State(state): State<AppState>,
+    execution_id: Result<Path<String>, PathRejection>,
+) -> Response {
+    // A non-UTF-8 percent-decoded id fails in the extractor, before the
+    // handler. Map it to the same stable JSON refusal as any other malformed
+    // id instead of letting axum's text/plain rejection escape.
+    let Ok(Path(execution_id)) = execution_id else {
+        return ApiError::BadRequest(
+            "invalid_execution_id",
+            "execution id is not valid".to_owned(),
+        )
+        .into_response();
+    };
+    if !is_safe_execution_id(&execution_id) {
+        return ApiError::BadRequest(
+            "invalid_execution_id",
+            "execution id is not valid".to_owned(),
+        )
+        .into_response();
+    }
+    match state.execution_service.find_execution(&execution_id).await {
+        Ok(Some(record)) => Json(ExecutionResponse::from(record)).into_response(),
+        Ok(None) => ApiError::NotFound("execution_not_found", "execution was not found".to_owned())
+            .into_response(),
+        Err(_) => internal().into_response(),
+    }
+}
+
+/// Server-generated execution ids are `exec-...`; this accepts exactly the
+/// bounded `[A-Za-z0-9_-]` set so separators, control bytes, and ANSI
+/// escapes are refused before a lookup.
+fn is_safe_execution_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_EXECUTION_ID_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn invalid_pagination() -> Response {
+    ApiError::BadRequest(
+        "invalid_pagination",
+        "pagination parameters are invalid".to_owned(),
+    )
+    .into_response()
+}
+
 impl From<ActivatedModule> for ActivateResponse {
     fn from(activated: ActivatedModule) -> Self {
         Self {
@@ -345,6 +465,22 @@ impl From<ExecutionReceipt> for ExecuteResponse {
             stdout: receipt.stdout.text_lossy().into_owned(),
             stderr: receipt.stderr.text_lossy().into_owned(),
             duration_ms: u64::try_from(receipt.duration.as_millis()).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+impl From<ExecutionRecord> for ExecutionResponse {
+    fn from(record: ExecutionRecord) -> Self {
+        Self {
+            execution_id: record.execution_id,
+            module_id: record.module_id,
+            version: record.version,
+            digest: record.digest,
+            function: record.function,
+            outcome: record.outcome,
+            started_at_ms: to_millis(record.started_at),
+            finished_at_ms: to_millis(record.finished_at),
+            duration_ms: record.duration_ms,
         }
     }
 }
@@ -434,7 +570,7 @@ fn activation_error(error: &ExecutionError) -> ApiError {
     match error {
         ExecutionError::Activation(inner) => activation_policy_error(inner),
         ExecutionError::PersistActive(inner) => active_error(inner),
-        ExecutionError::Registry(_) => internal(),
+        ExecutionError::Registry(_) | ExecutionError::History(_) => internal(),
         ExecutionError::EmptySignerAllowlist
         | ExecutionError::InvalidConcurrency { .. }
         | ExecutionError::InvalidStorageDirectory { .. }
@@ -566,6 +702,7 @@ fn execution_audit_detail(error: &ExecutionError) -> &'static str {
         ExecutionError::Activation(inner) => activation_audit_detail(inner),
         ExecutionError::PersistActive(_) => "failed to persist the active version",
         ExecutionError::Registry(_) => "registry storage failure",
+        ExecutionError::History(_) => "execution history write failed",
         ExecutionError::DeadlineExceeded { .. } => "requested deadline exceeds the host maximum",
         ExecutionError::Overloaded { .. } => "activation or execution capacity exhausted",
         ExecutionError::EmptySignerAllowlist => "execution signer allowlist is empty",
@@ -710,6 +847,31 @@ mod tests {
     }
 
     #[test]
+    fn execution_id_validation_accepts_only_the_bounded_safe_set() {
+        for value in [
+            "exec-123",
+            "exec_1",
+            "A1b2C3",
+            &"a".repeat(MAX_EXECUTION_ID_BYTES),
+        ] {
+            assert!(is_safe_execution_id(value), "{value:?} must be accepted");
+        }
+        for value in [
+            "",
+            "exec/1",
+            "exec\\1",
+            "exec\n1",
+            "exec\t1",
+            "exec.1",
+            "exec+1",
+            "exec 1",
+            &"a".repeat(MAX_EXECUTION_ID_BYTES + 1),
+        ] {
+            assert!(!is_safe_execution_id(value), "{value:?} must be refused");
+        }
+    }
+
+    #[test]
     fn execution_errors_never_expose_paths_or_manifest_text() {
         let errors = [
             ExecutionError::ArtifactMissing {
@@ -776,6 +938,9 @@ mod tests {
                     path: "payload/worker".to_owned(),
                     detail: "Permission denied (os error 13)".to_owned(),
                 },
+            )),
+            ExecutionError::History(crate::storage::database::DatabaseError::Query(
+                "INSERT INTO executions: /data/db: Permission denied (os error 13)".to_owned(),
             )),
         ];
         for error in errors {

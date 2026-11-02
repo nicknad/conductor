@@ -72,6 +72,7 @@ use crate::executions::executor::{
     CapturedOutput, ExecutionError as ExecutorError, ExecutionLimits, ExecutionOutcome,
     TargetError, WorkerExecutor, WorkerTarget,
 };
+use crate::executions::history::{ExecutionHistoryStore, ExecutionRecord};
 use crate::executions::protocol::{ExecutionRequest, Invocation};
 use crate::modules::activation::ActiveError;
 use crate::modules::registry::{IntegrityState, ModuleRecord, ModuleRegistry, RegistryError};
@@ -81,6 +82,7 @@ use crate::packages::digest::Sha256DigestProvider;
 use crate::packages::manifest::{Manifest, ManifestError, MANIFEST_FILE_NAME};
 use crate::packages::policy::PackageValidationPolicy;
 use crate::storage::artifact_store::canonical_artifact_relpath;
+use crate::storage::database::DatabaseError;
 use crate::storage::staging::{extract_registered, StagingError};
 
 static EXECUTION_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -216,6 +218,11 @@ pub enum ExecutionError {
     Target(#[from] TargetError),
     #[error(transparent)]
     Executor(#[from] ExecutorError),
+    /// The worker finished, but its metadata receipt could not be persisted.
+    /// The execution is not reported as successful: history is part of the
+    /// contract, and a failure here is a server-side (500-class) condition.
+    #[error("failed to record execution history")]
+    History(#[from] DatabaseError),
 }
 
 /// Everything the synchronous preparation phase produced: the registry
@@ -304,6 +311,9 @@ pub struct ExecutionService {
     /// Key ids currently permitted to execute. See the module docs: this is
     /// an allowlist, not a signature re-verification.
     allowed_signers: Arc<HashSet<String>>,
+    /// Durable metadata receipt sink. Every completed execution writes one
+    /// row before the receipt is returned.
+    history: Arc<ExecutionHistoryStore>,
     max_concurrent_executions: usize,
     execution_slots: Arc<Semaphore>,
     /// Bounds in-flight activation work. Activation reads and writes the
@@ -321,8 +331,9 @@ impl ExecutionService {
     /// Builds a service around one registry handle and immutable policy
     /// snapshot. `max_deadline` is the host-side ceiling for any requested
     /// execution deadline; longer requests are refused before resolution.
-    /// `allowed_signers` is the operator trust-store key-id allowlist and
-    /// `max_concurrent_executions` bounds in-flight workers.
+    /// `allowed_signers` is the operator trust-store key-id allowlist,
+    /// `max_concurrent_executions` bounds in-flight workers, and `history`
+    /// receives one metadata receipt per completed execution.
     ///
     /// Construction fails closed instead of silently repairing policy:
     /// an empty signer allowlist can authorize nothing and is refused; a
@@ -348,6 +359,7 @@ impl ExecutionService {
         package_policy: PackageValidationPolicy,
         allowed_signers: HashSet<String>,
         max_concurrent_executions: usize,
+        history: Arc<ExecutionHistoryStore>,
     ) -> Result<Self, ExecutionError> {
         if allowed_signers.is_empty() {
             return Err(ExecutionError::EmptySignerAllowlist);
@@ -366,6 +378,7 @@ impl ExecutionService {
             staging_dir,
             activation_policy,
             allowed_signers: Arc::new(allowed_signers),
+            history,
             max_concurrent_executions,
             execution_slots: Arc::new(Semaphore::new(max_concurrent_executions)),
             activation_slots: Arc::new(Semaphore::new(max_concurrent_executions)),
@@ -524,24 +537,96 @@ impl ExecutionService {
         let PreparedExecution {
             record,
             target,
-            permit: _permit,
+            permit: held_permit,
         } = prepared;
 
         let execution_id = next_execution_id();
+        let digest_hex = record.digest.to_hex();
         let request = ExecutionRequest::new(
             Invocation {
                 execution_id,
                 module_id: record.module_id.clone(),
                 version: record.version.clone(),
-                digest_hex: record.digest.to_hex(),
+                digest_hex: digest_hex.clone(),
                 function: function.to_owned(),
             },
             configuration,
             deadline,
         );
+        let started_at = SystemTime::now();
         let report = WorkerExecutor::new(self.limits)
             .execute(&target, request)
             .await?;
+        let finished_at = SystemTime::now();
+
+        let duration_ms = u64::try_from(report.duration.as_millis()).unwrap_or(u64::MAX);
+        let history_record = ExecutionRecord {
+            execution_id: report.execution_id.clone(),
+            module_id: record.module_id.clone(),
+            version: record.version.clone(),
+            digest: digest_hex.clone(),
+            function: function.to_owned(),
+            outcome: report.outcome.as_str().to_owned(),
+            started_at,
+            finished_at,
+            duration_ms,
+        };
+        // Emit the completion record before persisting: a finished execution
+        // stays observable even if the history insert later fails.
+        tracing::info!(
+            execution_id = %report.execution_id,
+            module_id = %record.module_id,
+            version = %record.version,
+            digest = %digest_hex,
+            function = %function,
+            outcome = %report.outcome.as_str(),
+            duration_ms,
+            "execution finished"
+        );
+
+        // History is part of the success contract: a completed worker whose
+        // receipt cannot be persisted is a 500-class failure, never a silent
+        // success with no durable record. SQLite I/O runs on the blocking
+        // pool; the owned permit moves into that task so caller cancellation
+        // cannot release capacity until the insert actually ends.
+        let history = Arc::clone(&self.history);
+        let persisted = tokio::task::spawn_blocking(move || {
+            let _held_permit = held_permit;
+            history.record(&history_record)
+        })
+        .await;
+        match persisted {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(
+                    execution_id = %report.execution_id,
+                    module_id = %record.module_id,
+                    version = %record.version,
+                    digest = %digest_hex,
+                    function = %function,
+                    outcome = %report.outcome.as_str(),
+                    duration_ms,
+                    error = %error,
+                    "execution history write failed"
+                );
+                return Err(ExecutionError::History(error));
+            }
+            Err(error) => {
+                tracing::error!(
+                    execution_id = %report.execution_id,
+                    module_id = %record.module_id,
+                    version = %record.version,
+                    digest = %digest_hex,
+                    function = %function,
+                    outcome = %report.outcome.as_str(),
+                    duration_ms,
+                    error = %error,
+                    "execution history write task failed"
+                );
+                return Err(ExecutionError::BlockingTask(error.to_string()));
+            }
+        }
+
         Ok(ExecutionReceipt {
             execution_id: report.execution_id,
             module_id: record.module_id,
@@ -552,6 +637,33 @@ impl ExecutionService {
             stderr: report.stderr,
             duration: report.duration,
         })
+    }
+
+    /// Newest-first page of durable execution history. Runs on the blocking
+    /// pool so SQLite I/O cannot stall the async runtime.
+    pub async fn list_executions(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ExecutionRecord>, ExecutionError> {
+        let history = Arc::clone(&self.history);
+        tokio::task::spawn_blocking(move || history.list(limit, offset))
+            .await
+            .map_err(|err| ExecutionError::BlockingTask(err.to_string()))?
+            .map_err(ExecutionError::History)
+    }
+
+    /// Looks up one durable execution receipt by id on the blocking pool.
+    pub async fn find_execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<ExecutionRecord>, ExecutionError> {
+        let history = Arc::clone(&self.history);
+        let execution_id = execution_id.to_owned();
+        tokio::task::spawn_blocking(move || history.get(&execution_id))
+            .await
+            .map_err(|err| ExecutionError::BlockingTask(err.to_string()))?
+            .map_err(ExecutionError::History)
     }
 }
 

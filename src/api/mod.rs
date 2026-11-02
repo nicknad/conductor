@@ -17,5 +17,11 @@ pub(crate) const ACTIVATE_MODULE_PATH: &str = "/v1/modules/{module_id}/activate"
 /// Executes one function of the active (or pinned) module version.
 pub(crate) const EXECUTE_MODULE_PATH: &str = "/v1/modules/{module_id}/executions";
 
+/// Lists durable execution receipts, newest first.
+pub(crate) const EXECUTIONS_PATH: &str = "/v1/executions";
+
+/// Returns one durable execution receipt by id.
+pub(crate) const EXECUTION_DETAIL_PATH: &str = "/v1/executions/{execution_id}";
+
 /// Route-scoped JSON body limit for activation and execution requests.
 pub(crate) const JSON_BODY_LIMIT_BYTES: usize = 1 << 20;
