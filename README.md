@@ -4,10 +4,10 @@
 > no API, no storage format, no CLI contract should be relied upon.
 
 > **Development is not finished:** this is an in-progress implementation, not a
-> complete job scheduler. Package ingestion, host startup wiring, and the
-> worker execution library exist, but scheduling, lifecycle endpoints,
-> execution history, and the operator CLI are still outstanding. Do not treat
-> it as a finished or production-ready product.
+> complete job scheduler. Package ingestion, host startup wiring, the
+> worker execution library, and the activation/execution HTTP endpoints
+> exist, but scheduling, execution history, and the operator CLI are still
+> outstanding. Do not treat it as a finished or production-ready product.
 
 A single-machine job execution platform supporting installing, validating, activating,
 updating, disabling, removing, and rolling back job plugin implementations **without
@@ -94,6 +94,35 @@ database/layout error — aborts before binding. `tests/startup.rs` drives that
 wiring end to end; `tests/upload_api.rs` and `tests/tls_only.rs` cover the
 API and transport hardening.
 
+## Activation and execution API (unstable)
+
+Both routes are bearer-authenticated and accept a bounded JSON body
+(1 MiB route-scoped limit):
+
+- `POST /v1/modules/{module_id}/activate` with `{"version":"1.2.0"}` checks
+  the registered version against the runtime allowlist and integrity state,
+  persists it as the active version, and returns
+  `{module_id, version, digest, signer_key_id}`.
+- `POST /v1/modules/{module_id}/executions` with
+  `{"version"?, "function", "configuration"?, "deadline_secs"?}` resolves the
+  active version (or the pinned `version`), re-verifies the promoted artifact
+  and manifest, stages it, and runs one worker process. It returns
+  `{execution_id, module_id, version, digest, outcome, stdout, stderr,
+  duration_ms}`; `outcome` is a stable lowercase name. `deadline_secs`
+  defaults to 30 seconds, clamped to `max_execution_deadline_secs` when that
+  is lower; explicit values above the host maximum are refused.
+
+Refusals use the same `{code, message}` contract: `404` for an unregistered
+version or missing active pointer, `422` for legacy v1 manifests,
+runtime/integrity/manifest/archive refusals, `400` for malformed input or an
+over-maximum deadline, `503` when all execution slots are busy, and `500` for
+storage/host failures (including a missing registered artifact) with no path
+or OS detail. Execution requires manifest v2; upload and activation still
+accept v1. Refusals are recorded through the
+rejection recorder under the `activation`/`execution` stages without the
+request configuration. `tests/execution_api.rs` proves the authenticated
+upload → activate → execute path with a real worker.
+
 ## Host configuration
 
 Configuration loading lives in `src/config.rs` and is consumed at startup by
@@ -111,7 +140,16 @@ JSON file plus `CONDUCTOR_*` environment overrides produce an immutable
   its own JSON array.
 - `Config::validate_for_startup` refuses to proceed without a non-empty token
   and at least one trusted key, and rejects an unusable bind address, zero
-  timeout or upload slots, and empty paths.
+  timeout or slot counts, empty runtime allowlists, and empty paths.
+- `allowed_runtimes` (non-empty) is a metadata filter over the runtime
+  declared in the manifest for activation and execution, not a sandbox;
+  `max_execution_deadline_secs` bounds any requested deadline (an omitted
+  deadline is clamped down to it), and `max_concurrent_executions` bounds
+  in-flight workers (fail fast with `503`, never an unbounded queue).
+  `request_timeout_secs` includes request preparation as well as the worker
+  run, and must be greater than `max_execution_deadline_secs` plus the
+  2-second worker termination grace, so an execution cannot outlive the
+  request that owns it.
 - `Config::trust_store` converts the configured records into the runtime
   `ConfiguredTrustedKeys`, validating standard base64, the 32-byte Ed25519 key
   size, and non-empty unique key ids.
@@ -124,7 +162,8 @@ JSON file plus `CONDUCTOR_*` environment overrides produce an immutable
 - `server::Host::assemble` validates the configuration, builds the validator
   from the trust store, creates the layout, opens and migrates one shared
   database, and wires the registry, durable rejection sink, bearer token,
-  timeout, and upload slots before `Host::serve` binds TLS.
+  timeout, upload slots, and the registered-artifact execution service before
+  `Host::serve` binds TLS.
 
 Example: [`config/conductor.example.json`](config/conductor.example.json).
 Its token and key are placeholders; generate your own and do not commit real
@@ -134,12 +173,15 @@ configuration or key material.
 |---|---|---|
 | `http_bind` | `CONDUCTOR_HTTP_BIND` | `127.0.0.1:8080` |
 | `storage_root` | `CONDUCTOR_STORAGE_ROOT` | `data` |
-| `request_timeout_secs` | `CONDUCTOR_REQUEST_TIMEOUT_SECS` | `30` |
+| `request_timeout_secs` | `CONDUCTOR_REQUEST_TIMEOUT_SECS` | `360` |
 | `tls_cert_path` | `CONDUCTOR_TLS_CERT_PATH` | `tls/cert.pem` |
 | `tls_key_path` | `CONDUCTOR_TLS_KEY_PATH` | `tls/key.pem` |
 | `max_concurrent_uploads` | `CONDUCTOR_MAX_CONCURRENT_UPLOADS` | `8` |
 | `quarantine_ttl_secs` | `CONDUCTOR_QUARANTINE_TTL_SECS` | `3600` |
 | `staging_ttl_secs` | `CONDUCTOR_STAGING_TTL_SECS` | `3600` |
+| `allowed_runtimes` | `CONDUCTOR_ALLOWED_RUNTIMES` (comma-separated) | `["rust"]` |
+| `max_execution_deadline_secs` | `CONDUCTOR_MAX_EXECUTION_DEADLINE_SECS` | `300` |
+| `max_concurrent_executions` | `CONDUCTOR_MAX_CONCURRENT_EXECUTIONS` | `4` |
 | `api_token` | `CONDUCTOR_API_TOKEN` / `CONDUCTOR_API_TOKEN_FILE` | none (required) |
 | `trusted_keys` | `CONDUCTOR_TRUSTED_KEYS_FILE` | none (required) |
 
@@ -179,10 +221,9 @@ included), output bounds, and staged-file tamper detection at resolve time.
 - Active code: single-crate Rust modular monolith (`src/`, `tests/`).
 - In progress: package ingestion, validation, promotion, registry persistence,
   startup assembly (configuration, trust store, storage layout, shared
-  database, durable rejection sink), the worker execution library, and a
-  library-level registered-artifact execution service are implemented.
-  Scheduler/triggering, activation/execution HTTP endpoints, execution
-  history, and the operator CLI are not built yet — see
+  database, durable rejection sink), the worker execution library, and
+  activation/execution HTTP endpoints are implemented. Scheduler/triggering,
+  execution history, and the operator CLI are not built yet — see
   [Not built yet](docs/architecture.md#not-built-yet).
 - Specification: [`docs/architecture.md`](docs/architecture.md) describes the
   Rust system as built. `docs/storage-reconciliation.md` and
@@ -209,6 +250,8 @@ tests/
   package_validation.rs     Package validation workflow tests
   archive_security.rs       Archive security tests
   execution_worker.rs       Worker-process execution tests
+  execution_service.rs      Registered-artifact execution service tests
+  execution_api.rs          Activation/execution HTTP API end-to-end tests
   upload_api.rs             Upload API tests
   upload_properties.rs      Generated endpoint input properties
   properties.rs             Pure crypto/path/manifest properties

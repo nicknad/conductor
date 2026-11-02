@@ -2,9 +2,13 @@
 
 Runs the real release binary in a container, behind its TLS-only listener,
 and points OWASP ZAP's API scan at it. The OpenAPI document enumerates
-`GET /healthz` and `POST /v1/packages`, and ZAP's auth-header environment
-variables attach the operator bearer to every generated request so the scan
-exercises the authenticated upload path.
+`GET /healthz`, `POST /v1/packages`, `POST /v1/modules/{module_id}/activate`,
+and `POST /v1/modules/{module_id}/executions`, and ZAP's auth-header
+environment variables attach the operator bearer to every generated request.
+The scan exercises the authenticated upload path and the activation/execution
+auth and refusal paths. It does not execute a worker: no module is seeded in
+the container, so a generated execution request reaches the not-found path
+rather than a spawned process.
 
 ## Run
 

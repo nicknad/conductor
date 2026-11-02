@@ -1,12 +1,15 @@
 {
   "http_bind": "127.0.0.1:8443",
   "storage_root": "data",
-  "request_timeout_secs": 30,
+  "request_timeout_secs": 360,
   "tls_cert_path": "tls/cert.pem",
   "tls_key_path": "tls/key.pem",
   "max_concurrent_uploads": 8,
   "quarantine_ttl_secs": 3600,
   "staging_ttl_secs": 3600,
+  "allowed_runtimes": ["rust"],
+  "max_execution_deadline_secs": 300,
+  "max_concurrent_executions": 4,
   "api_token": "replace-with-a-long-random-token",
   "trusted_keys": [
     {

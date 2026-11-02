@@ -141,9 +141,13 @@ One execution is one worker process (`executor.rs`):
 4. **Collect.** One `ExecutionResponse` line on stdout (`ok` + result, or
    `failed` + message); strict version/shape gate. Stderr is diagnostics,
    bounded and truncated with byte counts kept.
-5. **Terminate.** Deadline/cancel → `SIGTERM` the group, `SIGKILL` after a
-   grace period, best-effort descendant cleanup. Outcomes: `Succeeded |
+5. **Terminate.** Deadline/cancel → `SIGTERM` the group, `SIGKILL` after the
+   2-second grace period, best-effort descendant cleanup. Outcomes: `Succeeded |
    Failed | TimedOut | Cancelled | WorkerError | ProtocolViolation`.
+
+The HTTP request timeout covers request preparation (resolution, artifact
+verification, extraction, and spawn setup) as well as the worker run, and
+leaves the 2-second termination grace for process-group teardown.
 
 Trust scope: workers inherit the host `uid`/`gid`/groups by design. The
 process boundary is crash/hang/resource containment, **not** a security
@@ -158,8 +162,8 @@ pinned version from the registry, loads the promoted artifact, and hands a
 verified staged target to the worker executor. Fail-closed checks before
 spawn:
 
-- activation policy (runtime allowlist) is re-applied to the record actually
-  used for execution;
+- activation policy (the `allowed_runtimes` metadata filter) is re-applied to
+  the record actually used for execution; it is not a sandbox;
 - `artifact_relpath` must exactly equal the canonical
   `{module_id}/{version}/{digest}.zip` address and resolve under the artifact
   root (no traversal, symlink escape, or sibling-prefix confusion);
@@ -219,6 +223,5 @@ weaken these invariants.
 ## Not built yet
 
 Scheduler/triggering, CLI, startup reconciliation/leftover sweeps, artifact
-GC, and any execution-history or activation API beyond the persisted
-registry. `control_plane/lifecycle.rs` is currently a placeholder for
-deactivate/remove/rollback transitions.
+GC, and execution history. `control_plane/lifecycle.rs` is currently a
+placeholder for deactivate/remove/rollback transitions.
