@@ -57,8 +57,9 @@ state behind:
 5. Startup sweeps `quarantine/` files and `staging/` directories older than
    their configured TTLs, removing crash/drop leftovers before any request
    can race the sweep.
-6. One `Database` is opened and migrated; the module registry and rejection
-   store share it through `Arc`, so one connection owns the WAL/pragma policy.
+6. One `Database` is opened and migrated; the module registry, rejection
+   store, and execution-history store share it through `Arc`, so one
+   connection owns the WAL/pragma policy.
 7. The assembled `Host` builds the router (configured bearer token, upload
    slots, request timeout) and serves TLS-only on the configured bind.
 
@@ -114,7 +115,7 @@ request future is dropped after streaming.
 | --- | --- | --- |
 | `quarantine/` | Untrusted uploads awaiting validation | API streaming; deleted on failure |
 | `artifacts/{module}/{version}/{digest}.zip` | Immutable promoted artifacts | Artifact store only |
-| `database/conductor.db` | SQLite: module registry (+ activation/rejection rows per schema v1) | Registry / later phases |
+| `database/conductor.db` | SQLite: module registry, activation/rejection rows, execution history (schema v2) | Registry / audit / history phases |
 | `staging/` | Owner-only verified extraction, removed on drop | `extract_verified`; executor re-verifies at spawn |
 
 `Config::ensure_layout` creates the root and its managed directories with
@@ -188,6 +189,26 @@ is not atomic with `exec`, so a same-uid writer inside the 0700 staging
 directory can still race the final path resolution. HTTP exposure must not
 weaken these invariants.
 
+### Execution history (`executions::history`)
+
+Every completed worker execution — including `failed`, `timed_out`,
+`cancelled`, `worker_error`, and `protocol_violation` outcomes — writes one
+metadata receipt to the shared SQLite database before the execute response is
+returned. A history write failure is a typed server error (`500`-class), never
+a silent success. The row stores the stable registry identity, function,
+stable lowercase outcome name, start/finish wall times, and duration. It
+deliberately stores no stdout, stderr, configuration, secrets, or
+worker-provided failure text; history is metadata only, and pre-spawn
+refusals remain in `package_rejections` rather than becoming history rows.
+
+`GET /v1/executions` returns newest-first pages
+(`limit` 1..=200, default 50; `offset` 0..=1,000,000, default 0) and
+`GET /v1/executions/{execution_id}` returns one receipt. Both are
+bearer-authenticated and return only the metadata fields. The history table
+has no foreign key to `module_versions`, so history survives a future version
+removal. There is no retention policy or GC yet: this table grows without
+bound, which is a deliberate residual for a later slice.
+
 ## Invariants
 
 1. Authenticate before parsing — nothing inside an archive is trusted before
@@ -223,5 +244,5 @@ weaken these invariants.
 ## Not built yet
 
 Scheduler/triggering, CLI, startup reconciliation/leftover sweeps, artifact
-GC, and execution history. `control_plane/lifecycle.rs` is currently a
-placeholder for deactivate/remove/rollback transitions.
+GC, and execution-history retention/GC. `control_plane/lifecycle.rs` is
+currently a placeholder for deactivate/remove/rollback transitions.

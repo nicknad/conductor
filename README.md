@@ -5,9 +5,10 @@
 
 > **Development is not finished:** this is an in-progress implementation, not a
 > complete job scheduler. Package ingestion, host startup wiring, the
-> worker execution library, and the activation/execution HTTP endpoints
-> exist, but scheduling, execution history, and the operator CLI are still
-> outstanding. Do not treat it as a finished or production-ready product.
+> worker execution library, the activation/execution HTTP endpoints, and
+> durable execution history exist, but scheduling and the operator CLI are
+> still outstanding. Do not treat it as a finished or production-ready
+> product.
 
 A single-machine job execution platform supporting installing, validating, activating,
 updating, disabling, removing, and rolling back job plugin implementations **without
@@ -123,6 +124,26 @@ rejection recorder under the `activation`/`execution` stages without the
 request configuration. `tests/execution_api.rs` proves the authenticated
 upload → activate → execute path with a real worker.
 
+### Execution history (unstable)
+
+Every completed worker execution writes one durable metadata receipt to the
+shared database before the execute response is returned. Two read-only routes
+expose it, both bearer-authenticated:
+
+- `GET /v1/executions?limit=<1..=200>&offset=<0..=1000000>` lists receipts
+  newest first (`limit` defaults to 50, `offset` to 0).
+- `GET /v1/executions/{execution_id}` returns one receipt.
+
+A receipt contains only `execution_id`, `module_id`, `version`, `digest`,
+`function`, `outcome`, `started_at_ms`, `finished_at_ms`, and `duration_ms`.
+Stdout, stderr, configuration, secrets, and worker failure text are never
+stored. A worker that fails still produces a receipt with its stable outcome;
+pre-spawn refusals (unknown version, legacy v1 manifest, tampered/missing
+artifact, policy denial) stay in `package_rejections` and create no history
+row. Invalid pagination and execution ids are `400` with stable codes;
+unknown ids are `404`; history read/write failures are generic `500`s. There is
+no retention or garbage collection yet, so history grows without bound.
+
 ## Host configuration
 
 Configuration loading lives in `src/config.rs` and is consumed at startup by
@@ -221,10 +242,10 @@ included), output bounds, and staged-file tamper detection at resolve time.
 - Active code: single-crate Rust modular monolith (`src/`, `tests/`).
 - In progress: package ingestion, validation, promotion, registry persistence,
   startup assembly (configuration, trust store, storage layout, shared
-  database, durable rejection sink), the worker execution library, and
-  activation/execution HTTP endpoints are implemented. Scheduler/triggering,
-  execution history, and the operator CLI are not built yet — see
-  [Not built yet](docs/architecture.md#not-built-yet).
+  database, durable rejection sink), the worker execution library,
+  activation/execution HTTP endpoints, and durable execution history are
+  implemented. Scheduler/triggering and the operator CLI are not built yet —
+  see [Not built yet](docs/architecture.md#not-built-yet).
 - Specification: [`docs/architecture.md`](docs/architecture.md) describes the
   Rust system as built. `docs/storage-reconciliation.md` and
   `docs/design-persistence.md` are background/planning notes, not specs.
@@ -242,7 +263,7 @@ src/
   packages/                 Package domain and validation
   storage/                  Filesystem persistence
   modules/                  Installed module registry
-  executions/               Worker-process execution (spawn, IPC, limits)
+  executions/               Worker-process execution (spawn, IPC, limits, durable history)
   config.rs                 Host configuration
 config/
   conductor.example.json    Example host configuration
