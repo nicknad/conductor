@@ -69,3 +69,12 @@ is insufficient. Each entry names the observed failure and the process change.
   the fix was test serialization, not production retries or weakened
   assertions. Process-spawning test suites must now either serialize or prove
   their fixtures cannot race.
+- **2026-11-01 — HTTP exposure requires audit and status negative tests.** The
+  activation/execute API passed functional and DAST gates but verification
+  found raw paths/OS errors in durable audit rows and host I/O misclassified
+  as `422`. Endpoint tasks now require durable-row leakage tests and explicit
+  host-vs-package failure mapping before completion.
+- **2026-11-01 — fuzz fixtures are part of the endpoint gate.** Adding
+  `AppState` fields broke the fuzz target and would have failed CI. Endpoint
+  changes now must compile fuzz targets and run a short fuzz smoke as part of
+  the gate, not only `cargo test`.
