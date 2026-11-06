@@ -727,12 +727,20 @@ fn histogram(boundaries: &[f64]) -> Aggregation {
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn storage_free_bytes(root: &Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt as _;
 
     let path = CString::new(root.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `libc::statvfs` is a plain C struct whose fields are integer
+    // types, so all-zero bytes are a valid initial value before the call
+    // fills them in.
     let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is a valid NUL-terminated C string that outlives the
+    // call, and `stats` is a valid, writable pointer for the call's
+    // duration; a nonzero return reports failure instead of using the
+    // partially initialized struct.
     let result = unsafe { libc::statvfs(path.as_ptr(), &mut stats) };
     if result != 0 {
         return None;
@@ -1022,6 +1030,8 @@ mod tests {
         use std::net::TcpListener;
         use std::sync::mpsc;
 
+        // A blocking listener on a dedicated thread, not the async runtime.
+        // nosemgrep: rust.std-net-in-async
         let listener = TcpListener::bind("127.0.0.1:0").expect("collector must bind");
         let address = listener.local_addr().expect("collector address");
         let (tx, rx) = mpsc::channel();
@@ -1164,6 +1174,8 @@ mod tests {
     fn disabled_metrics_never_connect_to_a_listening_socket() {
         use std::net::TcpListener;
 
+        // Synchronous test guard; no async runtime is involved here.
+        // nosemgrep: rust.std-net-in-async
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener must bind");
         listener
             .set_nonblocking(true)

@@ -58,8 +58,7 @@ fn state() -> &'static AppState {
             .build()
             .expect("fixed validator");
         let registry = Arc::new(ModuleRegistry::new());
-        let metrics =
-            Metrics::new(MetricsOptions::default()).expect("fixed in-memory metrics");
+        let metrics = Metrics::new(MetricsOptions::default()).expect("fixed in-memory metrics");
         let execution_service = Arc::new(
             ExecutionService::new(
                 Arc::clone(&registry),
