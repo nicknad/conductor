@@ -1,15 +1,45 @@
 # Agent workflow
 
-Three roles, separated so that no agent grades its own work:
+The workflow uses the globally installed pstack agents for code writing and
+judgment, plus two project-local roles: the orchestrator and the security
+reviewer. No project agent duplicates a pstack role, and no project agent
+grades its own work.
 
-| Agent | Mode | May edit | Job |
-| --- | --- | --- | --- |
-| `orchestration` | primary | `.opencode/agents/**`, this file | Specify, dispatch, evaluate evidence, adapt the process |
-| `implementation` | subagent | production code and tests | Make one scoped change with falsifiable tests and command evidence |
-| `verification` | subagent | nothing | Try to falsify the implementation; report PASS/FAIL/UNPROVEN with evidence |
-| `security` | subagent | nothing | Threat-model and probe for attack/misuse paths; report severity, reachability, and residual risk |
+| Agent | Source | Mode | May edit | Job |
+| --- | --- | --- | --- | --- |
+| `orchestration` | project | primary | `.opencode/agents/**`, this file | Specify, dispatch, evaluate evidence, adapt the process |
+| `poteto-agent` | global pstack | subagent | production code and tests | Make one scoped change with falsifiable tests and command evidence |
+| `poteto-judge` | global pstack | subagent | nothing | Try to falsify the implementation; report PASS/FAIL/UNPROVEN with evidence |
+| `security` | project | subagent | nothing | Threat-model and probe for attack/misuse paths; report severity, reachability, and residual risk |
+| `comment-sicko` | global pstack | subagent | nothing | Savage narration and workaround comments in the diff |
+| `thermo-nuclear-code-quality-review` | global pstack | subagent | nothing | Maintainability, structure, and 1k-line audit |
+| `ci-watcher` | global pstack | subagent | nothing | Report PR-attached CI pass/fail with links |
 
-Definitions live in [`.opencode/agents/`](../.opencode/agents/).
+Project definitions live in [`.opencode/agents/`](../.opencode/agents/).
+Pstack definitions live in `~/.config/opencode/agents/`.
+
+## Pstack reconciliation
+
+Global pstack is authoritative for code writing, judgment, comment review,
+maintainability review, and CI watching. Their models are configured once by
+`/setup-pstack` and recorded in
+`~/.agents/skills/poteto-mode/references/opencode-models.md`. Project agent
+files do not set `model:` lines, so they cannot drift from that budget.
+
+| Work | Agent |
+| --- | --- |
+| Implementation | `poteto-agent` |
+| Independent verification | `poteto-judge` |
+| Read-only exploration | `explore` / `general` |
+| Comment review before PR | `comment-sicko` |
+| Structural review | `thermo-nuclear-code-quality-review` |
+| PR CI | `ci-watcher` |
+| Security review | project-local `security` |
+
+The project-local `security` agent exists because pstack has no security seat.
+It remains mandatory for changes that touch authentication, input parsing,
+filesystem or artifact paths, process spawning, secrets, audit, or
+persistence.
 
 ## Evidence protocol
 
@@ -112,3 +142,12 @@ is insufficient. Each entry names the observed failure and the process change.
   New tests are now classified as unit/service/e2e, new tests are timed both
   alone and in the full suite, and `#[serial]` is limited to named
   process-spawning groups instead of whole files.
+- **2026-11-06 — reconciled with global pstack.** The project declared its own
+  `implementation` and `verification` agents while the global pstack agents
+  held the configured model budget, so the project roles inherited the
+  session model and the orchestrator could not spawn pstack agents at all.
+  The duplicate project agents were retired. Orchestration now spawns
+  `poteto-agent` for implementation and `poteto-judge` for verification, and
+  wires in `comment-sicko`, `thermo-nuclear-code-quality-review`, and
+  `ci-watcher` as pstack review/CI seats. The project-local `security` agent
+  remains because pstack has no security seat.
