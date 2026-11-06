@@ -60,7 +60,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -74,6 +74,9 @@ use crate::executions::executor::{
 };
 use crate::executions::history::{ExecutionHistoryStore, ExecutionRecord};
 use crate::executions::protocol::{ExecutionRequest, Invocation};
+use crate::metrics::{
+    ExecutionOutcomeName, ExecutionPhase, ExecutionSlotGuard, IntegrityKind, Metrics, RefusalReason,
+};
 use crate::modules::activation::ActiveError;
 use crate::modules::registry::{IntegrityState, ModuleRecord, ModuleRegistry, RegistryError};
 use crate::packages::archive::{check_entry_path, ArchiveError, QuarantinedFile, ZipArchiveReader};
@@ -234,6 +237,9 @@ struct PreparedExecution {
     record: ModuleRecord,
     target: WorkerTarget,
     permit: OwnedSemaphorePermit,
+    /// Gauge guard tied to the permit's lifetime, so cancellation cannot
+    /// release the slot gauge while preparation still holds capacity.
+    slot_guard: ExecutionSlotGuard,
 }
 
 /// Test-only synchronization seam run at the start of blocking preparation.
@@ -323,6 +329,7 @@ pub struct ExecutionService {
     limits: ExecutionLimits,
     max_deadline: Duration,
     package_policy: PackageValidationPolicy,
+    metrics: Arc<Metrics>,
     preparation_hook: Option<PreparationHook>,
     activation_hook: Option<ActivationHook>,
 }
@@ -360,6 +367,7 @@ impl ExecutionService {
         allowed_signers: HashSet<String>,
         max_concurrent_executions: usize,
         history: Arc<ExecutionHistoryStore>,
+        metrics: Arc<Metrics>,
     ) -> Result<Self, ExecutionError> {
         if allowed_signers.is_empty() {
             return Err(ExecutionError::EmptySignerAllowlist);
@@ -385,6 +393,7 @@ impl ExecutionService {
             limits,
             max_deadline,
             package_policy,
+            metrics,
             preparation_hook: None,
             activation_hook: None,
         })
@@ -423,6 +432,22 @@ impl ExecutionService {
     /// artifact check happens before [`set_active`](ModuleRegistry::set_active)
     /// so activation cannot report success for an unrunnable version.
     pub async fn activate(
+        &self,
+        module_id: &str,
+        version: &str,
+    ) -> Result<ActivatedModule, ExecutionError> {
+        let result = self.activate_inner(module_id, version).await;
+        if let Err(error) = &result {
+            // Activation verifies the artifact bytes too; a tampered or
+            // missing artifact must be observable even though no worker ran.
+            if let Some(kind) = classify_integrity(error) {
+                self.metrics.record_artifact_integrity_failure(kind);
+            }
+        }
+        result
+    }
+
+    async fn activate_inner(
         &self,
         module_id: &str,
         version: &str,
@@ -490,6 +515,28 @@ impl ExecutionService {
         configuration: serde_json::Value,
         deadline: Duration,
     ) -> Result<ExecutionReceipt, ExecutionError> {
+        let result = self
+            .execute_inner(module_id, pinned_version, function, configuration, deadline)
+            .await;
+        if let Err(error) = &result {
+            if let Some(reason) = classify_refusal(error) {
+                self.metrics.record_execution_refused(reason);
+            }
+            if let Some(kind) = classify_integrity(error) {
+                self.metrics.record_artifact_integrity_failure(kind);
+            }
+        }
+        result
+    }
+
+    async fn execute_inner(
+        &self,
+        module_id: &str,
+        pinned_version: Option<&str>,
+        function: &str,
+        configuration: serde_json::Value,
+        deadline: Duration,
+    ) -> Result<ExecutionReceipt, ExecutionError> {
         if deadline > self.max_deadline {
             return Err(ExecutionError::DeadlineExceeded {
                 requested: deadline,
@@ -501,11 +548,18 @@ impl ExecutionService {
         // blocking preparation task and comes back with the prepared target:
         // if this caller is cancelled while preparation runs, the detached
         // task keeps the slot until preparation actually ends.
-        let permit = Arc::clone(&self.execution_slots)
-            .try_acquire_owned()
-            .map_err(|_| ExecutionError::Overloaded {
-                maximum: self.max_concurrent_executions,
-            })?;
+        let permit = match Arc::clone(&self.execution_slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.metrics.record_execution_overload();
+                return Err(ExecutionError::Overloaded {
+                    maximum: self.max_concurrent_executions,
+                });
+            }
+        };
+        // Both the permit and the gauge guard move into preparation, so a
+        // cancelled caller cannot release either while work is still running.
+        let slot_guard = self.metrics.execution_slot_guard();
 
         let module_id_owned = module_id.to_owned();
         let pinned_owned = pinned_version.map(ToOwned::to_owned);
@@ -516,6 +570,7 @@ impl ExecutionService {
         let package_policy = self.package_policy.clone();
         let allowed_signers = Arc::clone(&self.allowed_signers);
         let preparation_hook = self.preparation_hook.clone();
+        let prepare_started = Instant::now();
         let prepared = tokio::task::spawn_blocking(move || {
             if let Some(hook) = &preparation_hook {
                 hook.run();
@@ -530,14 +585,18 @@ impl ExecutionService {
                 &module_id_owned,
                 pinned_owned.as_deref(),
                 permit,
+                slot_guard,
             )
         })
-        .await
-        .map_err(|err| ExecutionError::BlockingTask(err.to_string()))??;
+        .await;
+        self.metrics
+            .record_execution_duration(ExecutionPhase::Prepare, prepare_started.elapsed());
+        let prepared = prepared.map_err(|err| ExecutionError::BlockingTask(err.to_string()))??;
         let PreparedExecution {
             record,
             target,
             permit: held_permit,
+            slot_guard: _slot_guard,
         } = prepared;
 
         let execution_id = next_execution_id();
@@ -560,6 +619,12 @@ impl ExecutionService {
         let finished_at = SystemTime::now();
 
         let duration_ms = u64::try_from(report.duration.as_millis()).unwrap_or(u64::MAX);
+        // Emit the completion metric before persisting: a finished execution
+        // stays observable even if the history insert later fails.
+        if let Some(outcome) = ExecutionOutcomeName::from_name(report.outcome.as_str()) {
+            self.metrics
+                .record_execution_completed(outcome, report.duration);
+        }
         let history_record = ExecutionRecord {
             execution_id: report.execution_id.clone(),
             module_id: record.module_id.clone(),
@@ -598,6 +663,7 @@ impl ExecutionService {
         match persisted {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
+                self.metrics.record_history_write_failure();
                 tracing::error!(
                     execution_id = %report.execution_id,
                     module_id = %record.module_id,
@@ -612,6 +678,7 @@ impl ExecutionService {
                 return Err(ExecutionError::History(error));
             }
             Err(error) => {
+                self.metrics.record_history_write_failure();
                 tracing::error!(
                     execution_id = %report.execution_id,
                     module_id = %record.module_id,
@@ -623,7 +690,14 @@ impl ExecutionService {
                     error = %error,
                     "execution history write task failed"
                 );
-                return Err(ExecutionError::BlockingTask(error.to_string()));
+                // The worker already finished. Classifying this as a blocking
+                // task failure would also emit `conductor.execution.refused`
+                // (`internal`) after a completed execution, double-counting
+                // the failure. Keep the history classification so only the
+                // dedicated history-failure counter is authoritative.
+                return Err(ExecutionError::History(DatabaseError::Query(
+                    error.to_string(),
+                )));
             }
         }
 
@@ -664,6 +738,98 @@ impl ExecutionService {
             .await
             .map_err(|err| ExecutionError::BlockingTask(err.to_string()))?
             .map_err(ExecutionError::History)
+    }
+}
+
+/// Maps an execution failure to the bounded `conductor.execution.reason`
+/// vocabulary, or `None` when a dedicated counter is already authoritative.
+/// This is deliberately exhaustive so a new error variant forces a
+/// classification choice instead of leaking an unbounded label.
+///
+/// `Overloaded` and `History` return `None`: overload has its own
+/// `conductor.execution.overload` counter, and a failed history insert has
+/// `conductor.execution.history.write.failures` plus the already-recorded
+/// completion. Counting either again as a generic refusal would double-count.
+fn classify_refusal(error: &ExecutionError) -> Option<RefusalReason> {
+    match error {
+        ExecutionError::Activation(activation) => match activation {
+            ActivationError::NotRegistered { .. } => Some(RefusalReason::NotFound),
+            ActivationError::NoActiveVersion { .. } => Some(RefusalReason::NotActive),
+            ActivationError::Integrity { .. } => Some(RefusalReason::Integrity),
+            ActivationError::RuntimeNotAllowed { .. } => Some(RefusalReason::Runtime),
+            ActivationError::EmptyRuntimeAllowlist | ActivationError::Storage(_) => {
+                Some(RefusalReason::Internal)
+            }
+        },
+        ExecutionError::PersistActive(_) | ExecutionError::Registry(_) => {
+            Some(RefusalReason::Internal)
+        }
+        ExecutionError::DeadlineExceeded { .. } => Some(RefusalReason::Deadline),
+        ExecutionError::Overloaded { .. } => None,
+        ExecutionError::EmptySignerAllowlist | ExecutionError::SignerNotAllowed { .. } => {
+            Some(RefusalReason::Signer)
+        }
+        ExecutionError::InvalidConcurrency { .. }
+        | ExecutionError::InvalidStorageDirectory { .. }
+        | ExecutionError::BlockingTask(_) => Some(RefusalReason::Internal),
+        ExecutionError::LegacyManifest { .. } => Some(RefusalReason::LegacyManifest),
+        ExecutionError::ArtifactDirectory { .. }
+        | ExecutionError::ArtifactPathEscape { .. }
+        | ExecutionError::ArtifactPathNotCanonical { .. }
+        | ExecutionError::ArtifactMissing { .. }
+        | ExecutionError::ArtifactUnreadable { .. }
+        | ExecutionError::ArtifactTooLarge { .. }
+        | ExecutionError::ArtifactSizeMismatch { .. }
+        | ExecutionError::ArtifactDigestMismatch { .. }
+        | ExecutionError::RecordDigestMismatch { .. } => Some(RefusalReason::Integrity),
+        ExecutionError::Manifest(_) | ExecutionError::ManifestIdentityMismatch { .. } => {
+            Some(RefusalReason::Manifest)
+        }
+        ExecutionError::Archive(_) | ExecutionError::ArchiveManifestMismatch { .. } => {
+            Some(RefusalReason::Archive)
+        }
+        ExecutionError::Staging(_) => Some(RefusalReason::Staging),
+        ExecutionError::Target(_) => Some(RefusalReason::Target),
+        ExecutionError::Executor(_) => Some(RefusalReason::Executor),
+        ExecutionError::History(_) => None,
+    }
+}
+
+/// Maps artifact/manifest/archive/staging/target integrity failures to the
+/// bounded `conductor.integrity.kind` vocabulary. Non-integrity errors return
+/// `None`.
+fn classify_integrity(error: &ExecutionError) -> Option<IntegrityKind> {
+    match error {
+        ExecutionError::ArtifactDirectory { .. }
+        | ExecutionError::ArtifactPathEscape { .. }
+        | ExecutionError::ArtifactPathNotCanonical { .. } => Some(IntegrityKind::Path),
+        ExecutionError::ArtifactMissing { .. } => Some(IntegrityKind::Missing),
+        ExecutionError::ArtifactUnreadable { .. } => Some(IntegrityKind::Unreadable),
+        ExecutionError::ArtifactTooLarge { .. } | ExecutionError::ArtifactSizeMismatch { .. } => {
+            Some(IntegrityKind::Size)
+        }
+        ExecutionError::ArtifactDigestMismatch { .. }
+        | ExecutionError::RecordDigestMismatch { .. } => Some(IntegrityKind::Digest),
+        ExecutionError::Manifest(_) | ExecutionError::ManifestIdentityMismatch { .. } => {
+            Some(IntegrityKind::Manifest)
+        }
+        ExecutionError::Archive(_) | ExecutionError::ArchiveManifestMismatch { .. } => {
+            Some(IntegrityKind::Archive)
+        }
+        ExecutionError::LegacyManifest { .. } => Some(IntegrityKind::Legacy),
+        ExecutionError::Staging(StagingError::Archive(_)) => Some(IntegrityKind::Archive),
+        ExecutionError::Staging(_) => Some(IntegrityKind::Staging),
+        ExecutionError::Target(_) => Some(IntegrityKind::Target),
+        ExecutionError::Executor(ExecutorError::TargetVerification(_)) => {
+            Some(IntegrityKind::Target)
+        }
+        // A registry record marked `Missing`/`Mismatch` is an artifact-integrity
+        // failure. This is the activation path shared by both `activate` and
+        // execution preparation, so both operations are counted.
+        ExecutionError::Activation(ActivationError::Integrity { .. }) => {
+            Some(IntegrityKind::RegistryState)
+        }
+        _ => None,
     }
 }
 
@@ -729,6 +895,7 @@ fn prepare_execution(
     module_id: &str,
     pinned_version: Option<&str>,
     permit: OwnedSemaphorePermit,
+    slot_guard: ExecutionSlotGuard,
 ) -> Result<PreparedExecution, ExecutionError> {
     let activated = resolve(registry, module_id, pinned_version, activation_policy)?;
     let record = registry
@@ -821,6 +988,7 @@ fn prepare_execution(
         record,
         target,
         permit,
+        slot_guard,
     })
 }
 
@@ -1134,6 +1302,180 @@ mod tests {
             integrity_state: IntegrityState::Ok,
             registered_at: SystemTime::now(),
         }
+    }
+
+    #[test]
+    fn refusal_classification_is_bounded_and_specific() {
+        let cases = [
+            (
+                ExecutionError::Activation(ActivationError::NotRegistered {
+                    module_id: "m".to_owned(),
+                    version: "1".to_owned(),
+                }),
+                Some(RefusalReason::NotFound),
+            ),
+            (
+                ExecutionError::Activation(ActivationError::NoActiveVersion {
+                    module_id: "m".to_owned(),
+                }),
+                Some(RefusalReason::NotActive),
+            ),
+            (
+                ExecutionError::Activation(ActivationError::RuntimeNotAllowed {
+                    module_id: "m".to_owned(),
+                    version: "1".to_owned(),
+                    runtime: "python".to_owned(),
+                }),
+                Some(RefusalReason::Runtime),
+            ),
+            (
+                ExecutionError::LegacyManifest {
+                    module_id: "m".to_owned(),
+                    version: "1".to_owned(),
+                    manifest_version: 1,
+                },
+                Some(RefusalReason::LegacyManifest),
+            ),
+            (
+                ExecutionError::SignerNotAllowed {
+                    module_id: "m".to_owned(),
+                    version: "1".to_owned(),
+                    key_id: "k".to_owned(),
+                },
+                Some(RefusalReason::Signer),
+            ),
+            (
+                ExecutionError::DeadlineExceeded {
+                    requested: Duration::from_secs(1),
+                    maximum: Duration::from_millis(1),
+                },
+                Some(RefusalReason::Deadline),
+            ),
+            (
+                ExecutionError::Staging(StagingError::SourceChanged),
+                Some(RefusalReason::Staging),
+            ),
+            (
+                ExecutionError::Target(TargetError::EntrypointMissing),
+                Some(RefusalReason::Target),
+            ),
+            (
+                ExecutionError::Executor(ExecutorError::Spawn("x".to_owned())),
+                Some(RefusalReason::Executor),
+            ),
+            // Dedicated counters are authoritative for these two; a generic
+            // refusal point would double-count them.
+            (ExecutionError::Overloaded { maximum: 1 }, None),
+            (
+                ExecutionError::History(DatabaseError::Query("insert failed".to_owned())),
+                None,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(
+                classify_refusal(&error),
+                expected,
+                "unexpected classification for {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn integrity_classification_is_artifact_specific() {
+        let cases = [
+            (
+                ExecutionError::ArtifactPathEscape {
+                    relpath: "x".to_owned(),
+                },
+                Some(IntegrityKind::Path),
+            ),
+            (
+                ExecutionError::ArtifactMissing {
+                    relpath: "x".to_owned(),
+                },
+                Some(IntegrityKind::Missing),
+            ),
+            (
+                ExecutionError::ArtifactUnreadable {
+                    relpath: "x".to_owned(),
+                    detail: "x".to_owned(),
+                },
+                Some(IntegrityKind::Unreadable),
+            ),
+            (
+                ExecutionError::ArtifactSizeMismatch {
+                    relpath: "x".to_owned(),
+                    expected: 1,
+                    actual: 2,
+                },
+                Some(IntegrityKind::Size),
+            ),
+            (
+                ExecutionError::ArtifactDigestMismatch {
+                    relpath: "x".to_owned(),
+                },
+                Some(IntegrityKind::Digest),
+            ),
+            (
+                ExecutionError::Manifest(ManifestError::TooLarge),
+                Some(IntegrityKind::Manifest),
+            ),
+            (
+                ExecutionError::Archive(ArchiveError::MissingEntry("x".to_owned())),
+                Some(IntegrityKind::Archive),
+            ),
+            (
+                ExecutionError::LegacyManifest {
+                    module_id: "m".to_owned(),
+                    version: "1".to_owned(),
+                    manifest_version: 1,
+                },
+                Some(IntegrityKind::Legacy),
+            ),
+            (
+                ExecutionError::Staging(StagingError::SourceChanged),
+                Some(IntegrityKind::Staging),
+            ),
+            (
+                ExecutionError::Target(TargetError::EntrypointMissing),
+                Some(IntegrityKind::Target),
+            ),
+            (
+                ExecutionError::Activation(ActivationError::Integrity {
+                    module_id: "m".to_owned(),
+                    version: "1".to_owned(),
+                    state: IntegrityState::Missing,
+                }),
+                Some(IntegrityKind::RegistryState),
+            ),
+            (
+                ExecutionError::DeadlineExceeded {
+                    requested: Duration::from_secs(1),
+                    maximum: Duration::from_millis(1),
+                },
+                None,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(
+                classify_integrity(&error),
+                expected,
+                "unexpected integrity classification for {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn history_join_failure_is_not_classified_as_a_refusal() {
+        // The worker already completed; the history task's join failure is a
+        // history failure. Counting it as `internal` refusal would double the
+        // signal. The dedicated history-failure counter is emitted by the
+        // caller instead.
+        let error = ExecutionError::History(DatabaseError::Query(
+            "blocking task failed: history insert panicked".to_owned(),
+        ));
+        assert_eq!(classify_refusal(&error), None);
+        assert_eq!(classify_integrity(&error), None);
     }
 
     #[test]

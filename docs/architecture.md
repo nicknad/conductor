@@ -26,6 +26,7 @@ digests at spawn time). That split is the load-bearing security property.
 src/
   main.rs / server.rs   Binary entry; fail-closed startup; TLS-only serving
   config.rs             Host configuration (bind, storage root, timeouts, TLS paths, rate floor, slots)
+  metrics.rs            Ephemeral OpenTelemetry metrics, OTLP/HTTP export, views, cached instruments
   api/                  HTTP interface: routes, uploads, bearer auth, transport guards, rejections
   control_plane/        Upload workflow, validation, registration, activation, lifecycle transitions
   packages/             Untrusted-bytes rules: zip, manifest, signature, digest, inventory, policy, artifact identity
@@ -51,6 +52,11 @@ state behind:
    `Config::trust_store` (standard-base64, 32-byte Ed25519, unique key ids).
 3. The production validation policy must be ingestable; the validator is
    built around the configured trust store (no skip-verification path).
+   Metrics are built here, after config validation but before any listener:
+   an unset `otlp_endpoint` yields a no-reader provider (no network client or
+   export thread), otherwise one OTLP/HTTP exporter (base URL plus
+   `/v1/metrics`, rustls for HTTPS) and periodic reader. The global handle
+   used by storage instrumentation is installed immediately.
 4. `Config::ensure_layout` creates/tightens `quarantine/`, `artifacts/`,
    `database/`, and `staging/` under the storage root, refusing a symlinked
    or world-writable existing root.
@@ -74,8 +80,11 @@ Failures at any step abort startup without binding a listener.
    missing/wrong), total-body bound (policy bound + 1 MiB slack),
    per-request timeout, 8 concurrent-upload slots (`503`), panic
    containment (bare `500`), security headers + `x-request-id` on every
-   response. `/healthz` is the sole unauthenticated route and returns
-   only `ok`.
+   response. `/healthz` (liveness) and `/readyz` (cached readiness) are the
+   only unauthenticated routes. `/healthz` returns only `ok`; `/readyz` returns
+   `ok` only when the cached readiness state says the shared database is
+   migrated/probeable and the scheduler hook is ready, otherwise `503
+   unavailable` with no detail. The route only reads two atomics.
 2. **Stream to quarantine** (`storage::quarantine`). Package bytes stream
    straight to a `create_new` private file with a per-chunk byte bound.
    A `QuarantineGuard` deletes partial files on every failure path.
@@ -209,6 +218,49 @@ has no foreign key to `module_versions`, so history survives a future version
 removal. There is no retention policy or GC yet: this table grows without
 bound, which is a deliberate residual for a later slice.
 
+## Observability (`metrics.rs`)
+
+Metrics are ephemeral and external by design. With no OTLP endpoint the host
+builds an SDK provider with no reader: instruments are cached and recording
+stays local, but there is no export thread, HTTP client, or network traffic.
+With an endpoint, one `MetricExporter` (HTTP/protobuf, cumulative temporality)
+feeds a `PeriodicReader` configured by `metrics_export_interval_secs` /
+`metrics_export_timeout_secs`. The configured value is a base URL: trailing
+slashes are trimmed and `/v1/metrics` is appended unless the full signal URL is
+already present. The blocking client is compiled with the rustls backend, so
+`https://` endpoints work; userinfo in the URL is rejected at config
+validation. There is no `/metrics` route and no metrics table: SQLite remains
+the durable authority only for registry, rejections, and execution history.
+
+Views fix explicit histogram buckets for HTTP request duration, execution
+duration, and DB lock wait, plus a future job-wait instrument that this slice
+does not emit. Every stream has a bounded cardinality limit and cumulative
+histograms skip min/max. Attributes are closed vocabularies: matched route
+templates (or `unmatched`), normalized methods (standard set or `_OTHER`),
+status codes, stable outcome names, bounded refusal/integrity reasons
+(including `registry_state`), and auth reasons. Module/version/execution ids,
+request ids, paths, tokens, configuration, stdout/stderr, and free-form error
+text are never attributes.
+
+`DatabaseError::from` classifies SQLite `Busy`/`Locked` errors and
+`Database::lock` records mutex wait through a process-global handle installed
+at startup; without a host the free functions are no-ops. HTTP middleware
+wraps the timeout/panic layers so 401/404/405/413/500/503 responses are
+observable, and the active-request guard releases on every path.
+
+**Exemplars:** OpenTelemetry Rust 0.33 has no application-side exemplar
+recording API (only exported data structures), so trace-linked exemplars are
+not emitted. Execution/history metrics correlate through structured logs and
+future tracing; claiming exemplar support would be false.
+
+Readiness (`/readyz`) is unauthenticated and reads a per-host cached state:
+`Readiness` holds atomic database and scheduler flags. Startup initializes the
+database flag from `Database::check_ready` after migration; a background
+watcher re-probes every few seconds through a one-permit semaphore on the
+blocking pool, so a hung check cannot accumulate tasks. The scheduler flag
+defaults to true (future hook). The route itself does no database work and
+cannot false-503 under probe flood. Readiness is not a write/disk-full proof.
+
 ## Invariants
 
 1. Authenticate before parsing — nothing inside an archive is trusted before
@@ -243,6 +295,9 @@ bound, which is a deliberate residual for a later slice.
 
 ## Not built yet
 
-Scheduler/triggering, CLI, startup reconciliation/leftover sweeps, artifact
-GC, and execution-history retention/GC. `control_plane/lifecycle.rs` is
-currently a placeholder for deactivate/remove/rollback transitions.
+Scheduler/triggering, CLI, startup reconciliation (registry ↔ artifact-store
+integrity repair), artifact GC, and execution-history retention/GC.
+`control_plane/lifecycle.rs` is currently a placeholder for
+deactivate/remove/rollback transitions. Leftover quarantine/staging sweeps
+already run at startup. See [statecharts.md](statecharts.md) for per-module
+state diagrams and the prioritized remaining-work table.

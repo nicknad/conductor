@@ -2,7 +2,7 @@
 
 Runs the real release binary in a container, behind its TLS-only listener,
 and points OWASP ZAP's API scan at it. The OpenAPI document enumerates
-`GET /healthz`, `POST /v1/packages`, `POST /v1/modules/{module_id}/activate`,
+`GET /healthz`, `GET /readyz`, `POST /v1/packages`, `POST /v1/modules/{module_id}/activate`,
 `POST /v1/modules/{module_id}/executions`, `GET /v1/executions`, and
 `GET /v1/executions/{execution_id}`, and ZAP's auth-header environment
 variables attach the operator bearer to every generated request. The scan

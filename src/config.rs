@@ -44,6 +44,13 @@ const ENV_API_TOKEN: &str = "CONDUCTOR_API_TOKEN";
 // nosemgrep: generic.hardcoded-secret
 const ENV_API_TOKEN_FILE: &str = "CONDUCTOR_API_TOKEN_FILE";
 const ENV_TRUSTED_KEYS_FILE: &str = "CONDUCTOR_TRUSTED_KEYS_FILE";
+const ENV_OTLP_ENDPOINT: &str = "CONDUCTOR_OTLP_ENDPOINT";
+const ENV_METRICS_EXPORT_INTERVAL_SECS: &str = "CONDUCTOR_METRICS_EXPORT_INTERVAL_SECS";
+const ENV_METRICS_EXPORT_TIMEOUT_SECS: &str = "CONDUCTOR_METRICS_EXPORT_TIMEOUT_SECS";
+const ENV_DEPLOYMENT_ENVIRONMENT: &str = "CONDUCTOR_DEPLOYMENT_ENVIRONMENT";
+
+/// Maximum accepted `deployment_environment` length, in bytes.
+const MAX_DEPLOYMENT_ENVIRONMENT_BYTES: usize = 64;
 
 /// One trusted signing key as it appears in operator configuration.
 ///
@@ -145,6 +152,15 @@ pub struct Config {
     /// Signing keys accepted for package uploads. At least one is required
     /// before serving.
     pub trusted_keys: Vec<TrustedKeyConfig>,
+    /// OTLP/HTTP metrics endpoint. `None` disables metric export entirely;
+    /// metrics are always ephemeral and never persisted.
+    pub otlp_endpoint: Option<String>,
+    /// Delay between periodic metric exports.
+    pub metrics_export_interval_secs: u64,
+    /// Per-export timeout. Must be strictly less than the interval.
+    pub metrics_export_timeout_secs: u64,
+    /// Resource attribute `deployment.environment.name`.
+    pub deployment_environment: String,
 }
 
 impl Default for Config {
@@ -163,6 +179,10 @@ impl Default for Config {
             max_concurrent_executions: 4,
             api_token: None,
             trusted_keys: Vec::new(),
+            otlp_endpoint: None,
+            metrics_export_interval_secs: 15,
+            metrics_export_timeout_secs: 5,
+            deployment_environment: "development".to_owned(),
         }
     }
 }
@@ -186,6 +206,19 @@ impl fmt::Debug for Config {
             .field("max_concurrent_executions", &self.max_concurrent_executions)
             .field("api_token", &self.api_token.as_ref().map(|_| "[redacted]"))
             .field("trusted_keys", &self.trusted_keys)
+            .field(
+                "otlp_endpoint",
+                &self.otlp_endpoint.as_ref().map(|_| "[configured]"),
+            )
+            .field(
+                "metrics_export_interval_secs",
+                &self.metrics_export_interval_secs,
+            )
+            .field(
+                "metrics_export_timeout_secs",
+                &self.metrics_export_timeout_secs,
+            )
+            .field("deployment_environment", &self.deployment_environment)
             .finish()
     }
 }
@@ -258,6 +291,18 @@ impl Config {
             if let Some(value) = file.trusted_keys {
                 config.trusted_keys = value;
             }
+            if let Some(value) = file.otlp_endpoint {
+                config.otlp_endpoint = Some(value);
+            }
+            if let Some(value) = file.metrics_export_interval_secs {
+                config.metrics_export_interval_secs = value;
+            }
+            if let Some(value) = file.metrics_export_timeout_secs {
+                config.metrics_export_timeout_secs = value;
+            }
+            if let Some(value) = file.deployment_environment {
+                config.deployment_environment = value;
+            }
             file_token = file.api_token;
             file_token_file = file.api_token_file;
         }
@@ -299,6 +344,18 @@ impl Config {
             let path = Path::new(path);
             let text = read_text("trusted-keys file", path)?;
             config.trusted_keys = parse_json("trusted-keys file", path, &text)?;
+        }
+        if let Some(value) = env.get(ENV_OTLP_ENDPOINT) {
+            config.otlp_endpoint = Some(value.clone());
+        }
+        if let Some(value) = env_parse(&env, ENV_METRICS_EXPORT_INTERVAL_SECS)? {
+            config.metrics_export_interval_secs = value;
+        }
+        if let Some(value) = env_parse(&env, ENV_METRICS_EXPORT_TIMEOUT_SECS)? {
+            config.metrics_export_timeout_secs = value;
+        }
+        if let Some(value) = env.get(ENV_DEPLOYMENT_ENVIRONMENT) {
+            config.deployment_environment = value.clone();
         }
 
         config.api_token = resolve_token(&env, file_token, file_token_file)?;
@@ -409,6 +466,71 @@ impl Config {
                     "must be at most {} (semaphore permit ceiling)",
                     tokio::sync::Semaphore::MAX_PERMITS
                 ),
+            });
+        }
+        if let Some(endpoint) = &self.otlp_endpoint {
+            if endpoint.trim().is_empty() {
+                return Err(ConfigError::Invalid {
+                    field: "otlp_endpoint",
+                    reason: "must not be empty".to_owned(),
+                });
+            }
+            if endpoint.trim() != endpoint {
+                return Err(ConfigError::Invalid {
+                    field: "otlp_endpoint",
+                    reason: "must not have leading or trailing whitespace".to_owned(),
+                });
+            }
+            if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+                return Err(ConfigError::Invalid {
+                    field: "otlp_endpoint",
+                    reason: "must start with http:// or https://".to_owned(),
+                });
+            }
+            // Userinfo in the authority would be sent as a credential (or
+            // echoed by an exporter/build error). The host has no use for it
+            // and operators may paste a URL with a token, so reject it.
+            if endpoint_authority_has_userinfo(endpoint) {
+                return Err(ConfigError::Invalid {
+                    field: "otlp_endpoint",
+                    reason: "must not contain userinfo (credentials in the URL)".to_owned(),
+                });
+            }
+        }
+        if self.metrics_export_interval_secs == 0 {
+            return Err(ConfigError::Invalid {
+                field: "metrics_export_interval_secs",
+                reason: "must be greater than zero".to_owned(),
+            });
+        }
+        if self.metrics_export_timeout_secs == 0 {
+            return Err(ConfigError::Invalid {
+                field: "metrics_export_timeout_secs",
+                reason: "must be greater than zero".to_owned(),
+            });
+        }
+        if self.metrics_export_timeout_secs >= self.metrics_export_interval_secs {
+            return Err(ConfigError::Invalid {
+                field: "metrics_export_timeout_secs",
+                reason: "must be strictly less than metrics_export_interval_secs".to_owned(),
+            });
+        }
+        if self.deployment_environment.trim().is_empty() {
+            return Err(ConfigError::Invalid {
+                field: "deployment_environment",
+                reason: "must not be empty".to_owned(),
+            });
+        }
+        if self.deployment_environment.len() > MAX_DEPLOYMENT_ENVIRONMENT_BYTES {
+            return Err(ConfigError::Invalid {
+                field: "deployment_environment",
+                reason: format!("must be at most {MAX_DEPLOYMENT_ENVIRONMENT_BYTES} bytes"),
+            });
+        }
+        if self.deployment_environment.chars().any(char::is_control) {
+            return Err(ConfigError::Invalid {
+                field: "deployment_environment",
+                reason: "must not contain control characters".to_owned(),
             });
         }
         if self.storage_root.as_os_str().is_empty() {
@@ -579,6 +701,17 @@ fn create_private_dir(path: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// True when the URL authority contains userinfo (`scheme://user:secret@host`).
+/// The endpoint is otherwise opaque to this configuration layer; only the
+/// authority is inspected, and a `@` in a path or query does not trigger it.
+pub(crate) fn endpoint_authority_has_userinfo(endpoint: &str) -> bool {
+    let Some((_scheme, rest)) = endpoint.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    authority.contains('@')
+}
+
 /// On-disk shape. Every field is optional: missing values fall back to
 /// [`Config::default`], and unknown keys are rejected so typos cannot be
 /// silently ignored.
@@ -599,6 +732,10 @@ struct ConfigFile {
     api_token: Option<String>,
     api_token_file: Option<PathBuf>,
     trusted_keys: Option<Vec<TrustedKeyConfig>>,
+    otlp_endpoint: Option<String>,
+    metrics_export_interval_secs: Option<u64>,
+    metrics_export_timeout_secs: Option<u64>,
+    deployment_environment: Option<String>,
 }
 
 /// Configuration failures. Every variant is a startup error; none is
@@ -1259,6 +1396,10 @@ mod tests {
                 "allowed_runtimes": ["rust", "python"],
                 "max_execution_deadline_secs": 90,
                 "max_concurrent_executions": 2,
+                "otlp_endpoint": "http://collector.example:4318",
+                "metrics_export_interval_secs": 30,
+                "metrics_export_timeout_secs": 10,
+                "deployment_environment": "staging",
                 "api_token": "file-token",
                 "trusted_keys": [{
                     "key_id": "file-key",
@@ -1284,6 +1425,13 @@ mod tests {
         );
         assert_eq!(config.max_execution_deadline_secs, 90);
         assert_eq!(config.max_concurrent_executions, 2);
+        assert_eq!(
+            config.otlp_endpoint.as_deref(),
+            Some("http://collector.example:4318")
+        );
+        assert_eq!(config.metrics_export_interval_secs, 30);
+        assert_eq!(config.metrics_export_timeout_secs, 10);
+        assert_eq!(config.deployment_environment, "staging");
         assert_eq!(config.api_token.as_deref(), Some("file-token"));
         assert_eq!(config.trusted_keys.len(), 1);
         assert_eq!(config.trusted_keys[0].key_id, "file-key");
@@ -1365,6 +1513,212 @@ mod tests {
         );
         assert_eq!(config.max_execution_deadline_secs, 45);
         assert_eq!(config.max_concurrent_executions, 2);
+    }
+
+    #[test]
+    fn metrics_defaults_are_disabled_with_safe_export_bounds() {
+        let config = Config::default();
+        assert_eq!(config.otlp_endpoint, None);
+        assert_eq!(config.metrics_export_interval_secs, 15);
+        assert_eq!(config.metrics_export_timeout_secs, 5);
+        assert_eq!(config.deployment_environment, "development");
+        startup_ready_config()
+            .validate_for_startup()
+            .expect("metrics defaults must pass startup validation");
+    }
+
+    #[test]
+    fn otlp_endpoint_requires_http_or_https_without_surrounding_whitespace() {
+        for endpoint in [
+            "",
+            "   ",
+            "collector.example:4318",
+            "ftp://collector.example",
+            " http://collector.example",
+            "http://collector.example ",
+        ] {
+            let config = Config {
+                otlp_endpoint: Some(endpoint.to_owned()),
+                ..startup_ready_config()
+            };
+            assert!(
+                matches!(
+                    config.validate_for_startup(),
+                    Err(ConfigError::Invalid {
+                        field: "otlp_endpoint",
+                        ..
+                    })
+                ),
+                "{endpoint:?} must be refused"
+            );
+        }
+
+        for endpoint in ["http://collector.example:4318", "https://collector.example"] {
+            let config = Config {
+                otlp_endpoint: Some(endpoint.to_owned()),
+                ..startup_ready_config()
+            };
+            config
+                .validate_for_startup()
+                .expect("an HTTP(S) endpoint must be accepted");
+        }
+    }
+
+    #[test]
+    fn otlp_endpoint_with_userinfo_is_rejected() {
+        for endpoint in [
+            "http://operator:secret-token@collector.example:4318",
+            "https://secret-token@collector.example",
+        ] {
+            let config = Config {
+                otlp_endpoint: Some(endpoint.to_owned()),
+                ..startup_ready_config()
+            };
+            assert!(
+                matches!(
+                    config.validate_for_startup(),
+                    Err(ConfigError::Invalid {
+                        field: "otlp_endpoint",
+                        ..
+                    })
+                ),
+                "{endpoint:?} must be refused"
+            );
+        }
+
+        // `@` outside the authority is path data, not userinfo.
+        let config = Config {
+            otlp_endpoint: Some("http://collector.example/path@not-authority".to_owned()),
+            ..startup_ready_config()
+        };
+        config
+            .validate_for_startup()
+            .expect("an @ in the path must not be treated as userinfo");
+    }
+
+    #[test]
+    fn otlp_endpoint_debug_never_carries_userinfo_or_markers() {
+        let marker = "userinfo-debug-marker";
+        let config = Config {
+            otlp_endpoint: Some(format!("http://operator:{marker}@collector.example:4318")),
+            ..startup_ready_config()
+        };
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains(marker) && !rendered.contains("collector.example"),
+            "Debug must redact the endpoint, not just its credentials: {rendered}"
+        );
+        assert!(rendered.contains("[configured]"));
+    }
+
+    #[test]
+    fn metrics_export_interval_and_timeout_must_be_ordered_and_nonzero() {
+        for (interval, timeout) in [(0, 1), (5, 0), (5, 5), (5, 6)] {
+            let config = Config {
+                metrics_export_interval_secs: interval,
+                metrics_export_timeout_secs: timeout,
+                ..startup_ready_config()
+            };
+            assert!(
+                matches!(
+                    config.validate_for_startup(),
+                    Err(ConfigError::Invalid {
+                        field: "metrics_export_interval_secs" | "metrics_export_timeout_secs",
+                        ..
+                    })
+                ),
+                "interval {interval} / timeout {timeout} must be refused"
+            );
+        }
+
+        let config = Config {
+            metrics_export_interval_secs: 30,
+            metrics_export_timeout_secs: 10,
+            ..startup_ready_config()
+        };
+        config
+            .validate_for_startup()
+            .expect("timeout strictly below the interval must be accepted");
+    }
+
+    #[test]
+    fn deployment_environment_is_bounded_and_control_free() {
+        for environment in [
+            "".to_owned(),
+            "   ".to_owned(),
+            "x".repeat(MAX_DEPLOYMENT_ENVIRONMENT_BYTES + 1),
+            "prod\nction".to_owned(),
+            "prod\u{7}".to_owned(),
+        ] {
+            let config = Config {
+                deployment_environment: environment.clone(),
+                ..startup_ready_config()
+            };
+            assert!(
+                matches!(
+                    config.validate_for_startup(),
+                    Err(ConfigError::Invalid {
+                        field: "deployment_environment",
+                        ..
+                    })
+                ),
+                "{environment:?} must be refused"
+            );
+        }
+
+        let config = Config {
+            deployment_environment: "x".repeat(MAX_DEPLOYMENT_ENVIRONMENT_BYTES),
+            ..startup_ready_config()
+        };
+        config
+            .validate_for_startup()
+            .expect("the exact byte bound must be accepted");
+    }
+
+    #[test]
+    fn environment_parses_observability_settings() {
+        let config = Config::load_with(
+            None,
+            [
+                (
+                    ENV_OTLP_ENDPOINT.to_owned(),
+                    "https://collector.example:4318".to_owned(),
+                ),
+                (ENV_METRICS_EXPORT_INTERVAL_SECS.to_owned(), "20".to_owned()),
+                (ENV_METRICS_EXPORT_TIMEOUT_SECS.to_owned(), "4".to_owned()),
+                (
+                    ENV_DEPLOYMENT_ENVIRONMENT.to_owned(),
+                    "production".to_owned(),
+                ),
+            ],
+        )
+        .expect("observability environment overrides must load");
+
+        assert_eq!(
+            config.otlp_endpoint.as_deref(),
+            Some("https://collector.example:4318")
+        );
+        assert_eq!(config.metrics_export_interval_secs, 20);
+        assert_eq!(config.metrics_export_timeout_secs, 4);
+        assert_eq!(config.deployment_environment, "production");
+    }
+
+    #[test]
+    fn invalid_numeric_observability_environment_value_is_reported() {
+        let result = Config::load_with(
+            None,
+            [(
+                ENV_METRICS_EXPORT_INTERVAL_SECS.to_owned(),
+                "soon".to_owned(),
+            )],
+        );
+        assert!(matches!(
+            result,
+            Err(ConfigError::Invalid {
+                field: ENV_METRICS_EXPORT_INTERVAL_SECS,
+                ..
+            })
+        ));
     }
 
     #[test]

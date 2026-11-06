@@ -16,6 +16,16 @@ paths:
       responses:
         "200":
           description: Liveness only; no version or topology detail.
+  /readyz:
+    get:
+      operationId: readyz
+      responses:
+        "200":
+          description: >-
+            Cached readiness reports the shared database migrated/probeable
+            and the scheduler hook ready. The probe does no database work.
+        "503":
+          description: Not ready; fixed `unavailable` body with no details.
   /v1/packages:
     post:
       operationId: uploadPackage

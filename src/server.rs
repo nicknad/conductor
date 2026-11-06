@@ -28,9 +28,14 @@ use crate::control_plane::execute_module::{ExecutionError, ExecutionService};
 use crate::control_plane::validate_package::{BuildError, PackageValidationBuilder};
 use crate::executions::executor::ExecutionLimits;
 use crate::executions::history::ExecutionHistoryStore;
+use crate::metrics::{Metrics, MetricsError, MetricsOptions};
 use crate::modules::registry::ModuleRegistry;
 use crate::packages::policy::{PackageValidationPolicy, PolicyError};
+use crate::readiness::Readiness;
 use crate::storage::database::{Database, DatabaseError};
+
+/// How often the background readiness watcher probes the shared database.
+const READINESS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Startup assembly failures. Every variant is fatal: the host never binds
 /// a listener or serves with partial state.
@@ -48,6 +53,8 @@ pub enum StartupError {
     Activation(#[from] ActivationError),
     #[error(transparent)]
     Execution(#[from] ExecutionError),
+    #[error(transparent)]
+    Metrics(#[from] MetricsError),
 }
 
 /// Fully assembled host: one immutable configuration plus the state the
@@ -69,6 +76,17 @@ impl Host {
     /// one [`Database`] handle and therefore one WAL/pragma policy.
     pub fn assemble(config: Config) -> Result<Self, StartupError> {
         config.validate_for_startup()?;
+        // Build metrics before any listener exists. With no endpoint this is a
+        // local no-reader provider; otherwise it owns the only OTLP client.
+        let metrics = Metrics::new(MetricsOptions {
+            endpoint: config.otlp_endpoint.clone(),
+            export_interval: Duration::from_secs(config.metrics_export_interval_secs),
+            export_timeout: Duration::from_secs(config.metrics_export_timeout_secs),
+            deployment_environment: config.deployment_environment.clone(),
+            execution_capacity: config.max_concurrent_executions,
+            storage_root: config.storage_root.clone(),
+        })?;
+        Metrics::install_global(Arc::clone(&metrics));
         let package_policy = PackageValidationPolicy::production();
         package_policy.ensure_production_ingest()?;
         let validator = PackageValidationBuilder::new(package_policy.clone())
@@ -100,6 +118,9 @@ impl Host {
         );
         let database = Arc::new(Database::open(&config.database_path())?);
         database.migrate()?;
+        // Cache the post-migration probe result. A later divergence is picked
+        // up by the bounded watcher started in `serve_with_handle`.
+        let readiness = Arc::new(Readiness::new(database.check_ready().is_ok()));
         let registry = Arc::new(ModuleRegistry::from_database(Arc::clone(&database)));
         let rejection_store = Arc::new(RejectionStore::new(Arc::clone(&database)));
         let execution_history = Arc::new(ExecutionHistoryStore::new(Arc::clone(&database)));
@@ -123,6 +144,7 @@ impl Host {
             allowed_signers,
             config.max_concurrent_executions,
             execution_history,
+            Arc::clone(&metrics),
         )?);
 
         // `validate_for_startup` guarantees a token; do not panic if that
@@ -141,6 +163,9 @@ impl Host {
             api_token: ApiToken::new(api_token),
             upload_slots: Arc::new(Semaphore::new(config.max_concurrent_uploads)),
             execution_service,
+            metrics,
+            database,
+            readiness,
         };
         Ok(Self { config, state })
     }
@@ -178,15 +203,63 @@ impl Host {
         handle: axum_server::Handle<SocketAddr>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let Self { config, state } = self;
-        serve_with_handle(
+        let metrics = Arc::clone(&state.metrics);
+        // Readiness is refreshed off the request path. The watcher is bounded
+        // to one in-flight probe and is aborted once serving ends, whether it
+        // succeeded or failed during bind.
+        let readiness_watcher = spawn_readiness_watcher(
+            Arc::clone(&state.database),
+            Arc::clone(&state.readiness),
+            READINESS_REFRESH_INTERVAL,
+        );
+        let served = serve_with_handle(
             router(state),
             &config.http_bind,
             &config.tls_cert_path,
             &config.tls_key_path,
             handle,
         )
-        .await
+        .await;
+        readiness_watcher.abort();
+        // Flush on both success and failure. Run shutdown off the async worker:
+        // the periodic reader's docs warn that current-thread runtimes can
+        // deadlock if shutdown blocks the runtime thread.
+        match tokio::task::spawn_blocking(move || metrics.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(error = %error, "metrics shutdown failed"),
+            Err(error) => tracing::warn!(error = %error, "metrics shutdown task failed"),
+        }
+        served
     }
+}
+
+/// Starts the bounded readiness watcher. Each tick tries to acquire the one
+/// permit; if the previous probe is still running (for example a hung SQLite
+/// call), the tick is skipped rather than queueing another blocking task. The
+/// permit lives inside the blocking task, so it is released only when the
+/// probe actually ends.
+fn spawn_readiness_watcher(
+    database: Arc<Database>,
+    readiness: Arc<Readiness>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let probe_slots = Arc::new(Semaphore::new(1));
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let Ok(permit) = Arc::clone(&probe_slots).try_acquire_owned() else {
+                continue;
+            };
+            let database = Arc::clone(&database);
+            let readiness = Arc::clone(&readiness);
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                readiness.set_db_ready(database.check_ready().is_ok());
+            });
+        }
+    })
 }
 
 /// Starts the host: initializes tracing, loads operator configuration,
@@ -552,6 +625,26 @@ mod tests {
     }
 
     #[test]
+    fn assemble_rejects_an_unusable_metrics_endpoint_before_touching_storage() {
+        let root = temp_root("metrics-endpoint");
+        let config = Config {
+            otlp_endpoint: Some("http://[".to_owned()),
+            ..test_config(&root)
+        };
+
+        let result = Host::assemble(config);
+        assert!(
+            matches!(result, Err(StartupError::Metrics(_))),
+            "an unbuildable OTLP exporter must be a startup error"
+        );
+        assert!(
+            !root.exists(),
+            "an unusable metrics endpoint must not create the storage layout"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
     fn assemble_rejects_duplicate_key_ids_before_touching_storage() {
         let root = temp_root("duplicate-keys");
         let mut config = test_config(&root);
@@ -571,6 +664,37 @@ mod tests {
             "an unusable trust store must not create the storage layout"
         );
         cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn readiness_watcher_tracks_database_migration() {
+        let database = Arc::new(Database::open_in_memory().expect("database must open"));
+        let readiness = Arc::new(Readiness::new(database.check_ready().is_ok()));
+        assert!(!readiness.is_ready(), "an unmigrated database is not ready");
+
+        let watcher = spawn_readiness_watcher(
+            Arc::clone(&database),
+            Arc::clone(&readiness),
+            Duration::from_millis(10),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !readiness.is_ready(),
+            "the watcher must not report an unmigrated database as ready"
+        );
+
+        database.migrate().expect("database must migrate");
+        for _ in 0..100 {
+            if readiness.is_ready() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            readiness.is_ready(),
+            "the watcher must pick up the migrated database"
+        );
+        watcher.abort();
     }
 
     #[tokio::test]

@@ -1,7 +1,8 @@
 //! Route table wiring.
 //!
-//! Builds the axum [`Router`](axum::Router) for the upload API plus a
-//! `GET /healthz` liveness probe. Layers, outermost first:
+//! Builds the axum [`Router`](axum::Router) for the upload API plus
+//! unauthenticated `GET /healthz` (liveness) and `GET /readyz` (cached
+//! database/scheduler readiness) probes. Layers, outermost first:
 //!
 //! - response security headers on every response, including transport
 //!   rejections: no sniffing, no framing, no referrer, no caching, HSTS
@@ -12,6 +13,9 @@
 //!   (server-generated, never trusted from the client);
 //! - [`TraceLayer`](tower_http::trace::TraceLayer): one span per request
 //!   with the matched route;
+//! - a metrics middleware outside the timeout/panic layers: counts every
+//!   response (including 401/404/405/413/500/503) with the matched route
+//!   template and brackets handlers with an active-request gauge;
 //! - [`TimeoutLayer`](tower_http::timeout::TimeoutLayer): bounds the whole
 //!   request including slow bodies and stalled field boundaries;
 //! - [`CatchPanicLayer`](tower_http::catch_panic::CatchPanicLayer):
@@ -25,13 +29,13 @@
 //!   default (2 MiB) is disabled so the policy bound stays authoritative.
 //!
 //! Per-route: [`require_bearer`](crate::api::uploads::require_bearer)
-//! gates every `/v1` route on the operator token. `/healthz` is
-//! intentionally unauthenticated — load balancers cannot present
-//! credentials — and returns only `ok`, no version or topology detail.
+//! gates every `/v1` route on the operator token. `/healthz` and `/readyz`
+//! are intentionally unauthenticated — probes cannot present credentials —
+//! and return only `ok`/`unavailable`, no version or topology detail.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -147,6 +151,13 @@ pub fn router(state: AppState) -> Router {
             )),
         )
         .route("/healthz", get(healthz))
+        // Readiness is unauthenticated like liveness, but it proves the shared
+        // database is migrated and answers a trivial query. It returns only a
+        // fixed word and never details why it is unavailable.
+        .route("/readyz", get(readyz))
+        // Custom fallback so the metrics middleware also sees unmatched 404s
+        // (Router::layer does not wrap the built-in default fallback).
+        .fallback(not_found)
         // axum's extractor default is 2 MiB; disabling it keeps the
         // route-scoped RequestBodyLimitLayer (policy bound + framing slack)
         // authoritative for valid uploads.
@@ -155,6 +166,13 @@ pub fn router(state: AppState) -> Router {
         .layer(TimeoutLayer::with_status_code(
             StatusCode::SERVICE_UNAVAILABLE,
             timeout,
+        ))
+        // Added after the timeout/catch-panic layers so metrics runs outside
+        // them and observes their 503/500 responses too. Router layers run
+        // after routing, so MatchedPath is available for template labels.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            record_http_metrics,
         ))
         .layer(TraceLayer::new_for_http())
         .layer(PropagateRequestIdLayer::x_request_id())
@@ -268,6 +286,51 @@ fn json_rejection_for(status: StatusCode, already_json: bool) -> Option<ApiError
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+/// Readiness: a cheap read of the host's cached readiness flags. The shared
+/// database probe runs in the bounded background watcher started with the
+/// host, so a probe flood issues no database work and cannot produce a false
+/// `503` from probe-slot contention. The response body stays a fixed word.
+async fn readyz(State(state): State<AppState>) -> Response {
+    if state.readiness.is_ready() {
+        (StatusCode::OK, "ok").into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response()
+    }
+}
+
+/// Default unmatched-route response, installed explicitly so the metrics
+/// middleware wraps it. The body stays empty and detail-free.
+async fn not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
+}
+
+/// One record per HTTP request: active-request gauge, count, and duration.
+/// `MatchedPath` is the route template (never the raw path); unmatched
+/// requests use the literal `unmatched` label.
+async fn record_http_metrics(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_owned())
+        .unwrap_or_else(|| "unmatched".to_owned());
+    let method = request.method().as_str().to_owned();
+    let guard = state.metrics.http_request_guard(&method, &route);
+    let started = Instant::now();
+    let response = next.run(request).await;
+    state.metrics.record_http_request(
+        &method,
+        &route,
+        response.status().as_u16(),
+        started.elapsed(),
+    );
+    drop(guard);
+    response
 }
 
 /// Rewrites refusals produced before the JSON handlers (body limit or a

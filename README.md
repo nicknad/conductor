@@ -68,9 +68,13 @@ Transport security, all fail-closed with no opt-outs:
 - **Bearer auth only.** Every `/v1` route requires
   `Authorization: Bearer <operator-token>`, compared in constant time
   (SHA-256 + `subtle`, redacted `Debug`). Missing and wrong tokens are
-  indistinguishable (`401`, `Bearer` challenge). `/healthz` is the sole
-  unauthenticated endpoint — liveness probes cannot present credentials —
-  and returns only `ok`.
+  indistinguishable (`401`, `Bearer` challenge). `/healthz` (liveness) and
+  `/readyz` (readiness) are the only unauthenticated endpoints — probes cannot
+  present credentials. `/healthz` returns only `ok`; `/readyz` returns `ok`
+  only when the cached readiness state says both the shared database (migrated
+  and answering a periodic probe) and the scheduler hook are ready, otherwise
+  `503` with a fixed `unavailable` body and no detail. `/readyz` reads two
+  atomics and never touches SQLite or the blocking pool per request.
 - **Bounded everything.** Total body (policy bound + 1 MiB slack),
   streaming package bytes, text fields, at most 16 multipart fields, and
   at most 8 concurrent uploads (`503 server_busy` instead of unbounded
@@ -159,6 +163,16 @@ JSON file plus `CONDUCTOR_*` environment overrides produce an immutable
   bearer token. The token is redacted from `Debug` output.
 - `CONDUCTOR_TRUSTED_KEYS_FILE` replaces the file's `trusted_keys` array with
   its own JSON array.
+- `CONDUCTOR_OTLP_ENDPOINT` enables OTLP/HTTP metric export; unset/`null`
+  keeps metrics disabled. The value is a **base URL**: trailing slashes are
+  trimmed and `/v1/metrics` is appended, unless the full signal URL is already
+  supplied. Both `http://` and `https://` are accepted; the blocking exporter
+  is built with a rustls TLS backend. Userinfo in the URL
+  (`https://user:token@host`) is rejected at startup.
+  `CONDUCTOR_METRICS_EXPORT_INTERVAL_SECS` and
+  `CONDUCTOR_METRICS_EXPORT_TIMEOUT_SECS` control the periodic reader
+  (timeout must be strictly below the interval), and
+  `CONDUCTOR_DEPLOYMENT_ENVIRONMENT` sets the resource environment label.
 - `Config::validate_for_startup` refuses to proceed without a non-empty token
   and at least one trusted key, and rejects an unusable bind address, zero
   timeout or slot counts, empty runtime allowlists, and empty paths.
@@ -203,11 +217,75 @@ configuration or key material.
 | `allowed_runtimes` | `CONDUCTOR_ALLOWED_RUNTIMES` (comma-separated) | `["rust"]` |
 | `max_execution_deadline_secs` | `CONDUCTOR_MAX_EXECUTION_DEADLINE_SECS` | `300` |
 | `max_concurrent_executions` | `CONDUCTOR_MAX_CONCURRENT_EXECUTIONS` | `4` |
+| `otlp_endpoint` | `CONDUCTOR_OTLP_ENDPOINT` | none (metrics disabled) |
+| `metrics_export_interval_secs` | `CONDUCTOR_METRICS_EXPORT_INTERVAL_SECS` | `15` |
+| `metrics_export_timeout_secs` | `CONDUCTOR_METRICS_EXPORT_TIMEOUT_SECS` | `5` |
+| `deployment_environment` | `CONDUCTOR_DEPLOYMENT_ENVIRONMENT` | `development` |
 | `api_token` | `CONDUCTOR_API_TOKEN` / `CONDUCTOR_API_TOKEN_FILE` | none (required) |
 | `trusted_keys` | `CONDUCTOR_TRUSTED_KEYS_FILE` | none (required) |
 
 Relative paths resolve against the process working directory; prefer absolute
 paths in deployed configuration.
+
+## Observability (unstable)
+
+Metrics are ephemeral process telemetry exported to an external OTLP/HTTP
+collector. They are **disabled by default** (`otlp_endpoint` unset): the host
+builds a no-reader provider, creates no HTTP client or export thread, and
+performs no network export. There is deliberately **no `/metrics` scrape
+endpoint**, and nothing metric-shaped is written to SQLite. Enable export by
+setting `CONDUCTOR_OTLP_ENDPOINT` (or `otlp_endpoint`) to an
+`http://`/`https://` base URL; exports use protobuf over OTLP/HTTP with
+cumulative temporality. The base URL has `/v1/metrics` appended (trailing
+slashes are ignored), and a full `/v1/metrics` URL is used as-is. HTTPS export
+is backed by rustls (`reqwest-rustls`); the endpoint must not carry userinfo.
+
+Metric names (attributes are bounded labels only — never module/version or
+execution ids, request ids, paths, tokens, configuration, stdout/stderr, or
+error text):
+
+| Metric | Type | Unit | Attributes |
+|---|---|---|---|
+| `http.server.requests` | counter | `{request}` | method, route template, status |
+| `http.server.request.duration` | histogram | `s` | method, route template, status |
+| `http.server.active_requests` | up-down counter | `{request}` | method, route template |
+| `conductor.auth.failures` | counter | `{failure}` | route template, reason (`missing`/`invalid`) |
+| `conductor.execution.completed` | counter | `{execution}` | stable outcome |
+| `conductor.execution.refused` | counter | `{execution}` | bounded reason |
+| `conductor.execution.duration` | histogram | `s` | phase (`prepare`/`run`) |
+| `conductor.execution.slots.in_use` | up-down counter | `{slot}` | none |
+| `conductor.execution.slots.capacity` | observable gauge | `{slot}` | none |
+| `conductor.execution.overload` | counter | `{execution}` | none |
+| `conductor.execution.history.write.failures` | counter | `{failure}` | none |
+| `conductor.db.busy.errors` | counter | `{error}` | none |
+| `conductor.db.lock.wait.duration` | histogram | `s` | none |
+| `conductor.storage.free.bytes` | observable gauge | `By` | none (Unix `statvfs`) |
+| `conductor.artifact.integrity.failures` | counter | `{failure}` | bounded integrity kind |
+
+`http.request.method` is normalized to the standard closed set (`GET`, `POST`,
+`PUT`, `DELETE`, `HEAD`, `OPTIONS`, `PATCH`, `CONNECT`, `TRACE`); any other
+method becomes `_OTHER`, so custom method tokens cannot create unbounded
+labels or exhaust the stream cardinality limit.
+
+Histogram buckets are fixed in `src/metrics.rs` (HTTP, execution, DB lock
+wait, plus a future job-wait view). Resource attributes are
+`service.name=conductor`, `service.version`, `deployment.environment.name`,
+`service.instance.id`, and `host.name`; the instrumentation scope is
+`conductor`.
+
+**Exemplars are not emitted.** OpenTelemetry Rust 0.33 exposes exported
+exemplar data structures but no application-side exemplar recording API, so
+trace-linked exemplars are unsupported by this SDK version. Correlate
+execution/history metrics through structured logs today and future tracing
+when it lands.
+
+`/readyz` reads a cached readiness state: the host probes the shared database
+off the request path every few seconds through a bounded watcher (one probe at
+a time on the blocking pool), and the scheduler-ready flag defaults to true.
+Requests never run a database probe and cannot produce a false `503` under
+flood. Readiness is not proof that the disk has free space or that writes
+succeed; it covers database/migration availability plus the future scheduler
+hook.
 
 ## Worker execution (unstable)
 

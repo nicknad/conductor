@@ -22,6 +22,16 @@ tower-http = { version = "0.7", features = ["trace", "limit", "timeout", "set-he
 base64 = "0.23.1"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 subtle = "2.6.1"
+opentelemetry = { version = "0.33.1", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["metrics"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = [
+    "http-proto",
+    "reqwest-blocking-client",
+    # TLS backend for the blocking OTLP/HTTP client. Without this feature an
+    # `https://` endpoint builds but every export fails at the transport.
+    "reqwest-rustls",
+    "metrics",
+] }
 
 [target.'cfg(unix)'.dependencies]
 # Process-group termination for worker descendants (`killpg`); Unix-only,
@@ -33,3 +43,9 @@ proptest = "1"
 rcgen = "0.14.10"
 serial_test = "4"
 tokio-rustls = "0.26"
+# `testing` exposes InMemoryMetricExporter for integration tests only; the
+# production dependency above deliberately omits it.
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = [
+    "metrics",
+    "testing",
+] }

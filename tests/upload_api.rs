@@ -28,6 +28,7 @@ use conductor::control_plane::execute_module::ExecutionService;
 use conductor::control_plane::validate_package::PackageValidationBuilder;
 use conductor::executions::executor::ExecutionLimits;
 use conductor::executions::history::ExecutionHistoryStore;
+use conductor::metrics::{Metrics, MetricsOptions};
 use conductor::modules::registry::ModuleRegistry;
 use conductor::packages::artifact::ArtifactDigest;
 use conductor::packages::digest::Sha256DigestProvider;
@@ -35,6 +36,8 @@ use conductor::packages::policy::PackageValidationPolicy;
 use conductor::packages::signature::{
     canonical_payload, ConfiguredTrustedKeys, SignatureAlgorithm, TrustedSigningKey,
 };
+use conductor::readiness::Readiness;
+use conductor::storage::database::Database;
 use tokio::sync::Semaphore;
 use tower::ServiceExt as _;
 
@@ -94,6 +97,7 @@ fn test_state(policy: PackageValidationPolicy, tag: &str) -> AppState {
     tighten_private(&artifact_dir);
     tighten_private(&staging_dir);
     let registry = Arc::new(ModuleRegistry::new());
+    let metrics = Metrics::new(MetricsOptions::default()).expect("metrics must build");
     let execution_service = Arc::new(
         ExecutionService::new(
             Arc::clone(&registry),
@@ -106,6 +110,7 @@ fn test_state(policy: PackageValidationPolicy, tag: &str) -> AppState {
             HashSet::from(["k1".to_owned()]),
             4,
             Arc::new(ExecutionHistoryStore::open_in_memory().expect("execution history must open")),
+            Arc::clone(&metrics),
         )
         .expect("execution service must build"),
     );
@@ -114,6 +119,9 @@ fn test_state(policy: PackageValidationPolicy, tag: &str) -> AppState {
     // invisible to the response path by contract.
     let rejection_store =
         Arc::new(RejectionStore::open_in_memory().expect("rejection store must open"));
+    let database = Arc::new(Database::open_in_memory().expect("database must open"));
+    database.migrate().expect("database must migrate");
+    let readiness = Arc::new(Readiness::new(database.check_ready().is_ok()));
     AppState {
         validator: Arc::new(validator),
         quarantine_dir,
@@ -124,6 +132,9 @@ fn test_state(policy: PackageValidationPolicy, tag: &str) -> AppState {
         api_token: ApiToken::new("test-bearer-upload"),
         upload_slots: Arc::new(Semaphore::new(8)),
         execution_service,
+        metrics,
+        database,
+        readiness,
     }
 }
 
