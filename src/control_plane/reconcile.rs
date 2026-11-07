@@ -1,14 +1,7 @@
-//! Classification-only reconciliation between the registry and the artifact
-//! store.
-//!
-//! Startup reconciliation answers one question per registered version: is the
-//! artifact still the exact content-addressed file the row names? It never
-//! parses archives, extracts code, starts a process, writes an artifact, or
-//! deletes one. Determinate per-row findings are persisted; indeterminate I/O
-//! aborts the run so startup can fail closed. Every row is classified before
-//! any is persisted, so a fatal read writes nothing; a fatal write during
-//! persistence can still leave earlier rows updated, and the next pass
-//! converges them.
+//! Classifies registered versions against their artifact bytes. It never
+//! parses, extracts, executes, repairs, or deletes. Determinate findings are
+//! persisted; indeterminate I/O aborts. All rows are classified before any are
+//! persisted, so a fatal read writes nothing.
 
 use std::path::Path;
 
@@ -93,8 +86,6 @@ fn reconcile_with<R: RegistryAccess + ?Sized>(
     let mut report = ReconciliationReport::default();
     let mut classifications = Vec::with_capacity(records.len());
 
-    // Classify every row before persisting any of them. A fatal read on a later
-    // row must not leave earlier rows already written.
     for record in records {
         report.scanned += 1;
         classifications.push((
@@ -250,9 +241,7 @@ fn bounded_reason(reason: &str) -> &str {
 
 fn truncate_on_char_boundary(value: &str, max: usize) -> &str {
     let mut end = max.min(value.len());
-    // A UTF-8 character is at most 4 bytes, so at most three walk-back steps
-    // are needed to reach a boundary. Bounding the loop makes a broken
-    // decrement fail fast instead of hanging the test.
+    // A UTF-8 character is at most 4 bytes; three steps reach a boundary.
     for _ in 0..4 {
         if value.is_char_boundary(end) {
             break;

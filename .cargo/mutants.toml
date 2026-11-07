@@ -15,7 +15,5 @@ timeout_multiplier = 2.0
 # Directory fsync has no observable behavior a test can assert: replacing it
 # with a no-op only changes crash durability. `skip_calls` only skips call
 # sites, so exclude the generated mutant itself.
-# Test-only root probe: `false` is the correct answer on a non-root CI
-# runner, so that mutant is equivalent there. The companion unit test pins
-# the helper to `geteuid`.
+# Test-only root probe; `false` is correct on a non-root runner.
 exclude_re = ["replace sync_dir", "replace test_is_root -> bool"]

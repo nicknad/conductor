@@ -5,19 +5,13 @@
 //! data, never a path: the address is re-derived from the record identity and
 //! the stored string must equal it exactly.
 //!
-//! Residuals:
-//!
-//! - Resolution and open are separate path operations. `O_NOFOLLOW` protects
-//!   only the final component, so a same-UID writer can swap an intermediate
-//!   directory between parent confinement and open. Execution independently
-//!   re-verifies before spawn, so reconciliation is detection, not
-//!   authorization. Dirfd-based opening is future hardening.
-//! - `O_NOFOLLOW`/`O_NONBLOCK` are Unix-only. Non-Unix targets follow symlinks
-//!   on open.
-//! - Startup work is proportional to every registered artifact. There is no
-//!   per-run byte or time budget yet.
-//! - `Oversized` is a policy-bound refusal and is persisted as `Mismatch`. The
-//!   caller must pass `PackageValidationPolicy::archive.max_compressed_bytes`.
+//! Resolution and open are separate path operations. `O_NOFOLLOW` protects
+//! only the final component, so a same-UID writer can swap an intermediate
+//! directory between confinement and open; execution re-verifies before spawn,
+//! so reconciliation is detection, not authorization. `O_NOFOLLOW` and
+//! `O_NONBLOCK` are Unix-only. Startup hashes every registered artifact with no
+//! per-run budget. `Oversized` is a policy refusal persisted as `Mismatch`;
+//! callers pass the package policy bound.
 
 use std::fs::{self, File};
 use std::io::Read;
@@ -75,12 +69,9 @@ pub enum ArtifactVerifyError {
 
 /// Validates the artifact root once and returns its canonical form.
 ///
-/// The root must already exist, be a real directory (not a symlink a later
-/// writer could retarget), and not be group- or world-writable. The raw path is
-/// checked for a trailing separator and for `.`/`..` components before
-/// `symlink_metadata`: on Linux both a trailing slash and a final `/.` follow a
-/// symlinked directory, so the metadata call would report the target as a real
-/// directory and hide the link.
+/// The root must be a real directory, not a symlink, and not group- or
+/// world-writable. A trailing separator or `.`/`..` component is checked before
+/// `symlink_metadata`, which would otherwise follow a symlinked root.
 pub fn preflight_artifact_root(path: &Path) -> Result<PathBuf, ArtifactRootError> {
     if has_trailing_separator(path) {
         return Err(ArtifactRootError::Unusable(
@@ -133,11 +124,8 @@ fn has_trailing_separator(path: &Path) -> bool {
     }
 }
 
-/// True when the raw path contains a `.` or `..` component.
-///
-/// `Path::components` normalizes `.` away except at the start of the path, so
-/// `link/.` yields only `link`. The raw suffix check catches that case before
-/// `symlink_metadata` can follow the linked directory.
+/// True when the raw path has a `.` or `..` component. `components` drops a
+/// trailing `.`, so the raw suffix check is also required.
 fn has_dot_or_parent_component(path: &Path) -> bool {
     use std::path::Component;
 
@@ -270,8 +258,7 @@ fn open_no_follow(path: &Path) -> Result<File, ArtifactVerifyError> {
 
     fs::OpenOptions::new()
         .read(true)
-        // Distinct flag bits, so addition matches OR without creating an
-        // OR-to-XOR equivalent-mutant survivor.
+        // Disjoint flag bits; `+` is the same value as `|` here.
         .custom_flags(libc::O_NOFOLLOW + libc::O_NONBLOCK)
         .open(path)
         .map_err(map_open_error)
@@ -317,21 +304,20 @@ fn test_is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-/// Pins the root probe to the OS answer so a misreporting helper fails here.
-#[cfg(all(test, unix))]
-#[test]
-#[allow(unsafe_code)]
-fn test_is_root_matches_effective_uid() {
-    // SAFETY: `geteuid` takes no arguments and only reads the process's
-    // effective uid; it cannot fail or touch memory.
-    let effective_root = unsafe { libc::geteuid() == 0 };
-    assert_eq!(test_is_root(), effective_root);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::artifact_store::canonical_artifact_relpath;
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(unsafe_code)]
+    fn test_is_root_matches_effective_uid() {
+        // SAFETY: `geteuid` takes no arguments and only reads the process's
+        // effective uid; it cannot fail or touch memory.
+        let effective_root = unsafe { libc::geteuid() == 0 };
+        assert_eq!(test_is_root(), effective_root);
+    }
 
     struct TempDir(PathBuf);
 
