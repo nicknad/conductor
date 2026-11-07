@@ -1026,11 +1026,11 @@ mod tests {
     #[test]
     #[serial]
     fn global_handle_records_through_the_module_helpers() {
-        fn clear() {
+        let clear = || {
             *global_slot()
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        }
+        };
 
         clear();
         let (metrics, exporter) = capture(MetricsOptions::default());
