@@ -9,6 +9,12 @@
 > [repository README](../README.md) and module READMEs are the entry points for
 > the current code.
 
+> **Status update (2026-11-07).** Registry persistence, startup
+> quarantine/staging sweeps, execution history, and classify-only startup
+> reconciliation have landed since this audit. Orphan detection, artifact
+> repair, `reconciliation_runs`, artifact GC, and execution-history retention
+> remain open. The historical findings below are unchanged.
+
 **Status vocabulary**
 
 - **Implemented** — code enforces what the summary states.

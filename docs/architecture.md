@@ -66,7 +66,12 @@ state behind:
 6. One `Database` is opened and migrated; the module registry, rejection
    store, and execution-history store share it through `Arc`, so one
    connection owns the WAL/pragma policy.
-7. The assembled `Host` builds the router (configured bearer token, upload
+7. Reconcile every registered version's artifact (classify-only). Each row is
+   classified as `ok`, `missing`, or `mismatch` without reading package code
+   or rewriting bytes; a read or persist error aborts startup. This runs after
+   the registry exists and before readiness, execution services, or the
+   router are built.
+8. The assembled `Host` builds the router (configured bearer token, upload
    slots, request timeout) and serves TLS-only on the configured bind.
 
 Failures at any step abort startup without binding a listener.
@@ -295,9 +300,12 @@ cannot false-503 under probe flood. Readiness is not a write/disk-full proof.
 
 ## Not built yet
 
-Scheduler/triggering, CLI, startup reconciliation (registry ↔ artifact-store
-integrity repair), artifact GC, and execution-history retention/GC.
+Scheduler/triggering, CLI, artifact GC, and execution-history
+retention/GC. Startup reconciliation is classify-only: it sets
+`ok`/`missing`/`mismatch` but does not repair artifacts or detect orphans,
+and it does not yet record `reconciliation_runs`.
 `control_plane/lifecycle.rs` is currently a placeholder for
 deactivate/remove/rollback transitions. Leftover quarantine/staging sweeps
-already run at startup. See [statecharts.md](statecharts.md) for per-module
-state diagrams and the prioritized remaining-work table.
+and classify-only startup reconciliation already run at startup. See
+[statecharts.md](statecharts.md) for per-module state diagrams and the
+prioritized remaining-work table.

@@ -9,7 +9,8 @@ implemented. Everything else is derived from the current code.
 
 ## 1. Host startup (`server::run` / `Host::assemble`)
 
-Source: `src/server.rs`, `src/config.rs`, `src/readiness.rs`.
+Source: `src/server.rs`, `src/config.rs`, `src/readiness.rs`,
+`src/control_plane/reconcile.rs`.
 
 ```mermaid
 stateDiagram-v2
@@ -26,7 +27,9 @@ stateDiagram-v2
     CreateLayout --> SweepWorkspaces: managed roots at 0700
     SweepWorkspaces --> OpenDatabase: quarantine + staging TTL sweeps
     OpenDatabase --> StartupFailed: open/migrate error or database newer than binary
-    OpenDatabase --> WarmReadiness: schema current
+    OpenDatabase --> ReconcileArtifacts: schema current
+    ReconcileArtifacts --> StartupFailed: registry/artifact read or persist error
+    ReconcileArtifacts --> WarmReadiness: classify-only complete
     WarmReadiness --> AssembleServices: one shared DB handle
     AssembleServices --> StartupFailed: activation/execution service refused
     AssembleServices --> Serving: router built
@@ -37,6 +40,10 @@ stateDiagram-v2
     note right of CreateLayout
         Config/trust validation happens first,
         so a rejected config leaves no dirs.
+    end note
+    note right of ReconcileArtifacts
+        Classifies every registered artifact
+        before readiness or execution exists.
     end note
     note right of Serving
         No listener is bound before this state.
@@ -390,51 +397,58 @@ stateDiagram-v2
 
 ### 10.1 Current behavior
 
-Source: `src/modules/registry.rs` (`IntegrityState`).
+Source: `src/modules/registry.rs` (`IntegrityState`),
+`src/control_plane/reconcile.rs`, `src/storage/artifact_verify.rs`.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Ok: registration records integrity_state = ok
-    Ok --> Missing: set_integrity_state(Missing) - no production caller
-    Ok --> Mismatch: set_integrity_state(Mismatch) - no production caller
-    Missing --> Ok: manual repair only
-    Mismatch --> Ok: manual repair only
+    Ok --> Missing: startup reconciliation finds no artifact
+    Ok --> Mismatch: startup reconciliation rejects path, size, or digest
+    Missing --> Ok: startup reconciliation after restore / re-promote
+    Mismatch --> Ok: startup reconciliation after replacement
     Ok --> ActivationAllowed: activation / execution
     Missing --> ActivationRefused
     Mismatch --> ActivationRefused
 
     note right of Missing
-        Integrity states persist in SQLite, but
-        no startup scanner or API sets them today.
+        Startup reconciliation sets these states; no API
+        does. Byte repair and artifact GC remain planned.
     end note
 ```
 
-### 10.2 Startup reconciliation (**planned**)
+### 10.2 Startup reconciliation (**classify-only implemented; repair/orphan/runs planned**)
 
-Source: [design-persistence.md](design-persistence.md) PR4,
+Source: `src/control_plane/reconcile.rs`,
+`src/storage/artifact_verify.rs`,
+[design-persistence.md](design-persistence.md) PR4,
 [storage-reconciliation.md](storage-reconciliation.md) items 8 and 11.
+`Host::assemble` runs classification after building the registry and before
+readiness, execution services, or the router.
+
+Implemented classify-only flow:
 
 ```mermaid
 stateDiagram-v2
     [*] --> EnumeratingRegistry: all_versions()
     EnumeratingRegistry --> CheckingArtifact: per registered row
-    CheckingArtifact --> Ok: size + SHA-256 match
+    CheckingArtifact --> Ok: canonical path + regular file + size + SHA-256 match
     CheckingArtifact --> Missing: file absent
-    CheckingArtifact --> Mismatch: size or digest differs
-    Missing --> Ok: restore / re-promote artifact
-    Mismatch --> Ok: replace from a trusted source
-    EnumeratingRegistry --> ScanningOrphans: registry scan complete
-    ScanningOrphans --> OrphanFound: artifact file has no registry row
-    OrphanFound --> Collected: artifact GC (planned)
-    Ok --> Reconciled
-    Collected --> Reconciled
-    Reconciled --> [*]: one reconciliation_runs row (planned)
+    CheckingArtifact --> Mismatch: non-canonical path, size, or digest differs
+    Ok --> Persisted
+    Missing --> Persisted
+    Mismatch --> Persisted
+    Persisted --> [*]: every row classified, then each state written
 
     note right of CheckingArtifact
         Reconciliation must never execute package bytes
         or rewrite a registry row to match bad bytes.
     end note
 ```
+
+Deferred: repair after restore or replacement (`Missing --> Ok`,
+`Mismatch --> Ok`), orphan scanning, artifact GC, and one
+`reconciliation_runs` row per pass.
 
 ## 11. Scheduler / triggering (**planned**)
 
@@ -511,7 +525,7 @@ guarantee beyond the dependencies noted.
 | 1 | **Scheduler / triggering**: durable job definitions, cron/interval triggers, queueing, dispatch, retry/attempt semantics, cancellation, scheduler readiness hook, job-wait histogram | No scheduler module; `scheduler_ready` defaults true; `conductor.job.wait.duration` is defined but not emitted | Produces the jobs the platform exists to run |
 | 2 | **Operator CLI**: upload, validate, activate, execute, history, lifecycle, reconcile commands | `tests/cli.rs` only drives startup failures; no CLI module | Operator usability; today everything is raw HTTP |
 | 3 | **Module lifecycle transitions**: deactivate, remove, rollback, drain running work, reference counting | `src/control_plane/lifecycle.rs` is a placeholder; `clear_active` / `remove_version` are registry primitives with no caller | Artifact GC and safe upgrades |
-| 4 | **Startup reconciliation**: scan registry vs artifact store, populate `Missing`/`Mismatch`, repair or quarantine, record `reconciliation_runs` | `IntegrityState` and `set_integrity_state` exist; no production caller; design says PR4 | Trustworthy restart state |
+| 4 | **Startup reconciliation**: scan registry vs artifact store, populate `Missing`/`Mismatch`, repair or quarantine, record `reconciliation_runs` | Classifier and startup wiring implemented in `Host::assemble`; repair, orphan detection, and `reconciliation_runs` deferred; design says PR4 | Trustworthy restart state |
 | 5 | **Artifact GC**: delete orphaned blobs left by version conflicts or removals, with reference checks against active versions and in-flight jobs | `remove_version` deliberately leaves bytes orphaned; no GC | Unbounded disk growth |
 | 6 | **Execution-history retention/GC**: age or count policy for the `executions` table | README and architecture both state growth is unbounded | Unbounded DB growth |
 | 7 | **Trust-key lifecycle and per-module authorization**: rotation/revocation beyond restart-time config, key→module scope | `TrustedSigningKey` has no scope; execution checks only key id, not signature | Least-privilege signing |
@@ -521,9 +535,8 @@ guarantee beyond the dependencies noted.
 
 ### Notes on in-progress work
 
-- `src/metrics.rs`, `src/readiness.rs`, and `tests/observability.rs` are
-  untracked, and `README.md`, `docs/architecture.md`, `src/server.rs`,
-  `src/api/routes.rs`, and related files are modified but uncommitted. The
-  charts above describe that working tree, including readiness and metrics.
+- Metrics and readiness landed in Slice 0 and are committed. The charts above
+  describe the current tree, including readiness, metrics, and classify-only
+  startup reconciliation.
 - `tests/cli.rs` is the process-level startup suite, not an operator CLI
   suite; do not mistake it for implemented CLI coverage.
