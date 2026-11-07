@@ -1557,6 +1557,7 @@ async fn history_write_failure_is_a_generic_internal_error() {
             HashSet::from(["k1".to_owned()]),
             4,
             Arc::new(ExecutionHistoryStore::new(Arc::new(unmigrated))),
+            Arc::clone(&state.metrics),
         )
         .expect("execution service must build"),
     );
@@ -1629,6 +1630,7 @@ async fn history_read_failure_is_a_generic_internal_error() {
             HashSet::from(["k1".to_owned()]),
             4,
             Arc::new(ExecutionHistoryStore::new(Arc::new(unmigrated))),
+            Arc::clone(&state.metrics),
         )
         .expect("execution service must build"),
     );

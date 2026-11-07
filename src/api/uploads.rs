@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Multipart, Request, State};
+use axum::extract::{MatchedPath, Multipart, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -58,6 +58,7 @@ use crate::audit::recorder::RejectionRecorder;
 use crate::control_plane::execute_module::ExecutionService;
 use crate::control_plane::upload_package::run_upload_workflow;
 use crate::control_plane::validate_package::{PackageValidator, ValidationError};
+use crate::metrics::AuthFailure;
 use crate::modules::registry::{ModuleRegistry, RegistryError};
 use crate::packages::signature::{
     PackageSignature, MAX_KEY_ID_BYTES, SUPPORTED_SIGNATURE_FORMAT_VERSION,
@@ -133,6 +134,13 @@ pub struct AppState {
     /// Registered-artifact execution service. Built once at startup around
     /// the shared registry, immutable policy, and artifact/staging roots.
     pub execution_service: Arc<ExecutionService>,
+    /// Process metrics handle. Instruments are cached; handlers only record.
+    pub metrics: Arc<crate::metrics::Metrics>,
+    /// Shared database handle used by the readiness watcher and tests.
+    pub database: Arc<crate::storage::database::Database>,
+    /// Per-host cached readiness. `/readyz` reads two atomics and never
+    /// touches SQLite per request.
+    pub readiness: Arc<crate::readiness::Readiness>,
 }
 
 /// `201` body for an accepted package.
@@ -316,6 +324,11 @@ pub async fn require_bearer(
     next: Next,
 ) -> Response {
     let id = request_id(request.headers());
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_owned())
+        .unwrap_or_else(|| "unmatched".to_owned());
     let presented = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -324,6 +337,12 @@ pub async fn require_bearer(
     match presented {
         Some(token) if state.api_token.verify(token) => next.run(request).await,
         _ => {
+            let reason = if presented.is_some() {
+                AuthFailure::Invalid
+            } else {
+                AuthFailure::Missing
+            };
+            state.metrics.record_auth_failure(&route, reason);
             let api = ApiError::Unauthorized {
                 code: "missing_or_invalid_bearer",
                 message: "valid bearer token required".to_owned(),

@@ -14,11 +14,14 @@ use conductor::control_plane::execute_module::ExecutionService;
 use conductor::control_plane::validate_package::PackageValidationBuilder;
 use conductor::executions::executor::ExecutionLimits;
 use conductor::executions::history::ExecutionHistoryStore;
+use conductor::metrics::{Metrics, MetricsOptions};
 use conductor::modules::registry::ModuleRegistry;
 use conductor::packages::policy::PackageValidationPolicy;
 use conductor::packages::signature::{
     ConfiguredTrustedKeys, SignatureAlgorithm, TrustedSigningKey,
 };
+use conductor::readiness::Readiness;
+use conductor::storage::database::Database;
 use libfuzzer_sys::fuzz_target;
 use tokio::sync::Semaphore;
 use tower::ServiceExt as _;
@@ -55,6 +58,7 @@ fn state() -> &'static AppState {
             .build()
             .expect("fixed validator");
         let registry = Arc::new(ModuleRegistry::new());
+        let metrics = Metrics::new(MetricsOptions::default()).expect("fixed in-memory metrics");
         let execution_service = Arc::new(
             ExecutionService::new(
                 Arc::clone(&registry),
@@ -70,9 +74,13 @@ fn state() -> &'static AppState {
                     ExecutionHistoryStore::open_in_memory()
                         .expect("fixed in-memory execution history"),
                 ),
+                Arc::clone(&metrics),
             )
             .expect("fixed execution service"),
         );
+        let database = Arc::new(Database::open_in_memory().expect("fixed database"));
+        database.migrate().expect("fixed database migration");
+        let readiness = Arc::new(Readiness::new(database.check_ready().is_ok()));
 
         AppState {
             validator: Arc::new(validator),
@@ -84,6 +92,9 @@ fn state() -> &'static AppState {
             api_token: ApiToken::new(TOKEN),
             upload_slots: Arc::new(Semaphore::new(4)),
             execution_service,
+            metrics,
+            database,
+            readiness,
         }
     })
 }

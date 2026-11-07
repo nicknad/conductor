@@ -22,6 +22,7 @@ use conductor::control_plane::register_package::register;
 use conductor::control_plane::validate_package::{PackageValidationBuilder, ValidatedPackage};
 use conductor::executions::executor::{ExecutionLimits, ExecutionOutcome};
 use conductor::executions::history::ExecutionHistoryStore;
+use conductor::metrics::{Metrics, MetricsOptions};
 use conductor::modules::registry::{IntegrityState, ModuleRecord, ModuleRegistry};
 use conductor::packages::archive::QuarantinedFile;
 use conductor::packages::digest::Sha256DigestProvider;
@@ -34,6 +35,8 @@ use conductor::storage::artifact_store::{
     artifact_relative_path, canonical_artifact_relpath, promote_quarantined,
 };
 use conductor::storage::database::Database;
+use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 
 /// Test-only signing key. This private key must never sign anything outside
 /// these tests.
@@ -342,6 +345,29 @@ impl Fixture {
         package_policy: PackageValidationPolicy,
         history: Arc<ExecutionHistoryStore>,
     ) -> Result<ExecutionService, ExecutionError> {
+        let metrics = Metrics::new(MetricsOptions::default()).expect("metrics must build");
+        self.try_service_with_history_and_metrics(
+            registry,
+            max_deadline,
+            allowed_signers,
+            max_concurrent_executions,
+            package_policy,
+            history,
+            metrics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_service_with_history_and_metrics(
+        &self,
+        registry: Arc<ModuleRegistry>,
+        max_deadline: Duration,
+        allowed_signers: HashSet<String>,
+        max_concurrent_executions: usize,
+        package_policy: PackageValidationPolicy,
+        history: Arc<ExecutionHistoryStore>,
+        metrics: Arc<Metrics>,
+    ) -> Result<ExecutionService, ExecutionError> {
         ExecutionService::new(
             registry,
             self.artifact_dir.clone(),
@@ -353,7 +379,29 @@ impl Fixture {
             allowed_signers,
             max_concurrent_executions,
             history,
+            metrics,
         )
+    }
+
+    fn service_with_metrics(
+        &self,
+        registry: Arc<ModuleRegistry>,
+        max_deadline: Duration,
+        allowed_signers: HashSet<String>,
+        max_concurrent_executions: usize,
+        package_policy: PackageValidationPolicy,
+        metrics: Arc<Metrics>,
+    ) -> ExecutionService {
+        self.try_service_with_history_and_metrics(
+            registry,
+            max_deadline,
+            allowed_signers,
+            max_concurrent_executions,
+            package_policy,
+            Arc::new(ExecutionHistoryStore::open_in_memory().expect("execution history must open")),
+            metrics,
+        )
+        .expect("execution service must build")
     }
 
     fn service_with(
@@ -445,6 +493,129 @@ impl Fixture {
             .expect("record must activate");
         Arc::new(registry)
     }
+}
+
+fn capture_metrics() -> (Arc<Metrics>, InMemoryMetricExporter) {
+    let exporter = InMemoryMetricExporter::default();
+    let metrics = Metrics::with_exporter(MetricsOptions::default(), exporter.clone())
+        .expect("in-memory metrics must build");
+    (metrics, exporter)
+}
+
+fn exported(metrics: &Metrics, exporter: &InMemoryMetricExporter) -> Vec<ResourceMetrics> {
+    metrics.force_flush().expect("metrics flush must succeed");
+    exporter
+        .get_finished_metrics()
+        .expect("in-memory metrics must read")
+}
+
+fn attributes_match<'a>(
+    attributes: impl Iterator<Item = &'a opentelemetry::KeyValue>,
+    key: &str,
+    value: &str,
+) -> bool {
+    attributes
+        .into_iter()
+        .any(|attribute| attribute.key.as_str() == key && attribute.value.as_str() == value)
+}
+
+fn u64_sum(data: &[ResourceMetrics], name: &str, key: &str, value: &str) -> Option<u64> {
+    for resource in data {
+        for scope in resource.scope_metrics() {
+            for metric in scope.metrics() {
+                if metric.name() != name {
+                    continue;
+                }
+                if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
+                    for point in sum.data_points() {
+                        if attributes_match(point.attributes(), key, value) {
+                            return Some(point.value());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn u64_sum_no_attributes(data: &[ResourceMetrics], name: &str) -> Option<u64> {
+    for resource in data {
+        for scope in resource.scope_metrics() {
+            for metric in scope.metrics() {
+                if metric.name() != name {
+                    continue;
+                }
+                if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
+                    return sum
+                        .data_points()
+                        .find(|point| point.attributes().next().is_none())
+                        .map(|point| point.value());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Total of every data point for `name`, regardless of attributes. Used to
+/// assert that an instrument emitted no point at all.
+fn u64_sum_overall(data: &[ResourceMetrics], name: &str) -> Option<u64> {
+    for resource in data {
+        for scope in resource.scope_metrics() {
+            for metric in scope.metrics() {
+                if metric.name() != name {
+                    continue;
+                }
+                if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
+                    let mut total = None;
+                    for point in sum.data_points() {
+                        total = Some(total.unwrap_or(0) + point.value());
+                    }
+                    if total.is_some() {
+                        return total;
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn i64_sum(data: &[ResourceMetrics], name: &str) -> Option<i64> {
+    for resource in data {
+        for scope in resource.scope_metrics() {
+            for metric in scope.metrics() {
+                if metric.name() != name {
+                    continue;
+                }
+                if let AggregatedMetrics::I64(MetricData::Sum(sum)) = metric.data() {
+                    return sum.data_points().map(|point| point.value()).next();
+                }
+            }
+        }
+    }
+    None
+}
+
+fn histogram_has_attributes(data: &[ResourceMetrics], name: &str, key: &str, value: &str) -> bool {
+    for resource in data {
+        for scope in resource.scope_metrics() {
+            for metric in scope.metrics() {
+                if metric.name() != name {
+                    continue;
+                }
+                if let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() {
+                    for point in histogram.data_points() {
+                        if point.count() > 0 && attributes_match(point.attributes(), key, value) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 const SCRIPT_OK: &str = r#"#!/bin/sh
@@ -712,6 +883,394 @@ async fn history_write_failure_fails_the_execution_without_a_receipt() {
         "expected a typed history failure, got {err:?}"
     );
     assert_eq!(err.to_string(), "failed to record execution history");
+}
+
+#[tokio::test]
+async fn successful_execution_emits_completion_duration_and_slot_gauges() {
+    let scratch = Scratch::new("metrics-success");
+    let fixture = fixture(&scratch, MODULE_ID, VERSION, SCRIPT_OK);
+    let (metrics, exporter) = capture_metrics();
+    let service = fixture.service_with_metrics(
+        Arc::clone(&fixture.active_registry(fixture.record())),
+        Duration::from_secs(30),
+        HashSet::from(["k1".to_owned()]),
+        4,
+        PackageValidationPolicy::production(),
+        Arc::clone(&metrics),
+    );
+
+    exporter.reset();
+    let receipt = service
+        .execute(
+            MODULE_ID,
+            None,
+            "run",
+            serde_json::json!({"batch": 7}),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("execution must succeed");
+
+    let data = exported(&metrics, &exporter);
+    assert_eq!(
+        u64_sum(
+            &data,
+            "conductor.execution.completed",
+            "conductor.execution.outcome",
+            "succeeded"
+        ),
+        Some(1),
+        "a successful worker must increment the completed counter"
+    );
+    assert!(
+        histogram_has_attributes(
+            &data,
+            "conductor.execution.duration",
+            "conductor.execution.phase",
+            "run"
+        ),
+        "the run phase must be recorded"
+    );
+    assert_eq!(
+        i64_sum(&data, "conductor.execution.slots.in_use"),
+        Some(0),
+        "the slot gauge must return to zero"
+    );
+
+    // No identity, path, token, or configuration may be an attribute.
+    let rendered = format!("{data:?}");
+    for leaked in [
+        MODULE_ID,
+        VERSION,
+        receipt.execution_id.as_str(),
+        fixture.artifact_dir.to_str().expect("temp path"),
+        ".zip",
+        "k1",
+        "batch",
+    ] {
+        assert!(
+            !rendered.contains(leaked),
+            "metric data leaked {leaked:?}: {rendered}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn execution_overload_emits_the_overload_counter() {
+    let scratch = Scratch::new("metrics-overload");
+    let marker = scratch.file("started");
+    let release = scratch.file("release");
+    let script = format!(
+        "#!/bin/sh\nread -r line\nprintf started > '{}'\ni=0\nwhile [ ! -e '{}' ]; do i=$((i+1)); [ \"$i\" -ge 1000 ] && break; sleep 0.01; done\nprintf '{{\"protocol_version\":1,\"status\":\"ok\",\"result\":null}}\\n'\n",
+        marker.display(),
+        release.display()
+    );
+    let fixture = fixture(&scratch, MODULE_ID, VERSION, &script);
+    let (metrics, exporter) = capture_metrics();
+    let service = fixture.service_with_metrics(
+        Arc::clone(&fixture.active_registry(fixture.record())),
+        Duration::from_secs(30),
+        HashSet::from(["k1".to_owned()]),
+        1,
+        PackageValidationPolicy::production(),
+        Arc::clone(&metrics),
+    );
+
+    exporter.reset();
+    let background = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .execute(
+                    MODULE_ID,
+                    None,
+                    "run",
+                    serde_json::json!({}),
+                    Duration::from_secs(10),
+                )
+                .await
+        })
+    };
+    assert!(
+        wait_for_path(&marker, Duration::from_secs(10)).await,
+        "the first execution must start before capacity is probed"
+    );
+
+    let err = service
+        .execute(
+            MODULE_ID,
+            None,
+            "run",
+            serde_json::json!({}),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ExecutionError::Overloaded { maximum: 1 }));
+
+    let data = exported(&metrics, &exporter);
+    assert_eq!(
+        u64_sum_no_attributes(&data, "conductor.execution.overload"),
+        Some(1),
+        "a fail-fast capacity refusal must be counted"
+    );
+    assert_eq!(
+        u64_sum_overall(&data, "conductor.execution.refused"),
+        None,
+        "overload is authoritative and must not also count as a generic refusal"
+    );
+
+    std::fs::write(&release, b"go").expect("release marker must be writable");
+    let first = background
+        .await
+        .expect("background task must join")
+        .expect("the first execution must succeed");
+    assert!(matches!(first.outcome, ExecutionOutcome::Succeeded { .. }));
+}
+
+#[tokio::test]
+async fn history_write_failure_emits_the_failure_counter() {
+    let scratch = Scratch::new("metrics-history-failure");
+    let fixture = fixture(&scratch, MODULE_ID, VERSION, SCRIPT_OK);
+    let (metrics, exporter) = capture_metrics();
+    let unmigrated = Database::open_in_memory().expect("in-memory database must open");
+    let service = fixture
+        .try_service_with_history_and_metrics(
+            Arc::clone(&fixture.active_registry(fixture.record())),
+            Duration::from_secs(30),
+            HashSet::from(["k1".to_owned()]),
+            4,
+            PackageValidationPolicy::production(),
+            Arc::new(ExecutionHistoryStore::new(Arc::new(unmigrated))),
+            Arc::clone(&metrics),
+        )
+        .expect("execution service must build");
+
+    exporter.reset();
+    let err = service
+        .execute(
+            MODULE_ID,
+            None,
+            "run",
+            serde_json::json!({}),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect_err("history failure must fail the execution");
+    assert!(matches!(err, ExecutionError::History(_)));
+
+    let data = exported(&metrics, &exporter);
+    assert_eq!(
+        u64_sum_no_attributes(&data, "conductor.execution.history.write.failures"),
+        Some(1),
+        "a failed history insert must be counted"
+    );
+    assert_eq!(
+        u64_sum(
+            &data,
+            "conductor.execution.completed",
+            "conductor.execution.outcome",
+            "succeeded"
+        ),
+        Some(1),
+        "the completed worker must remain observable before the failed insert"
+    );
+    assert_eq!(
+        u64_sum_overall(&data, "conductor.execution.refused"),
+        None,
+        "the history failure counter is authoritative; completion must not also be a refusal"
+    );
+    assert_eq!(i64_sum(&data, "conductor.execution.slots.in_use"), Some(0));
+}
+
+#[tokio::test]
+async fn tampered_artifact_emits_integrity_and_refusal_metrics() {
+    let scratch = Scratch::new("metrics-tamper");
+    let fixture = fixture(&scratch, MODULE_ID, VERSION, SCRIPT_OK);
+    let (metrics, exporter) = capture_metrics();
+    let service = fixture.service_with_metrics(
+        Arc::clone(&fixture.active_registry(fixture.record())),
+        Duration::from_secs(30),
+        HashSet::from(["k1".to_owned()]),
+        4,
+        PackageValidationPolicy::production(),
+        Arc::clone(&metrics),
+    );
+
+    let mut bytes = std::fs::read(&fixture.artifact_path).expect("artifact must be readable");
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xFF;
+    std::fs::write(&fixture.artifact_path, &bytes).expect("tampered bytes must be writable");
+
+    exporter.reset();
+    let err = service
+        .execute(
+            MODULE_ID,
+            None,
+            "run",
+            serde_json::json!({}),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ExecutionError::ArtifactDigestMismatch { .. }));
+
+    let data = exported(&metrics, &exporter);
+    assert_eq!(
+        u64_sum(
+            &data,
+            "conductor.artifact.integrity.failures",
+            "conductor.integrity.kind",
+            "digest"
+        ),
+        Some(1),
+        "a digest mismatch must be classified"
+    );
+    assert_eq!(
+        u64_sum(
+            &data,
+            "conductor.execution.refused",
+            "conductor.execution.reason",
+            "integrity"
+        ),
+        Some(1),
+        "the refusal must be classified as integrity"
+    );
+    let rendered = format!("{data:?}");
+    for leaked in [
+        MODULE_ID,
+        VERSION,
+        fixture.artifact_path.to_str().expect("temp path"),
+        ".zip",
+        "k1",
+    ] {
+        assert!(
+            !rendered.contains(leaked),
+            "metric data leaked {leaked:?}: {rendered}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn activation_tamper_emits_integrity_metrics() {
+    let scratch = Scratch::new("metrics-activate-tamper");
+    let fixture = fixture(&scratch, MODULE_ID, VERSION, SCRIPT_OK);
+    let (metrics, exporter) = capture_metrics();
+    let registry = Arc::new(ModuleRegistry::new());
+    registry
+        .record(fixture.record())
+        .expect("record must register");
+    let service = fixture.service_with_metrics(
+        registry,
+        Duration::from_secs(30),
+        HashSet::from(["k1".to_owned()]),
+        4,
+        PackageValidationPolicy::production(),
+        Arc::clone(&metrics),
+    );
+
+    let bytes = std::fs::read(&fixture.artifact_path).expect("artifact must be readable");
+    std::fs::write(&fixture.artifact_path, &bytes[..bytes.len() - 1])
+        .expect("truncated bytes must be writable");
+
+    exporter.reset();
+    let err = service
+        .activate(MODULE_ID, VERSION)
+        .await
+        .expect_err("activation must verify artifact bytes");
+    assert!(matches!(err, ExecutionError::ArtifactSizeMismatch { .. }));
+
+    let data = exported(&metrics, &exporter);
+    assert_eq!(
+        u64_sum(
+            &data,
+            "conductor.artifact.integrity.failures",
+            "conductor.integrity.kind",
+            "size"
+        ),
+        Some(1),
+        "activation must classify artifact damage"
+    );
+}
+
+#[tokio::test]
+async fn registry_integrity_state_emits_integrity_metrics_for_activate_and_execute() {
+    let scratch = Scratch::new("metrics-registry-state");
+    let fixture = fixture(&scratch, MODULE_ID, VERSION, SCRIPT_OK);
+    let (metrics, exporter) = capture_metrics();
+    let registry = Arc::new(ModuleRegistry::new());
+    registry
+        .record(fixture.record())
+        .expect("record must register");
+    registry
+        .set_integrity_state(MODULE_ID, VERSION, IntegrityState::Missing)
+        .expect("integrity state must be markable");
+    let service = fixture.service_with_metrics(
+        registry,
+        Duration::from_secs(30),
+        HashSet::from(["k1".to_owned()]),
+        4,
+        PackageValidationPolicy::production(),
+        Arc::clone(&metrics),
+    );
+
+    exporter.reset();
+    let err = service
+        .activate(MODULE_ID, VERSION)
+        .await
+        .expect_err("a registry state of Missing must refuse activation");
+    assert!(
+        matches!(
+            err,
+            ExecutionError::Activation(ActivationError::Integrity {
+                state: IntegrityState::Missing,
+                ..
+            })
+        ),
+        "unexpected activation error: {err:?}"
+    );
+    let err = service
+        .execute(
+            MODULE_ID,
+            Some(VERSION),
+            "run",
+            serde_json::json!({}),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect_err("a registry state of Missing must refuse execution");
+    assert!(
+        matches!(
+            err,
+            ExecutionError::Activation(ActivationError::Integrity {
+                state: IntegrityState::Missing,
+                ..
+            })
+        ),
+        "unexpected execution error: {err:?}"
+    );
+
+    let data = exported(&metrics, &exporter);
+    assert_eq!(
+        u64_sum(
+            &data,
+            "conductor.artifact.integrity.failures",
+            "conductor.integrity.kind",
+            "registry_state"
+        ),
+        Some(2),
+        "activation and execution must both count the registry integrity state"
+    );
+    assert_eq!(
+        u64_sum(
+            &data,
+            "conductor.execution.refused",
+            "conductor.execution.reason",
+            "integrity"
+        ),
+        Some(1),
+        "the execution refusal keeps its integrity reason"
+    );
 }
 
 #[tokio::test]
@@ -2123,6 +2682,7 @@ async fn execution_service_rejects_unusable_storage_directories() {
             HashSet::from(["k1".to_owned()]),
             4,
             Arc::new(ExecutionHistoryStore::open_in_memory().expect("execution history must open")),
+            Metrics::new(MetricsOptions::default()).expect("metrics must build"),
         )
     };
 

@@ -10,6 +10,10 @@
   "allowed_runtimes": ["rust"],
   "max_execution_deadline_secs": 300,
   "max_concurrent_executions": 4,
+  "otlp_endpoint": null,
+  "metrics_export_interval_secs": 15,
+  "metrics_export_timeout_secs": 5,
+  "deployment_environment": "development",
   "api_token": "replace-with-a-long-random-token",
   "trusted_keys": [
     {

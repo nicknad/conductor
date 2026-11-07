@@ -13,7 +13,7 @@
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 use thiserror::Error;
@@ -118,8 +118,20 @@ pub enum DatabaseError {
 
 impl From<rusqlite::Error> for DatabaseError {
     fn from(err: rusqlite::Error) -> Self {
+        if is_busy_or_locked(&err) {
+            crate::metrics::record_db_busy_error();
+        }
         Self::Query(err.to_string())
     }
+}
+
+/// True when SQLite refused because another writer held a lock. The global
+/// metrics handle (if a host installed one) records the classification.
+pub(crate) fn is_busy_or_locked(err: &rusqlite::Error) -> bool {
+    matches!(
+        err.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
 }
 
 /// One process-wide SQLite connection behind a mutex. Cloning is not
@@ -165,9 +177,40 @@ impl Database {
     }
 
     /// Recovers the connection from a poisoned lock: SQLite rolls back the
-    /// interrupted transaction itself, so the connection stays usable.
+    /// interrupted transaction itself, so the connection stays usable. Lock
+    /// wait is recorded through the process-global metrics handle when a host
+    /// installed one; absent a host, this is a no-op.
     fn lock(&self) -> MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+        let started = Instant::now();
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        crate::metrics::record_db_lock_wait(started.elapsed());
+        guard
+    }
+
+    /// Readiness probe: the database must be at the schema version this
+    /// binary produces and answer `SELECT 1`. Any error (including an
+    /// unmigrated in-memory database) is reported as not ready; callers must
+    /// not expose the error detail.
+    pub fn check_ready(&self) -> Result<(), DatabaseError> {
+        let conn = self.lock();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(DatabaseError::from)?;
+        if version != SCHEMA_VERSION {
+            return Err(DatabaseError::Query(
+                "database schema is not at the current version".to_owned(),
+            ));
+        }
+        let one: i64 = conn
+            .query_row("SELECT 1", [], |row| row.get(0))
+            .map_err(DatabaseError::from)?;
+        if one == 1 {
+            Ok(())
+        } else {
+            Err(DatabaseError::Query(
+                "readiness query returned an unexpected value".to_owned(),
+            ))
+        }
     }
 
     /// Applies pending migrations, each in its own transaction, recording
@@ -461,6 +504,36 @@ mod tests {
             })
             .expect("count must read");
         assert_eq!(count, 0, "an aborted write transaction must leave no rows");
+    }
+
+    #[test]
+    fn busy_and_locked_errors_are_classified() {
+        for code in [5, 6] {
+            let error = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+            assert!(
+                is_busy_or_locked(&error),
+                "SQLite code {code} must classify as busy/locked"
+            );
+        }
+        for code in [1, 11, 19] {
+            let error = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+            assert!(
+                !is_busy_or_locked(&error),
+                "SQLite code {code} must not classify as busy/locked"
+            );
+        }
+        assert!(!is_busy_or_locked(&rusqlite::Error::QueryReturnedNoRows));
+    }
+
+    #[test]
+    fn readiness_requires_a_migrated_database() {
+        let db = Database::open_in_memory().expect("in-memory database must open");
+        assert!(
+            db.check_ready().is_err(),
+            "an unmigrated database must not be ready"
+        );
+        db.migrate().expect("migrate");
+        db.check_ready().expect("a migrated database must be ready");
     }
 
     #[test]

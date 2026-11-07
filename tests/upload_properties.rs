@@ -23,11 +23,14 @@ use conductor::control_plane::execute_module::ExecutionService;
 use conductor::control_plane::validate_package::PackageValidationBuilder;
 use conductor::executions::executor::ExecutionLimits;
 use conductor::executions::history::ExecutionHistoryStore;
+use conductor::metrics::{Metrics, MetricsOptions};
 use conductor::modules::registry::ModuleRegistry;
 use conductor::packages::policy::PackageValidationPolicy;
 use conductor::packages::signature::{
     ConfiguredTrustedKeys, SignatureAlgorithm, TrustedSigningKey,
 };
+use conductor::readiness::Readiness;
+use conductor::storage::database::Database;
 use proptest::prelude::*;
 use tokio::sync::Semaphore;
 use tower::ServiceExt as _;
@@ -86,6 +89,7 @@ fn test_state(tag: &str) -> (AppState, PathBuf) {
         .build()
         .expect("test validator must build");
     let registry = Arc::new(ModuleRegistry::new());
+    let metrics = Metrics::new(MetricsOptions::default()).expect("metrics must build");
     let execution_service = Arc::new(
         ExecutionService::new(
             Arc::clone(&registry),
@@ -98,10 +102,14 @@ fn test_state(tag: &str) -> (AppState, PathBuf) {
             HashSet::from(["k1".to_owned()]),
             UPLOAD_SLOTS,
             Arc::new(ExecutionHistoryStore::open_in_memory().expect("execution history must open")),
+            Arc::clone(&metrics),
         )
         .expect("execution service must build"),
     );
 
+    let database = Arc::new(Database::open_in_memory().expect("database must open"));
+    database.migrate().expect("database must migrate");
+    let readiness = Arc::new(Readiness::new(database.check_ready().is_ok()));
     let state = AppState {
         validator: Arc::new(validator),
         quarantine_dir,
@@ -112,6 +120,9 @@ fn test_state(tag: &str) -> (AppState, PathBuf) {
         api_token: ApiToken::new(TOKEN),
         upload_slots: Arc::new(Semaphore::new(UPLOAD_SLOTS)),
         execution_service,
+        metrics,
+        database,
+        readiness,
     };
     (state, root)
 }
