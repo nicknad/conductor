@@ -1,8 +1,9 @@
 # Persistence and Rejection Events — Design
 
 > **Status:** in progress — **PR1 (structured rejection events)**,
-> **PR2 (SQLite registry persistence)**, and **PR3 (durable rejection
-> rows)** implemented. Later phases are not yet implemented. Implements audit items 7 and 8 from
+> **PR2 (SQLite registry persistence)**, **PR3 (durable rejection rows)**,
+> and **PR4 (classify-only startup reconciliation)** implemented. PR4 repair,
+> orphan detection, and `reconciliation_runs` are deferred. Implements audit items 7 and 8 from
 > [storage-reconciliation.md](storage-reconciliation.md). Decisions recorded
 > here: **SQLite via `rusqlite` (bundled)** for the registry and rejection
 > records; rejections go to **structured `tracing` events and `package_rejections`
@@ -131,7 +132,7 @@ queries — unacceptable for a registry authority).
 | --- | --- |
 | `src/storage/database.rs` | open, pragmas (WAL, `foreign_keys=ON`, `busy_timeout=5s`, `synchronous=NORMAL`), `PRAGMA user_version` migration runner, transaction helper |
 | `src/audit/event.rs`, `src/audit/recorder.rs` | taxonomy, tracing sink, DB sink |
-| `src/storage/reconcile.rs` | startup reconciliation and leftover sweeps |
+| `src/control_plane/reconcile.rs` | startup reconciliation classification; filesystem primitives live in `src/storage/artifact_verify.rs` |
 | `src/modules/registry.rs` | backend enum: in-memory (tests) or SQLite (production) |
 
 `ModuleRegistry::new()` stays as the in-memory constructor so every existing
@@ -206,8 +207,9 @@ Notes:
 - `manifest_json` stores the exact validated bytes, which requires threading
   the already-read manifest bytes into `ValidatedPackage` (they exist in
   `PackageValidator::validate` today).
-- `artifact_relpath` is stored rather than derived so reconciliation does not
-  depend on layout code.
+- `artifact_relpath` is stored for audit. Reconciliation derives the canonical
+  address from the row identity and requires exact equality; the stored string
+  is never used as a path.
 - `active_versions` is created now and wired when activation gets a caller.
 - The migration runner applies each migration in its own transaction and sets
   `user_version` inside it; a `user_version` newer than the binary is a startup
@@ -224,7 +226,7 @@ Notes:
    - absent → insert the full row → `Ok(already_registered = false)`.
 
 Additional read API: `list_versions(module_id)` (landed with PR2);
-`all_versions()` and `artifact_state()` land with reconciliation (PR4).
+`all_versions()` and `get_integrity_state()` are landed (PR4).
 
 ### 4.6 Upload ordering and crash windows
 
@@ -245,31 +247,58 @@ tx) → 201**.
 ### 5.1 Startup sequence
 
 1. Load config; ensure/validate the configured roots.
-2. Open the database; run migrations. **Failure aborts startup.**
-3. Reconcile (below).
-4. Build the registry from DB state.
-5. Build the validator and serve (validator construction still fails closed
-   until trust-key loading lands — separate work).
+2. Sweep `quarantine/` and `staging/` leftovers older than their TTLs, before
+   the database opens.
+3. Open the database; run migrations. **Failure aborts startup.**
+4. Build the registry from the migrated DB state.
+5. Reconcile every registered version's artifact (classify-only; a registry
+   read, artifact-root, or artifact I/O error aborts startup).
+6. Build readiness, the execution services, and the router, then serve.
 
 ### 5.2 Algorithm (idempotent, safe to repeat)
 
 1. Sweep `quarantine/` and `staging/` entries older than their TTLs. This
    wires the existing `sweep_older_than` and adds the staging twin, which also
    closes the crash leak for kept staging directories.
-2. For every `module_versions` row, stat the artifact: missing or size
-   mismatch sets `integrity_state` to `missing` / `mismatch`. Activation and
-   any future execution path refuse rows not in `ok`.
-3. Scan the artifact tree for files referenced by no row: report count and
-   sample (orphans). No deletion in this pass.
-4. Recommended: record one `reconciliation_runs` row per run
-   (`started_at`, `finished_at`, `missing_artifacts`, `orphan_artifacts`,
-   `swept_quarantine`, `swept_staging`) for the observability surface.
+2. For every `module_versions` row, classify its artifact without mutating it:
+   - Derive the canonical `{module_id}/{version}/{digest_hex}.zip` address and
+     require the stored `artifact_relpath` to equal it exactly. The stored
+     string is never used as a path.
+   - Canonicalize the parent directory and require it to remain under the
+     canonical artifact root.
+   - Reject a missing file, a final symlink, or a non-regular file.
+   - Refuse a registered size above `PackageValidationPolicy::archive.max_compressed_bytes`.
+     `Oversized` is a policy-bound refusal, not a corrupt-bytes finding, and is
+     persisted as `mismatch`.
+   - Open without following symlinks, require the size to equal the registered
+     size, and hash at most `expected_size + 1` bytes with SHA-256.
+   - Classify every row first, then persist `ok`, `missing`, or `mismatch` in
+     `integrity_state` for every row. Activation and any future execution path
+     refuse rows not in `ok`.
+3. Scan the artifact tree for files referenced by no row: deferred.
+4. Record one `reconciliation_runs` row per run: deferred.
+
+Residuals. Resolution and open are separate path operations. `O_NOFOLLOW`
+protects only the final component, so a same-UID writer can swap an intermediate
+directory between parent confinement and open; execution independently
+re-verifies before spawn, so reconciliation is detection, not authorization.
+Dirfd-based opening is future hardening. `O_NOFOLLOW`/`O_NONBLOCK` are
+Unix-only; non-Unix targets follow symlinks on open. Total startup work is
+proportional to every registered artifact, with no per-run byte or time budget
+yet.
 
 ### 5.3 Fail-closed rules
 
-- DB open/migrate errors and reconciliation read errors abort startup.
-- Per-row marking and sweep I/O errors log and continue; one bad file must not
-  prevent serving the rest.
+- DB open/migrate errors, registry read errors, artifact-root preflight
+  errors, and indeterminate per-row artifact I/O abort startup.
+- Classification is all-or-nothing with respect to reads: every row is
+  classified before any row is persisted, so a fatal read on a later row writes
+  nothing. A fatal write during persistence can still leave earlier rows
+  updated; the next pass converges them.
+- Determinate per-row classifications (`ok`, `missing`, `mismatch`) are
+  persisted; one such row never stops later rows.
+- Quarantine/staging sweep I/O errors still log and continue; one bad file must
+  not prevent serving the rest.
 
 ### 5.4 Deletion policy
 
@@ -287,9 +316,9 @@ wait for the retention/GC work.
 - **Rejections:** representative 400/401/413/422/409 paths assert row
   stage/code and that the external body is unchanged; accepted uploads write
   no rejection row; recorder failure does not alter the response.
-- **Reconciliation:** construct each crash residue directly (artifact without
-  row, row without artifact, stale quarantine/staging) and assert detection,
-  `integrity_state` marking, and activation refusal.
+- **Reconciliation:** missing and tampered artifacts are classified and
+  persisted, and activation refuses rows not in `ok`. Orphan detection is
+  deferred.
 - **Existing suites:** unchanged in-memory unit tests; the two integration
   builders move to temp-file databases.
 
@@ -310,9 +339,10 @@ wait for the retention/GC work.
    `RejectionRecorder::new()` stays tracing-only; `with_store` attaches
    the `package_rejections` insert (best-effort, never alters the
    response).
-4. **PR4 — reconciliation**: integrity states and `reconciliation_runs`
-   remain; the quarantine/staging startup sweeps and their config wiring are
-   implemented.
+4. **PR4 — reconciliation**: classify-only startup reconciliation is
+   implemented and wired into `Host::assemble`; the quarantine/staging startup
+   sweeps and their config wiring are implemented. `reconciliation_runs`,
+   orphan detection, and byte repair remain deferred.
 5. **PR5+** — activation persistence wiring, artifact GC and retention, backup,
    execution tables when the dispatcher lands.
 

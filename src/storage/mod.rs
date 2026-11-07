@@ -2,6 +2,7 @@
 //! extraction, and trusted artifacts live.
 
 pub mod artifact_store;
+pub mod artifact_verify;
 pub mod database;
 pub mod quarantine;
 pub mod staging;
