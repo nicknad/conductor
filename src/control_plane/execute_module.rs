@@ -1437,7 +1437,19 @@ mod tests {
                 Some(IntegrityKind::Staging),
             ),
             (
+                ExecutionError::Staging(StagingError::Archive(ArchiveError::MissingEntry(
+                    "x".to_owned(),
+                ))),
+                Some(IntegrityKind::Archive),
+            ),
+            (
                 ExecutionError::Target(TargetError::EntrypointMissing),
+                Some(IntegrityKind::Target),
+            ),
+            (
+                ExecutionError::Executor(ExecutorError::TargetVerification(
+                    TargetError::EntrypointMissing,
+                )),
                 Some(IntegrityKind::Target),
             ),
             (

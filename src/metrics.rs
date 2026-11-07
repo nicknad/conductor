@@ -784,6 +784,7 @@ mod tests {
     use opentelemetry::Key;
     use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+    use serial_test::serial;
 
     fn finished_metrics(
         metrics: &Metrics,
@@ -828,6 +829,42 @@ mod tests {
         metrics
             .shutdown()
             .expect("disabled shutdown must be a no-op");
+    }
+
+    #[test]
+    fn execution_outcome_names_round_trip_through_their_stable_labels() {
+        let names = [
+            ExecutionOutcomeName::Succeeded,
+            ExecutionOutcomeName::Failed,
+            ExecutionOutcomeName::TimedOut,
+            ExecutionOutcomeName::Cancelled,
+            ExecutionOutcomeName::WorkerError,
+            ExecutionOutcomeName::ProtocolViolation,
+        ];
+        for name in names {
+            assert_eq!(
+                ExecutionOutcomeName::from_name(name.as_str()),
+                Some(name),
+                "{} must parse back to itself",
+                name.as_str()
+            );
+        }
+        assert_eq!(ExecutionOutcomeName::from_name("unknown"), None);
+        assert_eq!(ExecutionOutcomeName::from_name(""), None);
+    }
+
+    #[test]
+    fn debug_reports_only_whether_export_is_enabled() {
+        let metrics = Metrics::new(MetricsOptions::default()).expect("disabled metrics must build");
+        let rendered = format!("{metrics:?}");
+        assert!(
+            rendered.contains("Metrics"),
+            "debug output must name the type: {rendered}"
+        );
+        assert!(
+            rendered.contains("enabled: false"),
+            "debug output must report the export state: {rendered}"
+        );
     }
 
     #[test]
@@ -896,6 +933,28 @@ mod tests {
     }
 
     #[test]
+    fn resource_uses_the_non_empty_host_environment_value() {
+        let expected = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let Some(expected) = expected else {
+            // CI and normal Unix sessions set one of these; with neither the
+            // fallback path is the only observable behavior.
+            return;
+        };
+        let resource = resource(&MetricsOptions::default());
+        assert_eq!(
+            resource
+                .get(&Key::new("host.name"))
+                .expect("host.name")
+                .as_str(),
+            expected,
+            "a non-empty host environment value must be exported verbatim"
+        );
+    }
+
+    #[test]
     fn db_helpers_record_busy_and_lock_wait() {
         let (metrics, exporter) = capture(MetricsOptions::default());
         metrics.record_db_busy_error();
@@ -925,6 +984,91 @@ mod tests {
         assert!(saw_histogram, "lock wait histogram must be exported");
     }
 
+    /// Exporter whose shutdown always fails, pinning error propagation from
+    /// `Metrics::shutdown` rather than only the happy path.
+    struct FailingShutdownExporter;
+
+    impl PushMetricExporter for FailingShutdownExporter {
+        async fn export(
+            &self,
+            _metrics: &ResourceMetrics,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            Ok(())
+        }
+
+        fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+            Ok(())
+        }
+
+        fn shutdown_with_timeout(
+            &self,
+            _timeout: Duration,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            Err(opentelemetry_sdk::error::OTelSdkError::InternalFailure(
+                "forced shutdown failure".to_owned(),
+            ))
+        }
+
+        fn temporality(&self) -> Temporality {
+            Temporality::Cumulative
+        }
+    }
+
+    #[test]
+    fn shutdown_surfaces_exporter_failure() {
+        let metrics = Metrics::with_exporter(MetricsOptions::default(), FailingShutdownExporter)
+            .expect("metrics must build");
+        metrics
+            .shutdown()
+            .expect_err("an exporter shutdown failure must be reported");
+    }
+
+    #[test]
+    #[serial]
+    fn global_handle_records_through_the_module_helpers() {
+        fn clear() {
+            *global_slot()
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+
+        clear();
+        let (metrics, exporter) = capture(MetricsOptions::default());
+        Metrics::install_global(Arc::clone(&metrics));
+        assert!(
+            global_metrics().is_some_and(|installed| Arc::ptr_eq(&installed, &metrics)),
+            "install_global must publish the exact handle global_metrics reads"
+        );
+        record_db_busy_error();
+        record_db_lock_wait(Duration::from_millis(2));
+        clear();
+        let data = finished_metrics(&metrics, &exporter);
+        assert!(
+            metric_value(&data, DB_BUSY_ERRORS).is_some_and(|value| value >= 1),
+            "the installed handle must receive the global busy-error sample"
+        );
+        let mut lock_wait_samples = 0;
+        for resource in &data {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics() {
+                    if metric.name() != DB_LOCK_WAIT_DURATION {
+                        continue;
+                    }
+                    if let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data()
+                    {
+                        for point in histogram.data_points() {
+                            lock_wait_samples += point.count();
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            lock_wait_samples >= 1,
+            "the installed handle must receive the global lock-wait sample"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn storage_free_bytes_is_observed_for_an_existing_root() {
@@ -948,8 +1092,8 @@ mod tests {
             }
         }
         assert!(
-            observed.is_some_and(|bytes| bytes > 0),
-            "storage free bytes must be observed: {observed:?}"
+            observed.is_some_and(|bytes| bytes > 1),
+            "storage free bytes must be the observed value, not a placeholder: {observed:?}"
         );
     }
 
