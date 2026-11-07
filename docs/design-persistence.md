@@ -1,8 +1,9 @@
 # Persistence and Rejection Events — Design
 
 > **Status:** in progress — **PR1 (structured rejection events)**,
-> **PR2 (SQLite registry persistence)**, and **PR3 (durable rejection
-> rows)** implemented. Later phases are not yet implemented. Implements audit items 7 and 8 from
+> **PR2 (SQLite registry persistence)**, **PR3 (durable rejection rows)**,
+> and **PR4 (classify-only startup reconciliation)** implemented. PR4 repair,
+> orphan detection, and `reconciliation_runs` are deferred. Implements audit items 7 and 8 from
 > [storage-reconciliation.md](storage-reconciliation.md). Decisions recorded
 > here: **SQLite via `rusqlite` (bundled)** for the registry and rejection
 > records; rejections go to **structured `tracing` events and `package_rejections`
@@ -225,7 +226,7 @@ Notes:
    - absent → insert the full row → `Ok(already_registered = false)`.
 
 Additional read API: `list_versions(module_id)` (landed with PR2);
-`all_versions()` and `artifact_state()` land with reconciliation (PR4).
+`all_versions()` and `get_integrity_state()` are landed (PR4).
 
 ### 4.6 Upload ordering and crash windows
 
@@ -246,11 +247,13 @@ tx) → 201**.
 ### 5.1 Startup sequence
 
 1. Load config; ensure/validate the configured roots.
-2. Open the database; run migrations. **Failure aborts startup.**
-3. Reconcile (below).
-4. Build the registry from DB state.
-5. Build the validator and serve (validator construction still fails closed
-   until trust-key loading lands — separate work).
+2. Sweep `quarantine/` and `staging/` leftovers older than their TTLs, before
+   the database opens.
+3. Open the database; run migrations. **Failure aborts startup.**
+4. Build the registry from the migrated DB state.
+5. Reconcile every registered version's artifact (classify-only; a registry
+   read, artifact-root, or artifact I/O error aborts startup).
+6. Build readiness, the execution services, and the router, then serve.
 
 ### 5.2 Algorithm (idempotent, safe to repeat)
 
@@ -336,9 +339,10 @@ wait for the retention/GC work.
    `RejectionRecorder::new()` stays tracing-only; `with_store` attaches
    the `package_rejections` insert (best-effort, never alters the
    response).
-4. **PR4 — reconciliation**: integrity states and `reconciliation_runs`
-   remain; the quarantine/staging startup sweeps and their config wiring are
-   implemented.
+4. **PR4 — reconciliation**: classify-only startup reconciliation is
+   implemented and wired into `Host::assemble`; the quarantine/staging startup
+   sweeps and their config wiring are implemented. `reconciliation_runs`,
+   orphan detection, and byte repair remain deferred.
 5. **PR5+** — activation persistence wiring, artifact GC and retention, backup,
    execution tables when the dispatcher lands.
 

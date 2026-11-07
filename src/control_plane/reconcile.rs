@@ -65,9 +65,9 @@ impl RegistryAccess for ModuleRegistry {
 
 /// Classifies every registered version's artifact and persists the result.
 ///
-/// There is no production caller yet; a later slice runs this during host
-/// assembly. The run is idempotent: the same rows and bytes produce the same
-/// states on every pass.
+/// `Host::assemble` runs this during startup, before readiness and execution
+/// services are built. The run is idempotent: the same rows and bytes produce
+/// the same states on every pass.
 pub fn reconcile_registry(
     registry: &ModuleRegistry,
     artifact_root: &Path,
