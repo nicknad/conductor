@@ -673,11 +673,11 @@ fn create_instruments(meter: &Meter, options: &MetricsOptions) -> Instruments {
 }
 
 fn resource(options: &MetricsOptions) -> Resource {
-    let host_name = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "unknown".to_owned());
+    let host_name = host_name(
+        std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .ok(),
+    );
     let started = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -698,6 +698,14 @@ fn resource(options: &MetricsOptions) -> Resource {
             KeyValue::new("host.name", host_name),
         ])
         .build()
+}
+
+/// Selects the exported host name, falling back when the environment value
+/// is absent or whitespace-only.
+fn host_name(value: Option<String>) -> String {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn buckets_for(name: &str) -> Option<&'static [f64]> {
@@ -933,25 +941,18 @@ mod tests {
     }
 
     #[test]
-    fn resource_uses_the_non_empty_host_environment_value() {
-        let expected = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .ok()
-            .filter(|value| !value.trim().is_empty());
-        let Some(expected) = expected else {
-            // CI and normal Unix sessions set one of these; with neither the
-            // fallback path is the only observable behavior.
-            return;
-        };
-        let resource = resource(&MetricsOptions::default());
+    fn resource_host_name_falls_back_for_missing_or_blank_values() {
         assert_eq!(
-            resource
-                .get(&Key::new("host.name"))
-                .expect("host.name")
-                .as_str(),
-            expected,
+            host_name(Some("runner-1".to_owned())),
+            "runner-1",
             "a non-empty host environment value must be exported verbatim"
         );
+        assert_eq!(
+            host_name(Some("   ".to_owned())),
+            "unknown",
+            "a whitespace-only host name must not become the exported value"
+        );
+        assert_eq!(host_name(None), "unknown");
     }
 
     #[test]
