@@ -304,20 +304,21 @@ fn test_is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// The root probe must match the OS effective uid.
+#[cfg(all(test, unix))]
+#[test]
+#[allow(unsafe_code)]
+fn test_is_root_matches_effective_uid() {
+    // SAFETY: `geteuid` takes no arguments and only reads the process's
+    // effective uid; it cannot fail or touch memory.
+    let effective_root = unsafe { libc::geteuid() == 0 };
+    assert_eq!(test_is_root(), effective_root);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::artifact_store::canonical_artifact_relpath;
-
-    #[cfg(unix)]
-    #[test]
-    #[allow(unsafe_code)]
-    fn test_is_root_matches_effective_uid() {
-        // SAFETY: `geteuid` takes no arguments and only reads the process's
-        // effective uid; it cannot fail or touch memory.
-        let effective_root = unsafe { libc::geteuid() == 0 };
-        assert_eq!(test_is_root(), effective_root);
-    }
 
     struct TempDir(PathBuf);
 
