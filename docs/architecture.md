@@ -1,8 +1,9 @@
 # Architecture
 
 > Current as of the Rust rewrite. The scheduler supports manual, interval, and
-> UTC five-field cron triggers; an in-process plugin runtime and a CLI are not
-> built yet — see [Not built yet](#not-built-yet).
+> UTC five-field cron triggers with bounded retries; an in-process plugin
+> runtime and a CLI are not built yet — see
+> [Not built yet](#not-built-yet).
 
 Conductor is a single-machine job execution platform: operators upload signed
 service packages, the host validates and stores them as immutable artifacts,
@@ -207,12 +208,12 @@ is not atomic with `exec`, so a same-uid writer inside the 0700 staging
 directory can still race the final path resolution. HTTP exposure must not
 weaken these invariants.
 
-### Scheduler slice 3 (`control_plane::scheduler`)
+### Scheduler slice 4 (`control_plane::scheduler`)
 
 Durable job definitions live in `jobs`; `job_runs.state` is the durable queue.
-Scheduler slice 3 supports manual triggers, interval triggers, and UTC
-five-field cron triggers. A job pins `(module_id, version, function)` and a
-bounded JSON payload. `interval_secs` is bounded to `1..=31_536_000` (one year).
+Scheduler slice 4 supports manual triggers, interval triggers, UTC five-field
+cron triggers, and bounded retries. A job pins
+`(module_id, version, function)` and a bounded JSON payload. `interval_secs` is bounded to `1..=31_536_000` (one year).
 Cron uses a closed grammar: minute `0-59`, hour `0-23`, day-of-month `1-31`,
 month `1-12`, day-of-week `0-7` (0 and 7 are Sunday), with `*`, numbers, ranges
 `a-b`, lists `a,b`, `*/n`, and `a-b/n`. Names, macros, seconds/6-field or
@@ -244,6 +245,26 @@ registry, artifact, staging, or worker-spawn surface. The scheduler cannot
 repoint `active_versions` and cannot bypass the execution checks described
 above.
 
+After a run reaches a terminal state, a retry is a new queued row rather than
+an in-place mutation. Only a `failed` completion with worker outcome `failed`,
+`timed_out`, or `worker_error` is retryable; refusals, cancellations,
+`protocol_violation`, interrupted runs, and every scheduler failure code stay
+terminal. When `attempt_no < max_attempts`, the scheduler inserts one row with
+`attempt_no+1`, the same `trigger_kind`, `scheduled_for = now + backoff` using
+the terminal-write time as `now`, and `created_at = now`. The policy is global
+in `SchedulerConfig`: `max_attempts=3`, `retry_base_backoff=5s`,
+`retry_max_backoff=5m`, with deterministic `base * 2^(attempt-1)` and no
+jitter. Claims require `scheduled_for <= now`, so the backoff wait is real.
+`jobs.next_run_at` is never changed by a retry. A full queue, a disabled job, or
+a duplicate tick skips the insert without failing the scheduler; disabling a
+job terminalizes its queued retries, but a retry that was already claimed can
+still run to completion (the pre-existing kill-switch race). The terminal write
+and the retry insert are separate transactions, so a crash between them leaves
+that failure terminal without a retry; startup does not reconstruct retries.
+The partial tick index is the dedupe backstop for interval/cron retries, so two
+overlapping attempts of the same job that finish in the same millisecond can
+collapse into one retry. Retry ownership stays single-process.
+
 Terminal run states are `succeeded`, `failed`, `refused`, and `interrupted`,
 with a closed failure-code vocabulary. Disabling a job clears `next_run_at` and
 terminalizes its queued runs; enabling a job recomputes
@@ -251,11 +272,12 @@ terminalizes its queued runs; enabling a job recomputes
 UTC occurrence after `now` for a cron job. A manual trigger on an interval or
 cron job stays allowed and does not move `next_run_at`. Startup marks
 previously running rows `interrupted` and refuses queued rows for disabled
-jobs; slice 3 is at-most-once and does not replay a worker. The loop owns
-scheduler readiness and emits job wait/queue/active metrics; due enqueue moves
-the queue gauge and logs bounded counts. A loop panic or tick failure flips
+jobs; slice 4 is at-most-once and does not replay a worker, while queued
+retries survive restart and dispatch when due. The loop owns scheduler
+readiness and emits job wait/queue/active metrics; due and retry enqueue move
+the queue gauge and log bounded counts. A loop panic or tick failure flips
 readiness false; in-flight run rows remain `running` until restart recovery
-marks them `interrupted`. Cron timezone/DST selection, retries, cancellation,
+marks them `interrupted`. Cron timezone/DST selection, cancellation,
 multi-process ownership, and retention are later slices.
 
 ### Execution history (`executions::history`)
@@ -354,13 +376,14 @@ cannot false-503 under probe flood. Readiness is not a write/disk-full proof.
 
 ## Not built yet
 
-Interval and UTC five-field cron triggering are implemented in slice 3.
-Retries, cancellation, distributed scheduling, CLI, artifact GC, and
-execution-history retention/GC remain. Scheduler slice 3 provides durable
-manual, interval, and cron jobs, due enqueue for both scheduled kinds, a
-single-process dispatcher, readiness, and job metrics. Cron is UTC only; there
-is no timezone/DST selection, seconds/7-field syntax, macros, names, or
-`?`/`L`/`W`/`#` extensions. Startup reconciliation is classify-only: it sets
+Manual, interval, and UTC five-field cron triggering plus bounded retries are
+implemented in slice 4. Cancellation, distributed scheduling, CLI, artifact GC,
+and execution-history retention/GC remain. Scheduler slice 4 provides durable
+manual, interval, and cron jobs, retries with deterministic backoff, due
+enqueue for both scheduled kinds, a single-process dispatcher, readiness, and
+job metrics. The retry policy is global, not per job, and has no API or CLI
+surface. Cron is UTC only; there is no timezone/DST selection, seconds/7-field
+syntax, macros, names, or `?`/`L`/`W`/`#` extensions. Startup reconciliation is classify-only: it sets
 `ok`/`missing`/`mismatch` but does not repair artifacts or detect orphans,
 and it does not yet record `reconciliation_runs`.
 `control_plane/lifecycle.rs` is currently a placeholder for

@@ -1,11 +1,12 @@
 //! Scheduler service lifecycle, dispatch, metrics, and failure paths.
 //!
-//! These tests use the real in-memory job store and a real `ExecutionService`
-//! with an empty registry, so dispatch exercises the pinned execution path
-//! without spawning a worker. The success path is covered by
-//! `tests/scheduler_api.rs`.
+//! These tests use the real in-memory job store and a real `ExecutionService`.
+//! Most dispatch against an empty registry to exercise the pinned refusal path
+//! without spawning a worker; the retry tests install a worker that reports a
+//! transient failure. The success path is covered by `tests/scheduler_api.rs`.
 
 use std::collections::HashSet;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -14,14 +15,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use conductor::control_plane::activate_module::ActivationPolicy;
 use conductor::control_plane::execute_module::ExecutionService;
 use conductor::control_plane::scheduler::{
-    JobFailureCode, JobRunState, NewJob, SchedulerError, SchedulerService, Trigger, TriggerKind,
+    JobFailureCode, JobRun, JobRunState, NewJob, SchedulerConfig, SchedulerError, SchedulerService,
+    Trigger, TriggerKind,
 };
 use conductor::executions::executor::ExecutionLimits;
 use conductor::executions::history::ExecutionHistoryStore;
 use conductor::metrics::{Metrics, MetricsOptions};
-use conductor::modules::registry::ModuleRegistry;
+use conductor::modules::registry::{IntegrityState, ModuleRecord, ModuleRegistry};
+use conductor::packages::artifact::ArtifactDigest;
+use conductor::packages::digest::Sha256DigestProvider;
 use conductor::packages::policy::PackageValidationPolicy;
 use conductor::readiness::Readiness;
+use conductor::storage::artifact_store::canonical_artifact_relpath;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 
@@ -130,6 +135,24 @@ fn build_scheduler_with_capacity(
     tag: &str,
     max_concurrent_runs: usize,
 ) -> (Arc<SchedulerService>, Scratch) {
+    let (scheduler, scratch, _, _) = build_scheduler_with_config(
+        metrics,
+        readiness,
+        tag,
+        SchedulerConfig {
+            max_concurrent_runs,
+            ..SchedulerConfig::default()
+        },
+    );
+    (scheduler, scratch)
+}
+
+fn build_scheduler_with_config(
+    metrics: Arc<Metrics>,
+    readiness: Arc<Readiness>,
+    tag: &str,
+    config: SchedulerConfig,
+) -> (Arc<SchedulerService>, Scratch, Arc<ModuleRegistry>, PathBuf) {
     let scratch = Scratch::new(tag);
     let artifact_dir = scratch.path().join("artifacts");
     let staging_dir = scratch.path().join("staging");
@@ -140,8 +163,8 @@ fn build_scheduler_with_capacity(
     let registry = Arc::new(ModuleRegistry::new());
     let execution_service = Arc::new(
         ExecutionService::new(
-            registry,
-            artifact_dir,
+            Arc::clone(&registry),
+            artifact_dir.clone(),
             staging_dir,
             ActivationPolicy::new(vec!["rust".to_owned()]).expect("activation policy"),
             ExecutionLimits::default(),
@@ -155,15 +178,123 @@ fn build_scheduler_with_capacity(
         .expect("execution service"),
     );
     let scheduler = Arc::new(
-        SchedulerService::in_memory_for_test(
+        SchedulerService::in_memory_for_test_with_config(
             execution_service,
             metrics,
             readiness,
-            max_concurrent_runs,
+            config,
         )
         .expect("scheduler"),
     );
+    (scheduler, scratch, registry, artifact_dir)
+}
+
+const RETRY_MODULE_ID: &str = "retry-worker";
+const RETRY_VERSION: &str = "1.0.0";
+const RETRY_BACKOFF: Duration = Duration::from_secs(30);
+const TRANSIENT_FAILURE_SCRIPT: &str = "#!/bin/sh\nread -r line\nprintf '{\"protocol_version\":1,\"status\":\"failed\",\"message\":\"transient\"}\\n'\n";
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256DigestProvider
+        .digest(bytes)
+        .expect("hash")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn package(module_id: &str, version: &str, script: &str) -> (Vec<u8>, String) {
+    let manifest = serde_json::json!({
+        "manifest_version": 2,
+        "module_id": module_id,
+        "version": version,
+        "runtime": "rust",
+        "entrypoint": "payload/worker",
+        "files": [{
+            "path": "payload/worker",
+            "size": script.len() as u64,
+            "sha256": sha256_hex(script.as_bytes()),
+        }],
+    });
+    let manifest_json = serde_json::to_string(&manifest).expect("manifest");
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    let mut writer = zip::ZipWriter::new(&mut cursor);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer
+        .start_file("manifest.json", options)
+        .expect("manifest entry");
+    writer
+        .write_all(manifest_json.as_bytes())
+        .expect("manifest bytes");
+    writer
+        .start_file("payload/worker", options)
+        .expect("worker entry");
+    writer.write_all(script.as_bytes()).expect("worker bytes");
+    writer.finish().expect("zip");
+    (cursor.into_inner(), manifest_json)
+}
+
+fn install_package(
+    registry: &ModuleRegistry,
+    artifact_dir: &Path,
+    module_id: &str,
+    version: &str,
+    script: &str,
+) {
+    let (bytes, manifest_json) = package(module_id, version, script);
+    let digest_bytes = Sha256DigestProvider.digest(&bytes).expect("digest");
+    let digest = ArtifactDigest::new(digest_bytes);
+    let relpath = canonical_artifact_relpath(module_id, version, &digest);
+    let artifact_path = artifact_dir.join(&relpath);
+    std::fs::create_dir_all(artifact_path.parent().expect("artifact parent"))
+        .expect("artifact parent mkdir");
+    std::fs::write(&artifact_path, &bytes).expect("artifact write");
+    registry
+        .record(ModuleRecord {
+            module_id: module_id.to_owned(),
+            version: version.to_owned(),
+            digest,
+            signer_key_id: "k1".to_owned(),
+            runtime: "rust".to_owned(),
+            manifest_version: 2,
+            manifest_json,
+            artifact_relpath: relpath,
+            artifact_size: bytes.len() as u64,
+            integrity_state: IntegrityState::Ok,
+            registered_at: SystemTime::now(),
+        })
+        .expect("registry record");
+}
+
+fn build_retry_scheduler(
+    metrics: Arc<Metrics>,
+    readiness: Arc<Readiness>,
+    tag: &str,
+    max_attempts: u32,
+) -> (Arc<SchedulerService>, Scratch) {
+    let config = SchedulerConfig {
+        max_attempts,
+        retry_base_backoff: RETRY_BACKOFF,
+        retry_max_backoff: RETRY_BACKOFF,
+        ..SchedulerConfig::default()
+    };
+    let (scheduler, scratch, registry, artifact_dir) =
+        build_scheduler_with_config(metrics, readiness, tag, config);
+    install_package(
+        &registry,
+        &artifact_dir,
+        RETRY_MODULE_ID,
+        RETRY_VERSION,
+        TRANSIENT_FAILURE_SCRIPT,
+    );
     (scheduler, scratch)
+}
+
+fn run_with_attempt(runs: &[JobRun], attempt_no: u32) -> &JobRun {
+    runs.iter()
+        .find(|run| run.attempt_no == attempt_no)
+        .expect("attempt row")
 }
 
 fn manual_job(job_id: &str, module_id: &str) -> NewJob {
@@ -319,6 +450,7 @@ async fn tick_dispatches_and_records_a_refusal_for_an_unregistered_module() {
         .list_runs("job-refused", 10, 0)
         .await
         .expect("runs");
+    assert_eq!(runs.len(), 1, "a refusal must not enqueue a retry");
     assert_eq!(runs[0].state, JobRunState::Refused);
     assert_eq!(runs[0].failure_code, Some(JobFailureCode::ModuleNotFound));
 
@@ -750,4 +882,206 @@ async fn manual_trigger_on_an_enabled_cron_job_keeps_the_cron_boundary() {
         Some(scheduled),
         "a manual run must not move the cron boundary"
     );
+}
+
+#[tokio::test]
+async fn a_retryable_worker_failure_schedules_one_bounded_retry() {
+    let (metrics, exporter) = capture(MetricsOptions::default());
+    let readiness = Arc::new(Readiness::new(true));
+    let (scheduler, _scratch) = build_retry_scheduler(
+        Arc::clone(&metrics),
+        Arc::clone(&readiness),
+        "retry-backoff",
+        2,
+    );
+    scheduler
+        .create_job(manual_job("job-retry", RETRY_MODULE_ID))
+        .await
+        .expect("create job");
+    scheduler
+        .enqueue_manual("job-retry")
+        .await
+        .expect("enqueue");
+    exporter.reset();
+
+    assert_eq!(
+        scheduler
+            .tick_once(SystemTime::now() + Duration::from_secs(1))
+            .await
+            .expect("first tick"),
+        1
+    );
+
+    let runs = scheduler.list_runs("job-retry", 10, 0).await.expect("runs");
+    assert_eq!(
+        runs.len(),
+        2,
+        "the failed first attempt must enqueue attempt 2"
+    );
+    let first = run_with_attempt(&runs, 1);
+    let retry = run_with_attempt(&runs, 2);
+    assert_eq!(first.state, JobRunState::Failed);
+    assert_eq!(first.outcome.as_deref(), Some("failed"));
+    assert_eq!(retry.state, JobRunState::Queued);
+    assert_eq!(retry.trigger, TriggerKind::Manual);
+    let retry_at = retry.scheduled_for;
+    assert_eq!(
+        retry_at
+            .duration_since(retry.created_at)
+            .expect("retry scheduled after creation"),
+        RETRY_BACKOFF,
+        "scheduled_for must be created_at plus the configured backoff"
+    );
+
+    let depth = exported(&metrics, &exporter);
+    assert_eq!(
+        i64_sum(&depth, conductor::metrics::JOB_QUEUE_DEPTH),
+        1,
+        "the retry enqueue must move the queue gauge once"
+    );
+    exporter.reset();
+
+    assert_eq!(
+        scheduler
+            .tick_once(retry_at - Duration::from_millis(1))
+            .await
+            .expect("early tick"),
+        0,
+        "a future retry must not be claimed early"
+    );
+    let runs = scheduler.list_runs("job-retry", 10, 0).await.expect("runs");
+    assert_eq!(runs.len(), 2);
+    assert_eq!(run_with_attempt(&runs, 2).state, JobRunState::Queued);
+    let depth = exported(&metrics, &exporter);
+    assert_eq!(i64_sum(&depth, conductor::metrics::JOB_QUEUE_DEPTH), 1);
+    exporter.reset();
+
+    assert_eq!(
+        scheduler.tick_once(retry_at).await.expect("retry tick"),
+        1,
+        "the retry is due at scheduled_for"
+    );
+    let runs = scheduler.list_runs("job-retry", 10, 0).await.expect("runs");
+    assert_eq!(runs.len(), 2, "max_attempts=2 must not create attempt 3");
+    assert_eq!(run_with_attempt(&runs, 2).state, JobRunState::Failed);
+    assert_eq!(
+        run_with_attempt(&runs, 2).outcome.as_deref(),
+        Some("failed")
+    );
+
+    let data = exported(&metrics, &exporter);
+    assert_eq!(i64_sum(&data, conductor::metrics::JOB_QUEUE_DEPTH), 0);
+    assert_eq!(i64_sum(&data, conductor::metrics::JOB_ACTIVE), 0);
+    assert!(readiness.is_ready());
+}
+
+#[tokio::test]
+async fn max_attempts_one_stops_after_the_first_failure() {
+    let (metrics, exporter) = capture(MetricsOptions::default());
+    let readiness = Arc::new(Readiness::new(true));
+    let (scheduler, _scratch) = build_retry_scheduler(
+        Arc::clone(&metrics),
+        Arc::clone(&readiness),
+        "retry-max-one",
+        1,
+    );
+    scheduler
+        .create_job(manual_job("job-retry", RETRY_MODULE_ID))
+        .await
+        .expect("create job");
+    scheduler
+        .enqueue_manual("job-retry")
+        .await
+        .expect("enqueue");
+    exporter.reset();
+
+    assert_eq!(
+        scheduler
+            .tick_once(SystemTime::now() + Duration::from_secs(1))
+            .await
+            .expect("tick"),
+        1
+    );
+
+    let runs = scheduler.list_runs("job-retry", 10, 0).await.expect("runs");
+    assert_eq!(runs.len(), 1, "max_attempts=1 must not enqueue attempt 2");
+    assert_eq!(runs[0].state, JobRunState::Failed);
+    assert_eq!(runs[0].attempt_no, 1);
+    let data = exported(&metrics, &exporter);
+    assert_eq!(i64_sum(&data, conductor::metrics::JOB_QUEUE_DEPTH), 0);
+
+    assert_eq!(
+        scheduler
+            .tick_once(SystemTime::now() + Duration::from_secs(35))
+            .await
+            .expect("later tick"),
+        0
+    );
+    assert_eq!(
+        scheduler
+            .list_runs("job-retry", 10, 0)
+            .await
+            .expect("runs")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn disabling_a_job_cancels_a_queued_retry() {
+    let (metrics, exporter) = capture(MetricsOptions::default());
+    let readiness = Arc::new(Readiness::new(true));
+    let (scheduler, _scratch) = build_retry_scheduler(
+        Arc::clone(&metrics),
+        Arc::clone(&readiness),
+        "retry-disable",
+        2,
+    );
+    scheduler
+        .create_job(manual_job("job-retry", RETRY_MODULE_ID))
+        .await
+        .expect("create job");
+    scheduler
+        .enqueue_manual("job-retry")
+        .await
+        .expect("enqueue");
+    exporter.reset();
+
+    assert_eq!(
+        scheduler
+            .tick_once(SystemTime::now() + Duration::from_secs(1))
+            .await
+            .expect("tick"),
+        1
+    );
+    let runs = scheduler.list_runs("job-retry", 10, 0).await.expect("runs");
+    let retry_at = run_with_attempt(&runs, 2).scheduled_for;
+
+    let result = scheduler
+        .set_enabled("job-retry", false, None)
+        .await
+        .expect("disable")
+        .expect("exists");
+    assert_eq!(result.cancelled_queued, 1);
+    assert!(readiness.is_ready(), "disable must not flip readiness");
+
+    assert_eq!(
+        scheduler
+            .tick_once(retry_at)
+            .await
+            .expect("tick after disable"),
+        0,
+        "a disabled job must not dispatch its queued retry"
+    );
+    let runs = scheduler.list_runs("job-retry", 10, 0).await.expect("runs");
+    assert_eq!(runs.len(), 2);
+    let retry = run_with_attempt(&runs, 2);
+    assert_eq!(retry.state, JobRunState::Refused);
+    assert_eq!(retry.failure_code, Some(JobFailureCode::JobDisabled));
+    assert!(
+        readiness.is_ready(),
+        "the kill-switch must not flip readiness"
+    );
+    let data = exported(&metrics, &exporter);
+    assert_eq!(i64_sum(&data, conductor::metrics::JOB_QUEUE_DEPTH), 0);
 }

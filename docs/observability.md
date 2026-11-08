@@ -96,11 +96,21 @@ Bounded integrity kinds include `path`, `missing`, `unreadable`, `size`,
 `integrity`, `runtime`, `signer`, `legacy_manifest`, `manifest`, `archive`,
 `staging`, `target`, `executor`, `deadline`, and `internal`.
 
-Scheduler slice 3 emits `conductor.job.wait.duration` at claim time. A due
-interval or cron tick enqueues queue rows, so `conductor.job.queue.depth` moves
-on enqueue as well as claim; `conductor.job.active` is unchanged. Raising the
-`conductor` log level to debug adds bounded `enqueued`, `deduped`,
-`skipped_full`, and `skipped_invalid` counts from the due pass.
+Scheduler slice 4 emits `conductor.job.wait.duration` at claim time as the
+claim time minus the run's `scheduled_for`. A due interval or cron tick and a
+retry enqueue both add queue rows, so `conductor.job.queue.depth` moves on
+enqueue as well as claim; one retry insert moves the gauge exactly once and a
+skipped retry does not move it. For a retry, `scheduled_for` is the backoff due
+time, so the configured backoff is visible as `scheduled_for - created_at`, not
+inside the wait histogram; the histogram measures only lateness past that due
+time. `conductor.job.active` records claimed runs.
+Raising the `conductor` log level to debug adds bounded `enqueued`, `deduped`,
+`skipped_full`, and `skipped_invalid` counts from the due pass, plus a
+`retry_skipped` count when a retry is dropped by the queue bound, a disabled
+job, or a duplicate tick. Each successful retry enqueue logs one info event with
+`job_id`, the failed `run_id`, and `retry_attempt`. There is no retry-specific
+metric; the `attempt` field on run rows and `GET /v1/jobs/{job_id}/runs` is the
+per-attempt observable.
 
 After your backend normalizes OTLP names, useful queries are conceptually:
 
@@ -287,7 +297,7 @@ Do **not** use `/readyz` as proof that reconciliation found healthy artifacts.
 | Counters are process-lifetime | Use `rate`/`increase`; restarts reset them |
 | Bounded metric labels | Module/version/execution diagnosis is via logs/SQL, not metrics |
 | No retention/GC for rejections, history, or job runs | All three grow without bound; queue/job counts are capped but terminal `job_runs` are not |
-| No cron or due-enqueue scheduler metrics | Slice 3 emits job wait/queue/active signals and a due-enqueue debug log with enqueued, deduped, skipped-full, and skipped-invalid counts, but no counter for cron lag or skipped rows |
+| No cron, retry, or due-enqueue scheduler metrics | Slice 4 emits job wait/queue/active signals and debug counts for due enqueue (enqueued, deduped, skipped-full, skipped-invalid) and retry skips, but no counter for cron lag, retries, or skipped rows |
 | `Readiness::new` defaults the scheduler flag true for fixtures | A direct `Host::into_state()` embedder that never starts the scheduler can report `/readyz` 200; triggers still return `scheduler_unavailable` |
 | Metrics are ephemeral | No durable metrics store; SQLite is the durable authority |
 

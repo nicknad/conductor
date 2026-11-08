@@ -20,8 +20,8 @@ use crate::readiness::Readiness;
 
 use super::dispatch::ExecutionDispatcher;
 use super::job::{
-    classify_execution_error, ClaimedRun, JobDefinition, JobRun, NewJob, RunCompletion,
-    DEFAULT_JOB_DEADLINE_SECS,
+    classify_execution_error, is_retryable_completion, retry_delay, ClaimedRun, JobDefinition,
+    JobRun, NewJob, RunCompletion, DEFAULT_JOB_DEADLINE_SECS,
 };
 use super::store::{DueEnqueueReport, EnableResult, JobStore, JobStoreError, JobStoreLimits};
 
@@ -31,6 +31,9 @@ pub struct SchedulerConfig {
     pub tick_interval: Duration,
     pub lease_ttl: Duration,
     pub max_concurrent_runs: usize,
+    pub max_attempts: u32,
+    pub retry_base_backoff: Duration,
+    pub retry_max_backoff: Duration,
 }
 
 impl Default for SchedulerConfig {
@@ -39,6 +42,9 @@ impl Default for SchedulerConfig {
             tick_interval: Duration::from_secs(1),
             lease_ttl: Duration::from_secs(30),
             max_concurrent_runs: 4,
+            max_attempts: 3,
+            retry_base_backoff: Duration::from_secs(5),
+            retry_max_backoff: Duration::from_secs(300),
         }
     }
 }
@@ -134,16 +140,31 @@ impl SchedulerService {
         readiness: Arc<Readiness>,
         max_concurrent_runs: usize,
     ) -> Result<Self, SchedulerError> {
-        let store = JobStore::open_in_memory(JobStoreLimits::default())?;
-        Ok(Self::new(
-            Arc::new(store),
-            Arc::new(ExecutionDispatcher::new(execution_service)),
+        Self::in_memory_for_test_with_config(
+            execution_service,
             metrics,
             readiness,
             SchedulerConfig {
                 max_concurrent_runs,
                 ..SchedulerConfig::default()
             },
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn in_memory_for_test_with_config(
+        execution_service: Arc<ExecutionService>,
+        metrics: Arc<Metrics>,
+        readiness: Arc<Readiness>,
+        config: SchedulerConfig,
+    ) -> Result<Self, SchedulerError> {
+        let store = JobStore::open_in_memory(JobStoreLimits::default())?;
+        Ok(Self::new(
+            Arc::new(store),
+            Arc::new(ExecutionDispatcher::new(execution_service)),
+            metrics,
+            readiness,
+            config,
         ))
     }
 
@@ -474,8 +495,10 @@ impl SchedulerService {
         let state = completion.state.as_str();
         let outcome = completion.outcome.clone();
         let failure_code = completion.failure_code;
+        let finish_completion = completion.clone();
         let persisted =
-            tokio::task::spawn_blocking(move || store.finish_run(&run_id, &completion, now)).await;
+            tokio::task::spawn_blocking(move || store.finish_run(&run_id, &finish_completion, now))
+                .await;
         match persisted {
             Ok(Ok(true)) => {
                 tracing::info!(
@@ -486,6 +509,7 @@ impl SchedulerService {
                     failure_code = failure_code.map(|code| code.as_str()).unwrap_or(""),
                     "job run finished"
                 );
+                self.maybe_enqueue_retry(&claimed, &completion, now).await;
             }
             Ok(Ok(false)) => {
                 tracing::warn!(
@@ -501,6 +525,65 @@ impl SchedulerService {
             }
         }
         drop(guard);
+    }
+
+    /// Enqueues the next attempt after a retryable worker failure. The
+    /// terminal write already happened; a full queue, a disabled job, an
+    /// exhausted attempt budget, or a duplicate tick is a skip, not a failure.
+    async fn maybe_enqueue_retry(
+        &self,
+        claimed: &ClaimedRun,
+        completion: &RunCompletion,
+        now: SystemTime,
+    ) {
+        if !is_retryable_completion(completion)
+            || claimed.run.attempt_no >= self.config.max_attempts
+        {
+            return;
+        }
+        let retry_at = retry_delay(
+            claimed.run.attempt_no,
+            self.config.retry_base_backoff,
+            self.config.retry_max_backoff,
+        )
+        .and_then(|delay| now.checked_add(delay));
+        let Some(retry_at) = retry_at else {
+            tracing::debug!(
+                job_id = %claimed.job.job_id,
+                retry_skipped = 1,
+                "scheduler skipped a retry"
+            );
+            return;
+        };
+        let next_attempt_no = claimed.run.attempt_no + 1;
+        let store = Arc::clone(&self.store);
+        let job_id = claimed.job.job_id.clone();
+        let trigger = claimed.run.trigger;
+        let enqueued = tokio::task::spawn_blocking(move || {
+            store.enqueue_retry(&job_id, trigger, next_attempt_no, retry_at, now)
+        })
+        .await;
+        match enqueued {
+            Ok(Ok(Some(run))) => {
+                self.metrics.job_enqueued();
+                tracing::info!(
+                    job_id = %claimed.job.job_id,
+                    run_id = %claimed.run.run_id,
+                    retry_attempt = run.attempt_no,
+                    "job retry enqueued"
+                );
+            }
+            Ok(Ok(None)) => {
+                tracing::debug!(
+                    job_id = %claimed.job.job_id,
+                    run_id = %claimed.run.run_id,
+                    retry_skipped = 1,
+                    "scheduler skipped a retry"
+                );
+            }
+            Ok(Err(error)) => self.fail(SchedulerError::Store(error)),
+            Err(error) => self.fail(task_error(error)),
+        }
     }
 
     async fn fill_slots(

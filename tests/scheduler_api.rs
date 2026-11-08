@@ -265,6 +265,7 @@ async fn manual_trigger_runs_through_execution_history() {
     assert_eq!(status, StatusCode::ACCEPTED, "trigger response: {body}");
     let run = wait_for_terminal(&state, &job_id).await;
     assert_eq!(run["state"], "succeeded");
+    assert_eq!(run["attempt"], 1);
     let execution_id = run["execution_id"].as_str().expect("execution id");
 
     let (status, execution) = send_json(

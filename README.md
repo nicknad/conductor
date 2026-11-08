@@ -6,10 +6,10 @@
 > **Development is not finished:** this is an in-progress implementation, not a
 > complete job scheduler. Package ingestion, host startup wiring, the
 > worker execution library, the activation/execution HTTP endpoints,
-> durable execution history, and Scheduler slice 3 (durable manual, interval,
-> and UTC five-field cron jobs) exist, but retries, lifecycle transitions,
-> and the operator CLI are still outstanding. Do not treat it as a finished or
-> production-ready product.
+> durable execution history, and Scheduler slice 4 (durable manual, interval,
+> and UTC five-field cron jobs with bounded retries) exist, but lifecycle
+> transitions and the operator CLI are still outstanding. Do not treat it as a
+> finished or production-ready product.
 
 A single-machine job execution platform supporting installing, validating, activating,
 updating, disabling, removing, and rolling back job plugin implementations **without
@@ -151,7 +151,8 @@ no retention or garbage collection yet, so history grows without bound.
 
 ### Jobs API (unstable)
 
-Scheduler slice 3 adds durable manual, interval, and UTC five-field cron jobs.
+Scheduler slice 4 adds durable manual, interval, and UTC five-field cron jobs
+with bounded retries.
 Every route is bearer-authenticated. The job definition pins `module_id`,
 `version`, and `function`; dispatch always goes through the same pinned
 execution service as `POST /v1/modules/{module_id}/executions`, so activation,
@@ -200,18 +201,38 @@ is left unchanged so a later tick retries it. An unparseable persisted cron
 expression is skipped and counted rather than failing the pass, and a read of
 that job fails closed until the row is repaired. A syntactically valid but
 impossible expression is likewise skipped and counted, but the row still reads
-back; the job does not run until the expression is repaired.
+back; the job does not run until the expression is repaired. Claims honor
+`scheduled_for <= now`, so a future-dated retry cannot be claimed early.
+
+Retries are a global policy on `SchedulerConfig`: `max_attempts=3`,
+`retry_base_backoff=5s`, and `retry_max_backoff=5m`, so the delay is the
+deterministic exponential `base * 2^(attempt-1)` with no jitter. Only a
+`failed` run whose worker outcome is `failed`, `timed_out`, or `worker_error` is
+retried; refusals, cancellations, `protocol_violation`, interrupted runs, and
+every scheduler failure code stay terminal. Under the attempt bound, one new
+`queued` run is inserted with `attempt_no+1`, the same `trigger_kind`,
+`scheduled_for=now+backoff`, and `created_at=now`; `jobs.next_run_at` does not
+move. A full queue drops the retry without an error and without a later
+automatic retry, and disabling a job terminalizes its queued retries (a retry
+already claimed can still finish). Two overlapping interval/cron attempts of
+one job that finish in the same millisecond can collapse into one retry because
+the partial tick index is the dedupe backstop. The policy is not per job and
+has no API or CLI surface. Retries re-execute the worker, so jobs with
+non-idempotent side effects can duplicate them because there are no idempotency
+keys; every attempt is a new `job_runs` row, so retries grow the table until a
+later retention slice.
 
 A trigger while the scheduler loop is not running returns `503
 scheduler_unavailable`; a disabled job returns `409 job_disabled`; a full job
 or queue bound returns `503 server_busy`. Startup recovery marks previously
-running rows `interrupted` and refuses queued rows for disabled jobs. Slice 3
-is single-process and at-most-once: a crash after claim does not replay the
-worker. A loop panic or tick failure flips `/readyz` to `503`; in-flight run
-rows remain `running` until restart recovery marks them `interrupted`. There is
-no job/run retention yet, so terminal rows and job payloads grow until a later
-retention slice. Retries, cancellation, distributed scheduling, timezone/DST
-selection, and retention are later slices.
+running rows `interrupted` and refuses queued rows for disabled jobs. The
+scheduler is single-process and at-most-once: a crash after claim does not
+replay the worker, and queued retries survive a restart and dispatch when due.
+A loop panic or tick failure flips `/readyz` to `503`; in-flight run rows remain
+`running` until restart recovery marks them `interrupted`. There is no job/run
+retention yet, so terminal rows and job payloads grow until a later retention
+slice. Cancellation, distributed scheduling, timezone/DST selection, and
+retention are later slices.
 
 ## Host configuration
 

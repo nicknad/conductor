@@ -485,6 +485,37 @@ impl RunCompletion {
     }
 }
 
+/// A completion is retryable only when the worker reported a transient
+/// failure. Refusals, scheduler failure codes, cancellations, protocol
+/// violations, interruptions, and successes are terminal.
+#[must_use]
+pub fn is_retryable_completion(completion: &RunCompletion) -> bool {
+    completion.state == JobRunState::Failed
+        && completion.failure_code.is_none()
+        && matches!(
+            completion.outcome.as_deref(),
+            Some("failed" | "timed_out" | "worker_error")
+        )
+}
+
+/// Backoff before the next attempt, `base * 2^(attempt_no - 1)` capped at
+/// `maximum`. `attempt_no` is the attempt that just failed; zero has no
+/// predecessor and returns `None`. Arithmetic saturates instead of wrapping.
+#[must_use]
+pub fn retry_delay(attempt_no: u32, base: Duration, maximum: Duration) -> Option<Duration> {
+    if attempt_no == 0 {
+        return None;
+    }
+    let factor = 1u128.checked_shl(attempt_no - 1).unwrap_or(u128::MAX);
+    let nanos = base
+        .as_nanos()
+        .saturating_mul(factor)
+        .min(maximum.as_nanos());
+    let secs = u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX);
+    let subsec = u32::try_from(nanos % 1_000_000_000).unwrap_or(0);
+    Some(Duration::new(secs, subsec))
+}
+
 /// Validation failures for a job definition or run row.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum JobValidationError {
@@ -830,6 +861,95 @@ mod tests {
                 "interval_secs {interval_secs} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn retryable_completions_are_worker_transient_failures_only() {
+        for outcome in ["failed", "timed_out", "worker_error"] {
+            assert!(
+                is_retryable_completion(&RunCompletion::worker_failure(
+                    "exec-1".to_owned(),
+                    outcome,
+                )),
+                "{outcome} must be retryable"
+            );
+        }
+        assert!(!is_retryable_completion(&RunCompletion::succeeded(
+            "exec-1".to_owned()
+        )));
+        assert!(!is_retryable_completion(&RunCompletion::refused(
+            JobFailureCode::ModuleNotFound
+        )));
+        for code in [
+            JobFailureCode::DeadlineExceeded,
+            JobFailureCode::ServerBusy,
+            JobFailureCode::Internal,
+            JobFailureCode::HistoryWriteFailed,
+        ] {
+            assert!(
+                !is_retryable_completion(&RunCompletion::failed(code)),
+                "{code:?} must not be retryable"
+            );
+        }
+        for outcome in ["cancelled", "protocol_violation"] {
+            assert!(
+                !is_retryable_completion(&RunCompletion::worker_failure(
+                    "exec-1".to_owned(),
+                    outcome,
+                )),
+                "{outcome} must not be retryable"
+            );
+        }
+        assert!(!is_retryable_completion(&RunCompletion {
+            state: JobRunState::Interrupted,
+            execution_id: None,
+            outcome: None,
+            failure_code: Some(JobFailureCode::Interrupted),
+        }));
+    }
+
+    #[test]
+    fn retry_delay_follows_the_exponential_curve_and_cap() {
+        let base = Duration::from_secs(5);
+        let maximum = Duration::from_secs(300);
+        assert_eq!(retry_delay(1, base, maximum), Some(Duration::from_secs(5)));
+        assert_eq!(retry_delay(2, base, maximum), Some(Duration::from_secs(10)));
+        assert_eq!(retry_delay(3, base, maximum), Some(Duration::from_secs(20)));
+        assert_eq!(
+            retry_delay(7, base, maximum),
+            Some(maximum),
+            "320 s exceeds the 5-minute cap"
+        );
+        assert_eq!(
+            retry_delay(3, base, Duration::from_secs(12)),
+            Some(Duration::from_secs(12)),
+            "the cap wins when it is below the exponential value"
+        );
+    }
+
+    #[test]
+    fn retry_delay_handles_zero_attempt_zero_base_and_overflow() {
+        let maximum = Duration::from_secs(300);
+        assert_eq!(retry_delay(0, Duration::from_secs(5), maximum), None);
+        assert_eq!(
+            retry_delay(1, Duration::ZERO, maximum),
+            Some(Duration::ZERO),
+            "a zero base yields a zero delay"
+        );
+        assert_eq!(
+            retry_delay(3, Duration::ZERO, maximum),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            retry_delay(u32::MAX, Duration::from_secs(5), maximum),
+            Some(maximum),
+            "a huge attempt saturates at the cap"
+        );
+        assert_eq!(
+            retry_delay(2, Duration::MAX, maximum),
+            Some(maximum),
+            "a multiplying base must saturate, not wrap"
+        );
     }
 
     #[test]

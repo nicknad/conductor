@@ -450,7 +450,7 @@ Deferred: repair after restore or replacement (`Missing --> Ok`,
 `Mismatch --> Ok`), orphan scanning, artifact GC, and one
 `reconciliation_runs` row per pass.
 
-## 11. Scheduler / triggering (**manual, interval, and UTC cron implemented; retry planned**)
+## 11. Scheduler / triggering (**manual, interval, UTC cron, and bounded retries implemented; cancellation planned**)
 
 Source: `src/control_plane/scheduler/`, `src/readiness.rs`,
 `src/metrics.rs` (`conductor.job.wait.duration`, queue/active gauges).
@@ -469,27 +469,36 @@ stateDiagram-v2
     Running --> Succeeded: outcome succeeded
     Running --> Failed: outcome failed / timed_out / worker_error / protocol_violation
     Running --> Cancelled: outcome cancelled
-    Failed --> RetryScheduled: retry policy allows another attempt
-    RetryScheduled --> Waiting: backoff elapsed
+    Failed --> RetryScheduled: worker failed/timed_out/worker_error and attempt < max_attempts
+    RetryScheduled --> Waiting: retry_at (now + exponential backoff)
+    RetryScheduled --> Refused: job disabled
     Succeeded --> Idle
-    Failed --> Idle: attempts exhausted
+    Failed --> Idle: attempts exhausted, queue full, or disabled
     Cancelled --> Idle
     Refused --> Idle
 
     note right of Queued
-        Slice 3 implements the durable queued/running/
-        succeeded/failed/refused/interrupted path for
-        manual, interval, and UTC five-field cron jobs.
-        A due interval or cron tick enqueues one run per
-        boundary, advances next_run_at past now, and
-        leaves a full queue's due time for a later tick.
-        A restart enqueues at most one missed run. An
-        unparseable cron row is skipped and counted, and
-        reads of it fail closed; a valid but impossible
-        expression is skipped and counted but still reads
-        back, so the job does not run until repaired. Cron
-        stays UTC only; timezone/DST, retries, cancellation,
-        and idempotency keys are later.
+        Slice 4 implements the durable queued/running/
+        terminal path for manual, interval, and UTC
+        five-field cron jobs, plus bounded retries. Only
+        a failed run with worker outcome failed, timed_out,
+        or worker_error is retried; refusals, cancellations,
+        protocol violations, interrupted runs, and scheduler
+        failure codes stay terminal. A retry is a new queued
+        row with attempt_no+1 and scheduled_for=now+backoff;
+        claims honor scheduled_for<=now, so the backoff wait
+        is real. Attempts stop at max_attempts (default 3)
+        with deterministic base*2^(attempt-1), 5s base and
+        5m cap, no jitter. A full queue drops the retry, and
+        disable terminalizes a queued retry. A due interval or
+        cron tick enqueues one run per boundary, advances
+        next_run_at past now, and leaves a full queue's due
+        time for a later tick. A restart enqueues at most one
+        missed run; queued retries survive and dispatch when
+        due. Unparseable cron rows are skipped and counted and
+        fail closed on read; impossible ones are skipped but
+        still read back. Cron stays UTC only; timezone/DST,
+        cancellation, and idempotency keys are later.
     end note
     note right of Ready
         The scheduler owns the scheduler_ready flag:
@@ -533,7 +542,7 @@ guarantee beyond the dependencies noted.
 
 | Priority | Work item | Current evidence | Blocks |
 | --- | --- | --- | --- |
-| 1 | **Scheduler / triggering**: durable job definitions, cron/interval triggers, queueing, dispatch, retry/attempt semantics, cancellation, scheduler readiness hook, job-wait histogram | Slice 3 implements durable manual, interval, and UTC five-field cron jobs, due enqueue for both scheduled kinds, queue/dispatch, recovery, readiness, and job wait/queue/active metrics. Retries, cancellation, timezone/DST cron, and multi-process ownership remain | Produces the jobs the platform exists to run |
+| 1 | **Scheduler / triggering**: durable job definitions, cron/interval triggers, queueing, dispatch, retry/attempt semantics, cancellation, scheduler readiness hook, job-wait histogram | Slice 4 implements durable manual, interval, and UTC five-field cron jobs, bounded retries with deterministic backoff, due enqueue for both scheduled kinds, queue/dispatch, recovery, readiness, and job wait/queue/active metrics. Cancellation, timezone/DST cron, and multi-process ownership remain | Produces the jobs the platform exists to run |
 | 2 | **Operator CLI**: upload, validate, activate, execute, history, lifecycle, reconcile commands | `tests/cli.rs` only drives startup failures; no CLI module | Operator usability; today everything is raw HTTP |
 | 3 | **Module lifecycle transitions**: deactivate, remove, rollback, drain running work, reference counting | `src/control_plane/lifecycle.rs` is a placeholder; `clear_active` / `remove_version` are registry primitives with no caller | Artifact GC and safe upgrades |
 | 4 | **Startup reconciliation**: scan registry vs artifact store, populate `Missing`/`Mismatch`, repair or quarantine, record `reconciliation_runs` | Classifier and startup wiring implemented in `Host::assemble`; repair, orphan detection, and `reconciliation_runs` deferred; design says PR4 | Trustworthy restart state |

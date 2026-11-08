@@ -314,6 +314,75 @@ impl JobStore {
         })
     }
 
+    /// Enqueues the next attempt of a failed run. Returns `Ok(None)` when the
+    /// job is missing/disabled, the shared queue bound is full, or the tick
+    /// index already holds this attempt. Never moves `jobs.next_run_at`.
+    pub(crate) fn enqueue_retry(
+        &self,
+        job_id: &str,
+        trigger: TriggerKind,
+        next_attempt_no: u32,
+        scheduled_for: SystemTime,
+        now: SystemTime,
+    ) -> Result<Option<JobRun>, JobStoreError> {
+        self.database.with_write_tx(|tx| {
+            let Some(job) = get_job_tx(tx, job_id)? else {
+                return Ok(None);
+            };
+            if !job.enabled {
+                return Ok(None);
+            }
+            if next_attempt_no < 2 {
+                return Err(JobStoreError::InvalidRun(
+                    "retry attempt number must be at least 2".to_owned(),
+                ));
+            }
+            let queued: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM job_runs WHERE state = 'queued'",
+                [],
+                |row| row.get(0),
+            )?;
+            if usize::try_from(queued).unwrap_or(usize::MAX) >= self.limits.max_queued_runs {
+                return Ok(None);
+            }
+            let run_id = next_run_id();
+            let scheduled_for_ms = to_millis(scheduled_for);
+            let created_at_ms = to_millis(now);
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO job_runs (
+                    run_id, job_id, attempt_no, trigger_kind, scheduled_for, state, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)",
+                params![
+                    run_id,
+                    job_id,
+                    i64::from(next_attempt_no),
+                    trigger.as_str(),
+                    scheduled_for_ms,
+                    created_at_ms,
+                ],
+            )?;
+            if inserted == 0 {
+                return Ok(None);
+            }
+            Ok(Some(JobRun {
+                run_id,
+                job_id: job_id.to_owned(),
+                attempt_no: next_attempt_no,
+                trigger,
+                scheduled_for,
+                state: JobRunState::Queued,
+                claimed_by: None,
+                lease_expires_at: None,
+                execution_id: None,
+                outcome: None,
+                failure_code: None,
+                created_at: now,
+                started_at: None,
+                finished_at: None,
+            }))
+        })
+    }
+
     /// Enqueues one queued run for each enabled interval/cron job whose
     /// `next_run_at` is due, then advances every attempted job to the first
     /// boundary after `now`. A full queue leaves `next_run_at` untouched so a
@@ -454,15 +523,16 @@ impl JobStore {
         lease_ttl: Duration,
     ) -> Result<Option<ClaimedRun>, JobStoreError> {
         let lease_expires_at = now.checked_add(lease_ttl).unwrap_or(now);
+        let now_ms = to_millis(now);
         self.database.with_write_tx(|tx| {
             let candidate: Option<JobRun> = tx
                 .query_row(
                     &format!(
-                        "{SELECT_RUN} WHERE state = 'queued' AND job_id IN \
-                         (SELECT job_id FROM jobs WHERE enabled = 1) \
+                        "{SELECT_RUN} WHERE state = 'queued' AND scheduled_for <= ?1 \
+                         AND job_id IN (SELECT job_id FROM jobs WHERE enabled = 1) \
                          ORDER BY scheduled_for, id LIMIT 1"
                     ),
-                    [],
+                    params![now_ms],
                     row_to_run,
                 )
                 .optional()?;
@@ -1662,5 +1732,183 @@ mod tests {
         );
         let cron = store.get_job("job-cron").expect("get").expect("exists");
         assert_eq!(cron.next_run_at, Some(at(CRON_START_MS + 30_000)));
+    }
+
+    #[test]
+    fn retry_enqueue_inserts_one_queued_attempt_and_keeps_next_run_at() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        let cases = [
+            (
+                "job-manual",
+                TriggerKind::Manual,
+                new_job("job-manual", true),
+            ),
+            (
+                "job-interval",
+                TriggerKind::Interval,
+                interval_job("job-interval", 60, at(60_000)),
+            ),
+            (
+                "job-cron",
+                TriggerKind::Cron,
+                cron_job("job-cron", "* * * * *", at(CRON_START_MS)),
+            ),
+        ];
+        for (job_id, trigger, job) in cases {
+            store.create_job(job).expect("create");
+            let before = store.get_job(job_id).expect("get").expect("exists");
+            let retry_at = at(90_000);
+            let now = at(85_000);
+            let run = store
+                .enqueue_retry(job_id, trigger, 2, retry_at, now)
+                .expect("enqueue retry")
+                .expect("inserted");
+
+            assert_eq!(run.job_id, job_id);
+            assert_eq!(run.attempt_no, 2);
+            assert_eq!(run.trigger, trigger);
+            assert_eq!(run.scheduled_for, retry_at);
+            assert_eq!(run.created_at, now);
+            assert_eq!(run.state, JobRunState::Queued);
+            assert!(run.claimed_by.is_none());
+            assert!(run.execution_id.is_none());
+            assert!(run.started_at.is_none());
+            assert_eq!(store.list_runs(job_id, 10, 0).expect("runs"), vec![run]);
+
+            let after = store.get_job(job_id).expect("get").expect("exists");
+            assert_eq!(after.next_run_at, before.next_run_at);
+            assert_eq!(after.updated_at, before.updated_at);
+        }
+    }
+
+    #[test]
+    fn retry_is_not_enqueued_for_a_missing_or_disabled_job() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        assert!(store
+            .enqueue_retry("missing", TriggerKind::Manual, 2, at(10_000), at(5_000))
+            .expect("missing job")
+            .is_none());
+
+        store.create_job(new_job("job-1", true)).expect("create");
+        store
+            .set_enabled("job-1", false, None, at(2_000))
+            .expect("disable")
+            .expect("exists");
+        assert!(store
+            .enqueue_retry("job-1", TriggerKind::Manual, 2, at(10_000), at(5_000))
+            .expect("disabled job")
+            .is_none());
+        assert!(store.list_runs("job-1", 10, 0).expect("runs").is_empty());
+    }
+
+    #[test]
+    fn retry_is_dropped_when_the_queue_is_full() {
+        let store = JobStore::open_in_memory(JobStoreLimits {
+            max_jobs: 4,
+            max_queued_runs: 1,
+        })
+        .expect("store");
+        store
+            .create_job(interval_job("job-int", 60, at(60_000)))
+            .expect("create");
+        store
+            .enqueue_manual_run("job-int", at(50_000))
+            .expect("fill queue");
+
+        assert!(store
+            .enqueue_retry("job-int", TriggerKind::Interval, 2, at(90_000), at(85_000))
+            .expect("a full queue is a skip, not an error")
+            .is_none());
+        assert_eq!(store.list_runs("job-int", 10, 0).expect("runs").len(), 1);
+    }
+
+    #[test]
+    fn an_identical_retry_tick_is_ignored() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        let cases = [
+            (
+                "job-interval",
+                TriggerKind::Interval,
+                interval_job("job-interval", 60, at(60_000)),
+            ),
+            (
+                "job-cron",
+                TriggerKind::Cron,
+                cron_job("job-cron", "* * * * *", at(CRON_START_MS)),
+            ),
+        ];
+        for (job_id, trigger, job) in cases {
+            store.create_job(job).expect("create");
+            assert!(store
+                .enqueue_retry(job_id, trigger, 2, at(90_000), at(85_000))
+                .expect("first retry")
+                .is_some());
+            assert!(store
+                .enqueue_retry(job_id, trigger, 2, at(90_000), at(85_000))
+                .expect("duplicate retry")
+                .is_none());
+            assert_eq!(store.list_runs(job_id, 10, 0).expect("runs").len(), 1);
+        }
+    }
+
+    #[test]
+    fn retry_rejects_attempt_numbers_below_two() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        store.create_job(new_job("job-1", true)).expect("create");
+        for attempt_no in [0, 1] {
+            assert!(
+                matches!(
+                    store.enqueue_retry(
+                        "job-1",
+                        TriggerKind::Manual,
+                        attempt_no,
+                        at(10_000),
+                        at(5_000)
+                    ),
+                    Err(JobStoreError::InvalidRun(_))
+                ),
+                "attempt {attempt_no} is not a retry"
+            );
+        }
+        assert!(store.list_runs("job-1", 10, 0).expect("runs").is_empty());
+    }
+
+    #[test]
+    fn claim_honors_a_future_retry_scheduled_for() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        store
+            .create_job(interval_job("job-int", 60, at(60_000)))
+            .expect("create");
+        let retry = store
+            .enqueue_retry("job-int", TriggerKind::Interval, 2, at(10_000), at(5_000))
+            .expect("retry")
+            .expect("inserted");
+
+        assert!(store
+            .claim_next_run("owner-1", at(9_999), Duration::from_secs(30))
+            .expect("early claim")
+            .is_none());
+        let claimed = store
+            .claim_next_run("owner-1", at(10_000), Duration::from_secs(30))
+            .expect("claim")
+            .expect("due retry");
+        assert_eq!(claimed.run.run_id, retry.run_id);
+        assert_eq!(claimed.run.attempt_no, 2);
+        store
+            .finish_run(
+                &claimed.run.run_id,
+                &RunCompletion::succeeded("exec-1".to_owned()),
+                at(10_100),
+            )
+            .expect("finish");
+
+        store
+            .enqueue_manual_run("job-int", at(10_000))
+            .expect("manual run");
+        let manual = store
+            .claim_next_run("owner-1", at(10_001), Duration::from_secs(30))
+            .expect("claim manual")
+            .expect("manual due");
+        assert_eq!(manual.run.trigger, TriggerKind::Manual);
     }
 }
