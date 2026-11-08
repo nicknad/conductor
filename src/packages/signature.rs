@@ -327,13 +327,10 @@ mod tests {
     fn canonical_payload_is_pinned_and_unambiguous() {
         let digest = [9u8; 32];
         let payload = canonical_payload(&digest);
-        assert!(payload.starts_with(SIGNATURE_DOMAIN));
-        assert!(payload.ends_with(&digest));
-        // NUL separators: no field boundary is ambiguous.
-        assert_eq!(payload.iter().filter(|b| **b == 0).count(), 3);
-        // Different digests diverge; same digest is deterministic.
+        let mut expected = b"conductor/package-signature/v1\0zip/v1\0sha256\0".to_vec();
+        expected.extend_from_slice(&digest);
+        assert_eq!(payload, expected);
         assert_ne!(payload, canonical_payload(&[8u8; 32]));
-        assert_eq!(payload, canonical_payload(&digest));
     }
 
     #[test]

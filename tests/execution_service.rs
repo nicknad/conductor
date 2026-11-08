@@ -624,6 +624,14 @@ printf 'diagnostic: reopened worker\n' >&2
 printf '{"protocol_version":1,"status":"ok","result":{"rows":3}}\n'
 "#;
 
+/// Flips one byte in the middle of the fixture's promoted artifact.
+fn tamper_artifact(fixture: &Fixture) {
+    let mut bytes = std::fs::read(&fixture.artifact_path).expect("artifact must be readable");
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xFF;
+    std::fs::write(&fixture.artifact_path, &bytes).expect("tampered bytes must be writable");
+}
+
 /// Runs an execution that is expected to be refused and returns the typed
 /// error. Keeps each refusal test focused on the error it pins.
 async fn refused_execution(service: &ExecutionService, module_id: &str) -> ExecutionError {
@@ -832,10 +840,7 @@ async fn pre_spawn_refusals_do_not_create_history_rows() {
         "a pre-spawn refusal must not create a history row"
     );
 
-    let mut bytes = std::fs::read(&fixture.artifact_path).expect("artifact must be readable");
-    let middle = bytes.len() / 2;
-    bytes[middle] ^= 0xFF;
-    std::fs::write(&fixture.artifact_path, &bytes).expect("tampered bytes must be writable");
+    tamper_artifact(&fixture);
     let err = refused_execution(&service, MODULE_ID).await;
     assert!(matches!(err, ExecutionError::ArtifactDigestMismatch { .. }));
     assert!(
@@ -996,16 +1001,7 @@ async fn execution_overload_emits_the_overload_counter() {
         "the first execution must start before capacity is probed"
     );
 
-    let err = service
-        .execute(
-            MODULE_ID,
-            None,
-            "run",
-            serde_json::json!({}),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
+    let err = refused_execution(&service, MODULE_ID).await;
     assert!(matches!(err, ExecutionError::Overloaded { maximum: 1 }));
 
     let data = exported(&metrics, &exporter);
@@ -1097,22 +1093,10 @@ async fn tampered_artifact_emits_integrity_and_refusal_metrics() {
         Arc::clone(&metrics),
     );
 
-    let mut bytes = std::fs::read(&fixture.artifact_path).expect("artifact must be readable");
-    let middle = bytes.len() / 2;
-    bytes[middle] ^= 0xFF;
-    std::fs::write(&fixture.artifact_path, &bytes).expect("tampered bytes must be writable");
+    tamper_artifact(&fixture);
 
     exporter.reset();
-    let err = service
-        .execute(
-            MODULE_ID,
-            None,
-            "run",
-            serde_json::json!({}),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
+    let err = refused_execution(&service, MODULE_ID).await;
     assert!(matches!(err, ExecutionError::ArtifactDigestMismatch { .. }));
 
     let data = exported(&metrics, &exporter);
@@ -1322,17 +1306,18 @@ async fn activation_capacity_is_bounded_and_released() {
         let first_activation = Arc::clone(&first_activation);
         move || {
             if first_activation.swap(false, Ordering::SeqCst) {
-                if let Some(started_tx) = started_tx
+                let started_tx = started_tx
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take()
-                {
+                    .expect("hook mutex must not be poisoned")
+                    .take();
+                if let Some(started_tx) = started_tx {
                     let _ = started_tx.send(());
                 }
-                let _ = release_rx
+                release_rx
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .recv();
+                    .expect("hook mutex must not be poisoned")
+                    .recv()
+                    .expect("release signal must arrive");
             }
         }
     });
@@ -1384,21 +1369,9 @@ async fn tampered_artifact_bytes_are_refused_before_spawn() {
     );
 
     // Same length, different bytes: only the digest can catch this.
-    let mut bytes = std::fs::read(&fixture.artifact_path).expect("artifact must be readable");
-    let middle = bytes.len() / 2;
-    bytes[middle] ^= 0xFF;
-    std::fs::write(&fixture.artifact_path, &bytes).expect("tampered bytes must be writable");
+    tamper_artifact(&fixture);
 
-    let err = service
-        .execute(
-            MODULE_ID,
-            None,
-            "run",
-            serde_json::json!({}),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
+    let err = refused_execution(&service, MODULE_ID).await;
     assert!(matches!(err, ExecutionError::ArtifactDigestMismatch { .. }));
     assert!(
         !marker.exists(),
@@ -1426,16 +1399,7 @@ async fn truncated_artifact_is_refused_by_the_size_check() {
     std::fs::write(&fixture.artifact_path, &bytes[..bytes.len() - 1])
         .expect("truncated bytes must be writable");
 
-    let err = service
-        .execute(
-            MODULE_ID,
-            None,
-            "run",
-            serde_json::json!({}),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
+    let err = refused_execution(&service, MODULE_ID).await;
     assert!(matches!(err, ExecutionError::ArtifactSizeMismatch { .. }));
 }
 
@@ -1449,16 +1413,7 @@ async fn missing_artifact_is_refused() {
     );
     std::fs::remove_file(&fixture.artifact_path).expect("artifact must be removable");
 
-    let err = service
-        .execute(
-            MODULE_ID,
-            None,
-            "run",
-            serde_json::json!({}),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
+    let err = refused_execution(&service, MODULE_ID).await;
     assert!(matches!(err, ExecutionError::ArtifactMissing { .. }));
 }
 
@@ -1473,16 +1428,7 @@ async fn artifact_path_escape_is_refused() {
         Duration::from_secs(30),
     );
 
-    let err = service
-        .execute(
-            MODULE_ID,
-            None,
-            "run",
-            serde_json::json!({}),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
+    let err = refused_execution(&service, MODULE_ID).await;
     assert!(matches!(err, ExecutionError::ArtifactPathEscape { .. }));
 }
 
@@ -1500,16 +1446,7 @@ async fn manifest_identity_mismatch_is_refused() {
         Duration::from_secs(30),
     );
 
-    let err = service
-        .execute(
-            MODULE_ID,
-            None,
-            "run",
-            serde_json::json!({}),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
+    let err = refused_execution(&service, MODULE_ID).await;
     assert!(matches!(
         err,
         ExecutionError::ManifestIdentityMismatch {
@@ -1529,16 +1466,7 @@ async fn execution_without_an_active_version_is_refused() {
         .expect("record must register, but not activate");
     let service = fixture.service(Arc::new(registry), Duration::from_secs(30));
 
-    let err = service
-        .execute(
-            MODULE_ID,
-            None,
-            "run",
-            serde_json::json!({}),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
+    let err = refused_execution(&service, MODULE_ID).await;
     assert!(matches!(
         err,
         ExecutionError::Activation(ActivationError::NoActiveVersion { .. })
@@ -1606,16 +1534,7 @@ async fn execution_refuses_runtime_and_integrity_policy_violations() {
         Arc::clone(&fixture.active_registry(wrong_runtime)),
         Duration::from_secs(30),
     );
-    let err = service
-        .execute(
-            MODULE_ID,
-            None,
-            "run",
-            serde_json::json!({}),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
+    let err = refused_execution(&service, MODULE_ID).await;
     assert!(matches!(
         err,
         ExecutionError::Activation(ActivationError::RuntimeNotAllowed { .. })
@@ -1656,16 +1575,7 @@ async fn absolute_artifact_path_is_refused() {
         Duration::from_secs(30),
     );
 
-    let err = service
-        .execute(
-            MODULE_ID,
-            None,
-            "run",
-            serde_json::json!({}),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
+    let err = refused_execution(&service, MODULE_ID).await;
     assert!(matches!(err, ExecutionError::ArtifactPathEscape { .. }));
 }
 
@@ -1687,16 +1597,7 @@ async fn artifact_path_prefix_confusion_with_a_sibling_directory_is_refused() {
         Duration::from_secs(30),
     );
 
-    let err = service
-        .execute(
-            MODULE_ID,
-            None,
-            "run",
-            serde_json::json!({}),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
+    let err = refused_execution(&service, MODULE_ID).await;
     assert!(matches!(err, ExecutionError::ArtifactPathEscape { .. }));
 }
 
@@ -1711,16 +1612,7 @@ async fn non_canonical_artifact_path_is_refused() {
         Duration::from_secs(30),
     );
 
-    let err = service
-        .execute(
-            MODULE_ID,
-            None,
-            "run",
-            serde_json::json!({}),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
+    let err = refused_execution(&service, MODULE_ID).await;
     match err {
         ExecutionError::ArtifactPathNotCanonical { relpath, expected } => {
             assert_eq!(relpath, format!("elsewhere/{}", fixture.relpath));
@@ -1745,16 +1637,7 @@ async fn artifact_symlink_escaping_the_root_is_refused() {
         Duration::from_secs(30),
     );
 
-    let err = service
-        .execute(
-            MODULE_ID,
-            None,
-            "run",
-            serde_json::json!({}),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
+    let err = refused_execution(&service, MODULE_ID).await;
     assert!(matches!(err, ExecutionError::ArtifactPathEscape { .. }));
 }
 
@@ -1780,16 +1663,7 @@ async fn stored_manifest_entrypoint_swap_is_refused() {
         Duration::from_secs(30),
     );
 
-    let err = service
-        .execute(
-            MODULE_ID,
-            None,
-            "run",
-            serde_json::json!({}),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
+    let err = refused_execution(&service, MODULE_ID).await;
     assert!(matches!(
         err,
         ExecutionError::ArchiveManifestMismatch {
@@ -1820,16 +1694,7 @@ async fn stored_manifest_file_integrity_swap_is_refused() {
         Duration::from_secs(30),
     );
 
-    let err = service
-        .execute(
-            MODULE_ID,
-            None,
-            "run",
-            serde_json::json!({}),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
+    let err = refused_execution(&service, MODULE_ID).await;
     assert!(matches!(
         err,
         ExecutionError::ArchiveManifestMismatch {
@@ -1994,16 +1859,7 @@ async fn artifact_above_the_package_size_bound_is_refused() {
         package_policy,
     );
 
-    let err = service
-        .execute(
-            MODULE_ID,
-            None,
-            "run",
-            serde_json::json!({}),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
+    let err = refused_execution(&service, MODULE_ID).await;
     match err {
         ExecutionError::ArtifactTooLarge {
             size,
@@ -2076,16 +1932,7 @@ async fn concurrency_limit_is_enforced_and_permits_are_released() {
         "the first execution must start before capacity is probed"
     );
 
-    let err = service
-        .execute(
-            MODULE_ID,
-            None,
-            "run",
-            serde_json::json!({}),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
+    let err = refused_execution(&service, MODULE_ID).await;
     assert!(matches!(err, ExecutionError::Overloaded { maximum: 1 }));
 
     // The first worker cannot finish before this write: it is parked in the
@@ -2151,17 +1998,18 @@ async fn cancelled_preparation_keeps_the_permit_until_preparation_ends() {
         let first_preparation = Arc::clone(&first_preparation);
         move || {
             if first_preparation.swap(false, Ordering::SeqCst) {
-                if let Some(started_tx) = started_tx
+                let started_tx = started_tx
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take()
-                {
+                    .expect("hook mutex must not be poisoned")
+                    .take();
+                if let Some(started_tx) = started_tx {
                     let _ = started_tx.send(());
                 }
-                let _ = release_rx
+                release_rx
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .recv();
+                    .expect("hook mutex must not be poisoned")
+                    .recv()
+                    .expect("release signal must arrive");
             }
         }
     });
@@ -2194,16 +2042,7 @@ async fn cancelled_preparation_keeps_the_permit_until_preparation_ends() {
 
     // The outer future is gone, but the detached blocking task still owns the
     // only permit: capacity must stay exhausted until it actually returns.
-    let err = service
-        .execute(
-            MODULE_ID,
-            None,
-            "run",
-            serde_json::json!({}),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
+    let err = refused_execution(&service, MODULE_ID).await;
     assert!(
         matches!(err, ExecutionError::Overloaded { maximum: 1 }),
         "a cancelled preparation must not release capacity: {err:?}"
@@ -2260,16 +2099,7 @@ async fn signer_outside_the_allowlist_is_refused() {
         PackageValidationPolicy::production(),
     );
 
-    let err = service
-        .execute(
-            MODULE_ID,
-            None,
-            "run",
-            serde_json::json!({}),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
+    let err = refused_execution(&service, MODULE_ID).await;
     assert!(matches!(
         err,
         ExecutionError::SignerNotAllowed { key_id, .. } if key_id == "k1"

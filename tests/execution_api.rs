@@ -9,9 +9,11 @@
 
 #![cfg(unix)]
 
+use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -20,10 +22,15 @@ use base64::prelude::*;
 use conductor::api::routes::router;
 use conductor::api::uploads::AppState;
 use conductor::config::{Config, TrustedKeyConfig};
-use conductor::control_plane::execute_module::ActivationHook;
+use conductor::control_plane::activate_module::ActivationPolicy;
+use conductor::control_plane::execute_module::{ActivationHook, ExecutionService};
+use conductor::executions::executor::ExecutionLimits;
+use conductor::executions::history::ExecutionHistoryStore;
 use conductor::packages::digest::Sha256DigestProvider;
+use conductor::packages::policy::PackageValidationPolicy;
 use conductor::packages::signature::{canonical_payload, SignatureAlgorithm};
 use conductor::server::Host;
+use conductor::storage::database::Database;
 use ed25519_dalek::{Signer as _, SigningKey};
 use serial_test::serial;
 use tower::ServiceExt as _;
@@ -227,7 +234,7 @@ async fn post_bytes(
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("response body must read");
-    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    let json = serde_json::from_slice(&bytes).expect("response body must be JSON");
     (status, json)
 }
 
@@ -263,7 +270,7 @@ async fn get_json_with_content_type(
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("response body must read");
-    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    let json = serde_json::from_slice(&bytes).expect("response body must be JSON");
     (status, content_type, json)
 }
 
@@ -273,6 +280,55 @@ fn activate_uri(module_id: &str) -> String {
 
 fn execute_uri(module_id: &str) -> String {
     format!("/v1/modules/{module_id}/executions")
+}
+
+async fn upload_and_activate(state: &AppState, version: &str, script: &str) -> serde_json::Value {
+    let (status, uploaded) = post_upload(
+        state,
+        &package_bytes(MODULE_ID, version, 2, script),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = post_json(
+        state,
+        &activate_uri(MODULE_ID),
+        serde_json::json!({"version": version}),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    uploaded
+}
+
+fn artifact_path(state: &AppState, version: &str, digest: &str) -> PathBuf {
+    state
+        .artifact_dir
+        .join(MODULE_ID)
+        .join(version)
+        .join(format!("{digest}.zip"))
+}
+
+/// Replaces the service's history store with an unmigrated database, so
+/// every execution-history write or read can only fail.
+fn replace_history_with_unmigrated(state: &mut AppState, root: &Path) {
+    let unmigrated = Database::open_in_memory().expect("in-memory database must open");
+    state.execution_service = Arc::new(
+        ExecutionService::new(
+            Arc::clone(&state.registry),
+            state.artifact_dir.clone(),
+            root.join("staging"),
+            ActivationPolicy::new(vec!["rust".to_owned()]).expect("activation policy"),
+            ExecutionLimits::default(),
+            Duration::from_secs(30),
+            PackageValidationPolicy::production(),
+            HashSet::from(["k1".to_owned()]),
+            4,
+            Arc::new(ExecutionHistoryStore::new(Arc::new(unmigrated))),
+            Arc::clone(&state.metrics),
+        )
+        .expect("execution service must build"),
+    );
 }
 
 fn assert_generic_error(json: &serde_json::Value, root: &Path) {
@@ -571,28 +627,10 @@ async fn v1_manifest_is_refused_for_execution_but_activates() {
 async fn tampered_artifact_is_refused_without_leaking_its_path() {
     let root = temp_root("tampered-artifact");
     let state = assembled_state(&root, 30, 4);
-    let (status, uploaded) = post_upload(
-        &state,
-        &package_bytes(MODULE_ID, "1.2.0", 2, SCRIPT_ROWS_3),
-        Some(TOKEN),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
-    let (status, _) = post_json(
-        &state,
-        &activate_uri(MODULE_ID),
-        serde_json::json!({"version": "1.2.0"}),
-        Some(TOKEN),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    let uploaded = upload_and_activate(&state, "1.2.0", SCRIPT_ROWS_3).await;
 
     let digest = uploaded["digest"].as_str().expect("digest");
-    let artifact = state
-        .artifact_dir
-        .join(MODULE_ID)
-        .join("1.2.0")
-        .join(format!("{digest}.zip"));
+    let artifact = artifact_path(&state, "1.2.0", digest);
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(&artifact)
@@ -624,21 +662,7 @@ async fn deadline_over_the_host_maximum_is_rejected_before_any_worker() {
         "#!/bin/sh\nread -r line\ntouch '{}'\nprintf '{{\"protocol_version\":1,\"status\":\"ok\",\"result\":{{}}}}\\n'\n",
         marker.display()
     );
-    let (status, _) = post_upload(
-        &state,
-        &package_bytes(MODULE_ID, "1.2.0", 2, &script),
-        Some(TOKEN),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
-    let (status, _) = post_json(
-        &state,
-        &activate_uri(MODULE_ID),
-        serde_json::json!({"version": "1.2.0"}),
-        Some(TOKEN),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    upload_and_activate(&state, "1.2.0", &script).await;
 
     let (status, json) = post_json(
         &state,
@@ -674,21 +698,7 @@ async fn omitted_deadline_is_clamped_to_the_host_maximum() {
     // A host maximum below the 30s documented default must stay usable when
     // the caller omits `deadline_secs`.
     let state = assembled_state(&root, 5, 4);
-    let (status, _) = post_upload(
-        &state,
-        &package_bytes(MODULE_ID, "1.2.0", 2, SCRIPT_ROWS_3),
-        Some(TOKEN),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
-    let (status, _) = post_json(
-        &state,
-        &activate_uri(MODULE_ID),
-        serde_json::json!({"version": "1.2.0"}),
-        Some(TOKEN),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    upload_and_activate(&state, "1.2.0", SCRIPT_ROWS_3).await;
 
     let (status, json) = post_json(
         &state,
@@ -716,21 +726,7 @@ async fn execution_capacity_exhaustion_is_service_unavailable() {
         "#!/bin/sh\nread -r line\ntouch '{}'\nsleep 5\nprintf '{{\"protocol_version\":1,\"status\":\"ok\",\"result\":{{}}}}\\n'\n",
         marker.display()
     );
-    let (status, _) = post_upload(
-        &state,
-        &package_bytes(MODULE_ID, "1.2.0", 2, &script),
-        Some(TOKEN),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
-    let (status, _) = post_json(
-        &state,
-        &activate_uri(MODULE_ID),
-        serde_json::json!({"version": "1.2.0"}),
-        Some(TOKEN),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    upload_and_activate(&state, "1.2.0", &script).await;
 
     let first = {
         let state = state.clone();
@@ -820,11 +816,7 @@ async fn activation_refuses_a_missing_artifact_without_persisting_a_pointer() {
     assert_eq!(status, StatusCode::CREATED);
 
     let digest = uploaded["digest"].as_str().expect("digest");
-    let artifact = state
-        .artifact_dir
-        .join(MODULE_ID)
-        .join("1.2.0")
-        .join(format!("{digest}.zip"));
+    let artifact = artifact_path(&state, "1.2.0", digest);
     std::fs::remove_file(&artifact).expect("artifact must be removable");
 
     let (status, json) = post_json(
@@ -854,28 +846,10 @@ async fn activation_refuses_a_missing_artifact_without_persisting_a_pointer() {
 async fn missing_artifact_after_activation_is_a_generic_internal_error() {
     let root = temp_root("execution-missing-artifact");
     let state = assembled_state(&root, 30, 4);
-    let (status, uploaded) = post_upload(
-        &state,
-        &package_bytes(MODULE_ID, "1.2.0", 2, SCRIPT_ROWS_3),
-        Some(TOKEN),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
-    let (status, _) = post_json(
-        &state,
-        &activate_uri(MODULE_ID),
-        serde_json::json!({"version": "1.2.0"}),
-        Some(TOKEN),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    let uploaded = upload_and_activate(&state, "1.2.0", SCRIPT_ROWS_3).await;
 
     let digest = uploaded["digest"].as_str().expect("digest");
-    let artifact = state
-        .artifact_dir
-        .join(MODULE_ID)
-        .join("1.2.0")
-        .join(format!("{digest}.zip"));
+    let artifact = artifact_path(&state, "1.2.0", digest);
     std::fs::remove_file(&artifact).expect("artifact must be removable");
 
     let (status, json) = post_json(
@@ -897,21 +871,7 @@ async fn missing_artifact_after_activation_is_a_generic_internal_error() {
 async fn staging_host_io_failure_is_a_generic_internal_error() {
     let root = temp_root("staging-host-io");
     let state = assembled_state(&root, 30, 4);
-    let (status, _) = post_upload(
-        &state,
-        &package_bytes(MODULE_ID, "1.2.0", 2, SCRIPT_ROWS_3),
-        Some(TOKEN),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
-    let (status, _) = post_json(
-        &state,
-        &activate_uri(MODULE_ID),
-        serde_json::json!({"version": "1.2.0"}),
-        Some(TOKEN),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    upload_and_activate(&state, "1.2.0", SCRIPT_ROWS_3).await;
 
     // Replace the private staging root with a regular file after assembly.
     // Extraction can no longer create a stage directory, which is host I/O,
@@ -1530,53 +1490,12 @@ async fn execution_history_lookup_and_pagination_reject_invalid_input() {
 #[tokio::test]
 #[serial]
 async fn history_write_failure_is_a_generic_internal_error() {
-    use std::collections::HashSet;
-    use std::sync::Arc;
-
-    use conductor::control_plane::activate_module::ActivationPolicy;
-    use conductor::control_plane::execute_module::ExecutionService;
-    use conductor::executions::executor::ExecutionLimits;
-    use conductor::executions::history::ExecutionHistoryStore;
-    use conductor::packages::policy::PackageValidationPolicy;
-    use conductor::storage::database::Database;
-
     let root = temp_root("history-write-failure-api");
     let mut state = assembled_state(&root, 30, 4);
-    // Replace only the service's history store with an unmigrated database:
-    // the worker still runs, but the receipt insert can only fail.
-    let unmigrated = Database::open_in_memory().expect("in-memory database must open");
-    state.execution_service = Arc::new(
-        ExecutionService::new(
-            Arc::clone(&state.registry),
-            state.artifact_dir.clone(),
-            root.join("staging"),
-            ActivationPolicy::new(vec!["rust".to_owned()]).expect("activation policy"),
-            ExecutionLimits::default(),
-            Duration::from_secs(30),
-            PackageValidationPolicy::production(),
-            HashSet::from(["k1".to_owned()]),
-            4,
-            Arc::new(ExecutionHistoryStore::new(Arc::new(unmigrated))),
-            Arc::clone(&state.metrics),
-        )
-        .expect("execution service must build"),
-    );
+    // The worker still runs, but the receipt insert can only fail.
+    replace_history_with_unmigrated(&mut state, &root);
 
-    let (status, _) = post_upload(
-        &state,
-        &package_bytes(MODULE_ID, "1.2.0", 2, SCRIPT_ROWS_3),
-        Some(TOKEN),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
-    let (status, _) = post_json(
-        &state,
-        &activate_uri(MODULE_ID),
-        serde_json::json!({"version": "1.2.0"}),
-        Some(TOKEN),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    upload_and_activate(&state, "1.2.0", SCRIPT_ROWS_3).await;
 
     let (status, json) = post_json(
         &state,
@@ -1603,37 +1522,11 @@ async fn history_write_failure_is_a_generic_internal_error() {
 #[tokio::test]
 #[serial]
 async fn history_read_failure_is_a_generic_internal_error() {
-    use std::collections::HashSet;
-    use std::sync::Arc;
-
-    use conductor::control_plane::activate_module::ActivationPolicy;
-    use conductor::control_plane::execute_module::ExecutionService;
-    use conductor::executions::executor::ExecutionLimits;
-    use conductor::executions::history::ExecutionHistoryStore;
-    use conductor::packages::policy::PackageValidationPolicy;
-    use conductor::storage::database::Database;
-
     let root = temp_root("history-read-failure-api");
     let mut state = assembled_state(&root, 30, 4);
     // An unmigrated database has no `executions` table, so both history
     // reads can only fail. The API must still speak the generic JSON 500.
-    let unmigrated = Database::open_in_memory().expect("in-memory database must open");
-    state.execution_service = Arc::new(
-        ExecutionService::new(
-            Arc::clone(&state.registry),
-            state.artifact_dir.clone(),
-            root.join("staging"),
-            ActivationPolicy::new(vec!["rust".to_owned()]).expect("activation policy"),
-            ExecutionLimits::default(),
-            Duration::from_secs(30),
-            PackageValidationPolicy::production(),
-            HashSet::from(["k1".to_owned()]),
-            4,
-            Arc::new(ExecutionHistoryStore::new(Arc::new(unmigrated))),
-            Arc::clone(&state.metrics),
-        )
-        .expect("execution service must build"),
-    );
+    replace_history_with_unmigrated(&mut state, &root);
 
     let root_text = root.to_str().expect("temp root must be UTF-8");
     for uri in ["/v1/executions", "/v1/executions/exec-known"] {

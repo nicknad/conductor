@@ -12,6 +12,7 @@
 //! `tests/tls_only.rs` for the socket proof; HSTS is asserted here).
 
 use std::collections::HashSet;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -142,8 +143,6 @@ fn golden_package_bytes() -> Vec<u8> {
     package_bytes_with_payload(b"not a real executable")
 }
 
-/// Golden identity (`reporting-service` `1.2.0`) with a caller-chosen
-/// payload, for conflict cases that must differ only in bytes.
 /// Golden package whose `manifest.json` is caller-supplied raw bytes, for
 /// route-level manifest rejection tests.
 fn package_with_raw_manifest(manifest: &[u8], payload: &[u8]) -> Vec<u8> {
@@ -167,6 +166,8 @@ fn package_with_raw_manifest(manifest: &[u8], payload: &[u8]) -> Vec<u8> {
     cursor.into_inner()
 }
 
+/// Golden identity (`reporting-service` `1.2.0`) with a caller-chosen
+/// payload, for conflict cases that must differ only in bytes.
 fn package_bytes_with_payload(payload: &[u8]) -> Vec<u8> {
     let manifest = serde_json::json!({
         "manifest_version": 1,
@@ -176,24 +177,10 @@ fn package_bytes_with_payload(payload: &[u8]) -> Vec<u8> {
         "entrypoint": "payload/reporting-service",
         "files": ["payload/reporting-service"],
     });
-    let mut cursor = std::io::Cursor::new(Vec::new());
-    let mut writer = zip::ZipWriter::new(&mut cursor);
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    writer
-        .start_file("manifest.json", options)
-        .expect("zip writer must accept manifest");
-    writer
-        .write_all(&serde_json::to_vec(&manifest).expect("manifest must serialize"))
-        .expect("zip writer must accept manifest bytes");
-    writer
-        .start_file("payload/reporting-service", options)
-        .expect("zip writer must accept payload");
-    writer
-        .write_all(payload)
-        .expect("zip writer must accept payload bytes");
-    writer.finish().expect("zip must finalize");
-    cursor.into_inner()
+    package_with_raw_manifest(
+        &serde_json::to_vec(&manifest).expect("manifest must serialize"),
+        payload,
+    )
 }
 
 fn signature_base64_for(bytes: &[u8]) -> String {
@@ -281,7 +268,7 @@ async fn post_custom_body(state: &AppState, body: Vec<u8>) -> (StatusCode, serde
         send_upload(state, Body::from(body), Some("test-bearer-upload"), &[]).await;
     (
         status,
-        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        serde_json::from_slice(&bytes).expect("error and success bodies are JSON"),
     )
 }
 
@@ -307,8 +294,6 @@ fn quarantine_zip_count(dir: &Path) -> usize {
 fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
-
-use std::io::Write as _;
 
 #[tokio::test]
 async fn healthz_reports_ok() {

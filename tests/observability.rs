@@ -253,7 +253,7 @@ async fn http_metrics_use_the_matched_template_and_release_active_requests() {
         storage_root: root.clone(),
         ..MetricsOptions::default()
     });
-    let (state, _state_root) = build_state(Arc::clone(&metrics), migrated_database(), "http");
+    let (state, state_root) = build_state(Arc::clone(&metrics), migrated_database(), "http");
 
     exporter.reset();
     let response = send(
@@ -325,12 +325,14 @@ async fn http_metrics_use_the_matched_template_and_release_active_requests() {
             "metric data leaked {leaked:?}: {rendered}"
         );
     }
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&state_root);
 }
 
 #[tokio::test]
 async fn http_metrics_observe_unmatched_and_method_not_allowed_requests() {
     let (metrics, exporter) = capture(MetricsOptions::default());
-    let (state, _root) = build_state(Arc::clone(&metrics), migrated_database(), "transport");
+    let (state, root) = build_state(Arc::clone(&metrics), migrated_database(), "transport");
 
     exporter.reset();
     let unmatched = send(&state, "/definitely-not-a-route", None).await;
@@ -374,12 +376,13 @@ async fn http_metrics_observe_unmatched_and_method_not_allowed_requests() {
         Some(1),
         "method-not-allowed responses must keep the matched template"
     );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[tokio::test]
 async fn auth_failure_metrics_distinguish_missing_and_invalid_without_tokens() {
     let (metrics, exporter) = capture(MetricsOptions::default());
-    let (state, _root) = build_state(Arc::clone(&metrics), migrated_database(), "auth");
+    let (state, root) = build_state(Arc::clone(&metrics), migrated_database(), "auth");
 
     exporter.reset();
     let missing = send(&state, "/v1/executions", None).await;
@@ -423,6 +426,7 @@ async fn auth_failure_metrics_distinguish_missing_and_invalid_without_tokens() {
         !rendered.contains("wrong-token-value") && !rendered.contains(TOKEN),
         "auth metrics must never carry token values: {rendered}"
     );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[tokio::test]
@@ -431,7 +435,7 @@ async fn provider_resource_and_scope_carry_the_service_identity() {
         deployment_environment: "staging".to_owned(),
         ..MetricsOptions::default()
     });
-    let (state, _root) = build_state(Arc::clone(&metrics), migrated_database(), "resource");
+    let (state, root) = build_state(Arc::clone(&metrics), migrated_database(), "resource");
 
     exporter.reset();
     let response = send(&state, "/healthz", None).await;
@@ -499,6 +503,7 @@ async fn provider_resource_and_scope_carry_the_service_identity() {
         saw_scope,
         "at least one scope must carry the conductor name"
     );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[tokio::test]

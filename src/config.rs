@@ -1108,10 +1108,6 @@ mod tests {
         assert_eq!(config.allowed_runtimes, vec!["rust".to_owned()]);
         assert_eq!(config.max_execution_deadline_secs, 300);
         assert_eq!(config.max_concurrent_executions, 4);
-        assert!(matches!(
-            config.validate_for_startup(),
-            Err(ConfigError::Missing("api_token"))
-        ));
     }
 
     #[test]

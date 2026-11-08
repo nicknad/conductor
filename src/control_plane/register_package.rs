@@ -218,8 +218,8 @@ mod tests {
     fn same_version_different_bytes_conflicts() {
         let a = package_bytes("1.2.0", b"bin-a");
         let b = package_bytes("1.2.0", b"bin-b");
-        let (verdict_a, dir) = validated(&a, "conflict-a");
-        let (verdict_b, _) = validated(&b, "conflict-b");
+        let (verdict_a, dir_a) = validated(&a, "conflict-a");
+        let (verdict_b, dir_b) = validated(&b, "conflict-b");
         let registry = ModuleRegistry::new();
         register(&registry, &verdict_a, &relpath(&verdict_a)).expect("first");
         let err = register(&registry, &verdict_b, &relpath(&verdict_b)).unwrap_err();
@@ -232,6 +232,7 @@ mod tests {
                 .digest,
             *verdict_a.artifact().digest()
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 }

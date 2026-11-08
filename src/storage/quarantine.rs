@@ -174,21 +174,9 @@ mod tests {
 
     #[cfg(test)]
     fn filetime_backdate(path: &Path, t: SystemTime) {
-        // No extra deps: set mtime via /usr/bin/touch equivalent is
-        // overkill; libc-free backdating uses the file's atime/mtime
-        // through std only on nightly, so shell out to `touch -d`.
-        // Tests run on Linux; failure fails the test loudly.
-        let secs = t
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("time must be past epoch")
-            .as_secs()
-            .to_string();
-        let status = std::process::Command::new("touch")
-            .arg("-d")
-            .arg(format!("@{secs}"))
-            .arg(path)
-            .status()
-            .expect("touch must run");
-        assert!(status.success());
+        std::fs::File::open(path)
+            .expect("file must open")
+            .set_times(std::fs::FileTimes::new().set_modified(t))
+            .expect("mtime must be set");
     }
 }

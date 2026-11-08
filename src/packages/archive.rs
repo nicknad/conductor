@@ -744,6 +744,15 @@ mod tests {
         }
     }
 
+    fn roomy_limits() -> ArchiveLimits {
+        ArchiveLimits {
+            max_entries: 16,
+            max_compressed_bytes: 1 << 20,
+            max_uncompressed_bytes: 1 << 20,
+            max_entry_bytes: 1 << 20,
+        }
+    }
+
     fn sane_config(limits: &ArchiveLimits) -> ScanConfig<'_> {
         ScanConfig {
             limits,
@@ -948,10 +957,8 @@ mod tests {
     #[test]
     fn scan_enforces_per_entry_and_total_bounds() {
         let limits = ArchiveLimits {
-            max_entries: 16,
-            max_compressed_bytes: 1 << 20,
-            max_uncompressed_bytes: 1 << 20,
             max_entry_bytes: 2,
+            ..roomy_limits()
         };
         let config = sane_config(&limits);
         let bytes = stored_zip(&[("big.dat", b"1234")]);
@@ -961,10 +968,8 @@ mod tests {
         ));
 
         let totals = ArchiveLimits {
-            max_entries: 16,
             max_compressed_bytes: 6,
-            max_uncompressed_bytes: 1 << 20,
-            max_entry_bytes: 1 << 20,
+            ..roomy_limits()
         };
         let totals_config = sane_config(&totals);
         let bytes = stored_zip(&[("a", b"1234"), ("b", b"5678")]);
@@ -976,12 +981,7 @@ mod tests {
 
     #[test]
     fn scan_enforces_ratio_and_depth() {
-        let ratio = ArchiveLimits {
-            max_entries: 16,
-            max_compressed_bytes: 1 << 20,
-            max_uncompressed_bytes: 1 << 20,
-            max_entry_bytes: 1 << 20,
-        };
+        let ratio = roomy_limits();
         let mut config = sane_config(&ratio);
         config.max_compression_ratio = 1;
         // 1,000 zero bytes deflate to a handful: ratio ~50:1 trips a
@@ -1003,12 +1003,7 @@ mod tests {
             Err(ArchiveError::LimitExceeded(_))
         ));
 
-        let depth = ArchiveLimits {
-            max_entries: 16,
-            max_compressed_bytes: 1 << 20,
-            max_uncompressed_bytes: 1 << 20,
-            max_entry_bytes: 1 << 20,
-        };
+        let depth = roomy_limits();
         let mut deep_config = sane_config(&depth);
         deep_config.max_nesting_depth = 2;
         let bytes = stored_zip(&[("a/b/c", b"x")]);
@@ -1025,12 +1020,7 @@ mod tests {
     fn scan_rejects_disallowed_method_encrypted_and_lists_dirs() {
         // Deflate is decodable but not allowlisted here: capability must not
         // imply permission.
-        let limits = ArchiveLimits {
-            max_entries: 16,
-            max_compressed_bytes: 1 << 20,
-            max_uncompressed_bytes: 1 << 20,
-            max_entry_bytes: 1 << 20,
-        };
+        let limits = roomy_limits();
         let stored_only = ScanConfig {
             limits: &limits,
             allowed_methods: &[CompressionMethod::Stored],
@@ -1166,12 +1156,7 @@ mod tests {
 
     #[test]
     fn scan_rejects_non_regular_file_types_not_only_symlinks() {
-        let limits = ArchiveLimits {
-            max_entries: 16,
-            max_compressed_bytes: 1 << 20,
-            max_uncompressed_bytes: 1 << 20,
-            max_entry_bytes: 1 << 20,
-        };
+        let limits = roomy_limits();
         let config = sane_config(&limits);
 
         // FIFO mode bits (S_IFIFO) with otherwise ordinary permissions: the

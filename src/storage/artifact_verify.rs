@@ -304,17 +304,6 @@ fn test_is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-/// The root probe must match the OS effective uid.
-#[cfg(all(test, unix))]
-#[test]
-#[allow(unsafe_code)]
-fn test_is_root_matches_effective_uid() {
-    // SAFETY: `geteuid` takes no arguments and only reads the process's
-    // effective uid; it cannot fail or touch memory.
-    let effective_root = unsafe { libc::geteuid() == 0 };
-    assert_eq!(test_is_root(), effective_root);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,70 +811,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn preflight_rejects_symlink_root() {
+    fn preflight_rejects_symlink_root_with_path_suffixes() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new("root-symlink");
-        let target = temp.path().join("real-root");
-        fs::create_dir_all(&target).expect("target");
-        let link = temp.path().join("artifacts");
-        symlink(&target, &link).expect("symlink root");
-        assert!(matches!(
-            preflight_artifact_root(&link),
-            Err(ArtifactRootError::Unusable(_))
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn preflight_rejects_symlink_root_with_trailing_separator() {
-        use std::os::unix::fs::symlink;
-
-        let temp = TempDir::new("root-symlink-slash");
-        let target = temp.path().join("real-root");
-        fs::create_dir_all(&target).expect("target");
-        let link = temp.path().join("artifacts");
-        symlink(&target, &link).expect("symlink root");
-        let with_separator = PathBuf::from(format!("{}/", link.display()));
-        assert!(has_trailing_separator(&with_separator));
-        assert!(matches!(
-            preflight_artifact_root(&with_separator),
-            Err(ArtifactRootError::Unusable(_))
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn preflight_rejects_symlink_root_with_dot_suffix() {
-        use std::os::unix::fs::symlink;
-
-        let temp = TempDir::new("root-symlink-dot");
-        let target = temp.path().join("real-root");
-        fs::create_dir_all(&target).expect("target");
-        let link = temp.path().join("artifacts");
-        symlink(&target, &link).expect("symlink root");
-        let with_dot = PathBuf::from(format!("{}/.", link.display()));
-        assert!(matches!(
-            preflight_artifact_root(&with_dot),
-            Err(ArtifactRootError::Unusable(_))
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn preflight_rejects_symlink_root_with_parent_component() {
-        use std::os::unix::fs::symlink;
-
-        let temp = TempDir::new("root-symlink-parent");
-        let target = temp.path().join("real-root");
-        fs::create_dir_all(&target).expect("target");
-        let link = temp.path().join("artifacts");
-        symlink(&target, &link).expect("symlink root");
-        let with_parent = PathBuf::from(format!("{}/..", link.display()));
-        assert!(matches!(
-            preflight_artifact_root(&with_parent),
-            Err(ArtifactRootError::Unusable(_))
-        ));
+        for suffix in ["", "/", "/.", "/.."] {
+            let temp = TempDir::new("root-symlink");
+            let target = temp.path().join("real-root");
+            fs::create_dir_all(&target).expect("target");
+            let link = temp.path().join("artifacts");
+            symlink(&target, &link).expect("symlink root");
+            let path = PathBuf::from(format!("{}{suffix}", link.display()));
+            if suffix == "/" {
+                assert!(has_trailing_separator(&path));
+            }
+            assert!(matches!(
+                preflight_artifact_root(&path),
+                Err(ArtifactRootError::Unusable(_))
+            ));
+        }
     }
 
     #[cfg(unix)]

@@ -185,7 +185,7 @@ async fn post_json(
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("response body must read");
-    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    let json = serde_json::from_slice(&bytes).expect("response body must be JSON");
     (status, json)
 }
 

@@ -273,19 +273,16 @@ mod tests {
         let a = package_bytes("reporting-service", "1.2.0", b"bin-a");
         let b = package_bytes("reporting-service", "1.2.0", b"bin-b");
         assert_ne!(a, b);
-        let (verdict_a, qpath_a, dir) = validated(&a, "coexist-a");
-        let artifacts = dir.join("artifacts");
+        let (verdict_a, qpath_a, dir_a) = validated(&a, "coexist-a");
+        let artifacts = dir_a.join("artifacts");
         let dest_a = promote_quarantined(&artifacts, &qpath_a, &verdict_a).expect("a");
-        let (verdict_b, qpath_b, _) = validated(&b, "coexist-b");
-        let qpath_b_shared = dir.join("pkg-b.zip");
-        std::fs::write(&qpath_b_shared, &b).expect("write");
-        let _ = std::fs::remove_file(&qpath_b);
-        let dest_b =
-            promote_quarantined(&artifacts, &qpath_b_shared, &verdict_b).expect("b promotes too");
+        let (verdict_b, qpath_b, dir_b) = validated(&b, "coexist-b");
+        let dest_b = promote_quarantined(&artifacts, &qpath_b, &verdict_b).expect("b promotes too");
         assert_ne!(dest_a, dest_b);
         assert_eq!(std::fs::read(&dest_a).expect("read a"), a);
         assert_eq!(std::fs::read(&dest_b).expect("read b"), b);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 
     #[test]

@@ -185,9 +185,10 @@ mod tests {
     fn round_trip_covers_every_stage_truncation_and_missing_attribution() {
         let store = RejectionStore::open_in_memory().expect("in-memory store must open");
         // One stable code per stage; distinct so rows cannot be confused.
-        const CODES: [&str; 12] = [
+        const CODES: [&str; 15] = [
             "transport_rejected",
             "multipart_rejected",
+            "request_rejected",
             "streaming_rejected",
             "policy_rejected",
             "archive_rejected",
@@ -197,11 +198,14 @@ mod tests {
             "inventory_rejected",
             "promotion_rejected",
             "registration_rejected",
+            "activation_rejected",
+            "execution_rejected",
             "internal_rejected",
         ];
         let stages = [
             RejectionStage::Transport,
             RejectionStage::Multipart,
+            RejectionStage::Request,
             RejectionStage::Streaming,
             RejectionStage::Policy,
             RejectionStage::Archive,
@@ -211,6 +215,8 @@ mod tests {
             RejectionStage::Inventory,
             RejectionStage::Promotion,
             RejectionStage::Registration,
+            RejectionStage::Activation,
+            RejectionStage::Execution,
             RejectionStage::Internal,
         ];
         let mut events = Vec::new();
