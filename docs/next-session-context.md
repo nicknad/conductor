@@ -1,19 +1,24 @@
 # Next session context
 
 Upload, validation, persistence, activation, execution, history, metrics,
-readiness, classify-only startup reconciliation, and Scheduler slices 1-2 are
+readiness, classify-only startup reconciliation, and Scheduler slices 1-3 are
 implemented. Slice 1 added durable manual jobs, manual triggers, queue/dispatch,
 recovery, and job metrics. Slice 2 added bounded interval triggers, durable
 `next_run_at` scheduling, due-tick enqueue with duplicate-tick protection,
-restart catch-up, and the queue-bound retry path.
+restart catch-up, and the queue-bound retry path. Slice 3 added bounded 5-field
+UTC cron triggers with closed-grammar validation, next-run computation, due
+enqueue, duplicate-tick protection, restart catch-up, defensive tamper
+skipping, and the existing pinned dispatcher.
 
-## Recommended: Scheduler slice 3 (cron triggers)
+## Recommended: Scheduler slice 4 (bounded retries with backoff)
 
-Start with [handover-scheduler-slice-3.md](handover-scheduler-slice-3.md).
-Add bounded 5-field UTC cron triggers on the same durable queue: next-run
-computation, due enqueue, duplicate-tick protection, restart catch-up, and the
-existing pinned dispatcher. Defer retries, cancellation, drain, distributed
-scheduling, retention, timezone/DST, and artifact GC.
+Start with [handover-scheduler-slice-4.md](handover-scheduler-slice-4.md).
+Add a global bounded retry policy for worker-reported transient failures: new
+durable attempts with `attempt_no+1`, deterministic backoff, claim gating on
+`scheduled_for <= now`, and the existing queue bound, disable kill-switch,
+metrics, and pinned dispatcher. Defer per-job/API retry config, jitter,
+cancellation/drain, distributed scheduling, retention, timezone/DST, and
+artifact GC.
 
 ## Small wins if scheduler is too large
 
