@@ -4,13 +4,14 @@
 //! adapter. It owns readiness, job metrics, and startup recovery; it never
 //! touches registry, artifact, staging, or worker-spawn state directly.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use thiserror::Error;
-use tokio::sync::Notify;
+use tokio::sync::{oneshot, Notify};
 use tokio::task::{JoinError, JoinSet};
 
 use crate::control_plane::execute_module::{ExecutionError, ExecutionService};
@@ -23,7 +24,9 @@ use super::job::{
     classify_execution_error, is_retryable_completion, retry_delay, ClaimedRun, JobDefinition,
     JobRun, NewJob, RunCompletion, DEFAULT_JOB_DEADLINE_SECS,
 };
-use super::store::{DueEnqueueReport, EnableResult, JobStore, JobStoreError, JobStoreLimits};
+use super::store::{
+    DueEnqueueReport, EnableResult, JobStore, JobStoreError, JobStoreLimits, RunCancel,
+};
 
 /// Extra time `drain` waits beyond `drain_timeout` so a stuck loop cannot hold
 /// host shutdown forever.
@@ -86,8 +89,29 @@ pub enum SchedulerError {
     AlreadyStarted,
     #[error("scheduler is not running")]
     NotRunning,
+    #[error("run was not found")]
+    RunNotFound,
+    #[error("run cannot be cancelled")]
+    RunNotCancellable,
     #[error("scheduler task failed: {0}")]
     Task(String),
+}
+
+/// Accepted cancellation: either a queued row already terminalized or a
+/// running row whose worker was asked to stop.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CancelResult {
+    Queued(JobRun),
+    Running(JobRun),
+}
+
+impl CancelResult {
+    #[must_use]
+    pub fn into_run(self) -> JobRun {
+        match self {
+            Self::Queued(run) | Self::Running(run) => run,
+        }
+    }
 }
 
 /// One scheduler per host.
@@ -102,6 +126,7 @@ pub struct SchedulerService {
     active: Arc<AtomicUsize>,
     notify: Notify,
     loop_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    cancellations: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
 }
 
 impl fmt::Debug for SchedulerService {
@@ -134,6 +159,7 @@ impl SchedulerService {
             active: Arc::new(AtomicUsize::new(0)),
             notify: Notify::new(),
             loop_handle: Mutex::new(None),
+            cancellations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -341,7 +367,7 @@ impl SchedulerService {
                 break;
             };
             let guard = self.begin_run();
-            self.dispatch_claimed(claimed, now, guard).await;
+            self.dispatch_claimed(claimed, now, guard, None).await;
             dispatched += 1;
         }
         Ok(dispatched)
@@ -435,6 +461,80 @@ impl SchedulerService {
             .map_err(SchedulerError::from)
     }
 
+    /// Cancels one run while the scheduler is running. A queued row becomes
+    /// terminal in the store; a running row gets a cancellation reason through
+    /// the registered worker channel, and the dispatch task writes the normal
+    /// terminal completion.
+    pub async fn cancel_run(
+        &self,
+        job_id: &str,
+        run_id: &str,
+    ) -> Result<CancelResult, SchedulerError> {
+        if !self.is_running() {
+            return Err(SchedulerError::NotRunning);
+        }
+        let store = Arc::clone(&self.store);
+        let job_id_owned = job_id.to_owned();
+        let run_id_owned = run_id.to_owned();
+        let now = SystemTime::now();
+        let cancel = tokio::task::spawn_blocking(move || {
+            store.request_run_cancel(&job_id_owned, &run_id_owned, now)
+        })
+        .await
+        .map_err(task_error)?
+        .map_err(SchedulerError::from)?;
+        match cancel {
+            RunCancel::Queued(run) => {
+                self.metrics.job_terminalized_queued(1);
+                Ok(CancelResult::Queued(run))
+            }
+            RunCancel::Running => {
+                let sender = self
+                    .cancellations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(run_id);
+                let Some(sender) = sender else {
+                    return Err(SchedulerError::RunNotCancellable);
+                };
+                if sender.send("cancel requested".to_owned()).is_err() {
+                    return Err(SchedulerError::RunNotCancellable);
+                }
+                let store = Arc::clone(&self.store);
+                let job_id_owned = job_id.to_owned();
+                let run_id_owned = run_id.to_owned();
+                let run = tokio::task::spawn_blocking(move || {
+                    store.get_run(&job_id_owned, &run_id_owned)
+                })
+                .await
+                .map_err(task_error)?
+                .map_err(SchedulerError::from)?
+                .ok_or(SchedulerError::RunNotFound)?;
+                Ok(CancelResult::Running(run))
+            }
+            RunCancel::Terminal(_) => Err(SchedulerError::RunNotCancellable),
+            RunCancel::NotFound => Err(SchedulerError::RunNotFound),
+        }
+    }
+
+    fn register_cancellation(
+        &self,
+        run_id: String,
+    ) -> (oneshot::Receiver<String>, CancellationGuard) {
+        let (sender, receiver) = oneshot::channel();
+        self.cancellations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(run_id.clone(), sender);
+        (
+            receiver,
+            CancellationGuard {
+                cancellations: Arc::clone(&self.cancellations),
+                run_id,
+            },
+        )
+    }
+
     async fn count_queued(&self) -> Result<usize, SchedulerError> {
         let store = Arc::clone(&self.store);
         tokio::task::spawn_blocking(move || store.count_queued())
@@ -485,6 +585,7 @@ impl SchedulerService {
         claimed: ClaimedRun,
         claimed_at: SystemTime,
         guard: ActiveRun,
+        cancel: Option<oneshot::Receiver<String>>,
     ) {
         let wait = claimed_at
             .duration_since(claimed.run.scheduled_for)
@@ -497,12 +598,13 @@ impl SchedulerService {
             .min(Duration::from_secs(DEFAULT_JOB_DEADLINE_SECS));
         let completion = match self
             .dispatcher
-            .execute(
+            .execute_cancellable(
                 &claimed.job.module_id,
                 &claimed.job.version,
                 &claimed.job.function,
                 claimed.job.payload.clone(),
                 deadline,
+                cancel,
             )
             .await
         {
@@ -637,9 +739,13 @@ impl SchedulerService {
                 break;
             };
             let guard = self.begin_run();
+            let (cancel, cancellation) = self.register_cancellation(claimed.run.run_id.clone());
             let service = Arc::clone(self);
             join_set.spawn(async move {
-                service.dispatch_claimed(claimed, now, guard).await;
+                let _cancellation = cancellation;
+                service
+                    .dispatch_claimed(claimed, now, guard, Some(cancel))
+                    .await;
             });
         }
         Ok(())
@@ -742,6 +848,22 @@ impl Drop for ActiveRun {
     }
 }
 
+/// Removes the run's cancellation sender when the dispatch task ends, panics,
+/// or is aborted (stop/drain).
+struct CancellationGuard {
+    cancellations: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
+    run_id: String,
+}
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        self.cancellations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.run_id);
+    }
+}
+
 fn task_error(error: JoinError) -> SchedulerError {
     SchedulerError::Task(error.to_string())
 }
@@ -751,4 +873,47 @@ fn next_owner_suffix() -> u128 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry() -> Arc<Mutex<HashMap<String, oneshot::Sender<String>>>> {
+        let registry = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, _receiver) = oneshot::channel();
+        registry
+            .lock()
+            .expect("registry lock")
+            .insert("run-1".to_owned(), sender);
+        registry
+    }
+
+    #[test]
+    fn cancellation_guard_removes_its_entry_on_drop() {
+        let cancellations = registry();
+        {
+            let _guard = CancellationGuard {
+                cancellations: Arc::clone(&cancellations),
+                run_id: "run-1".to_owned(),
+            };
+        }
+        assert!(cancellations.lock().expect("registry lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_guard_removes_its_entry_when_the_task_is_aborted() {
+        let cancellations = registry();
+        let guard = CancellationGuard {
+            cancellations: Arc::clone(&cancellations),
+            run_id: "run-1".to_owned(),
+        };
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        handle.abort();
+        let _ = handle.await;
+        assert!(cancellations.lock().expect("registry lock").is_empty());
+    }
 }

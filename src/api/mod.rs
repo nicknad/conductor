@@ -39,5 +39,8 @@ pub(crate) const JOB_TRIGGER_PATH: &str = "/v1/jobs/{job_id}/trigger";
 /// Lists runs for one job.
 pub(crate) const JOB_RUNS_PATH: &str = "/v1/jobs/{job_id}/runs";
 
+/// Cancels one queued or running run.
+pub(crate) const JOB_RUN_CANCEL_PATH: &str = "/v1/jobs/{job_id}/runs/{run_id}/cancel";
+
 /// Route-scoped JSON body limit for activation and execution requests.
 pub(crate) const JSON_BODY_LIMIT_BYTES: usize = 1 << 20;

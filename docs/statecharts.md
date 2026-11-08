@@ -450,7 +450,7 @@ Deferred: repair after restore or replacement (`Missing --> Ok`,
 `Mismatch --> Ok`), orphan scanning, artifact GC, and one
 `reconciliation_runs` row per pass.
 
-## 11. Scheduler / triggering (**manual, interval, UTC cron, bounded retries, and bounded drain implemented; cancellation planned**)
+## 11. Scheduler / triggering (**manual, interval, UTC cron, bounded retries, bounded drain, and per-run cancellation implemented**)
 
 Source: `src/control_plane/scheduler/`, `src/readiness.rs`,
 `src/metrics.rs` (`conductor.job.wait.duration`, queue/active gauges).
@@ -498,7 +498,9 @@ stateDiagram-v2
         due. Unparseable cron rows are skipped and counted and
         fail closed on read; impossible ones are skipped but
         still read back. Cron stays UTC only; timezone/DST,
-        cancellation, and idempotency keys are later.
+        interrupted-run replay, and idempotency keys are later.
+        Slice 6 adds per-run cancellation; see the next
+        diagram.
     end note
     note right of Ready
         The scheduler owns the scheduler_ready flag:
@@ -540,9 +542,9 @@ stateDiagram-v2
         the next start.
     end note
     note right of TimedOut
-        Per-run cancellation is still absent; drain
-        bounds host shutdown, it does not cancel an
-        individual run.
+        Drain and stop do not cancel individual
+        runs; per-run cancellation is a separate
+        authenticated request.
     end note
 ```
 
@@ -552,6 +554,50 @@ writes its normal terminal row. A run still executing when the deadline expires
 is aborted and its row stays `running` until startup recovery marks it
 `interrupted`; interrupted runs are not replayed. Drain adds no metric, route,
 state, or schema.
+
+### Per-run cancellation
+
+Source: `src/control_plane/scheduler/{store,service,dispatch}.rs`,
+`src/control_plane/execute_module.rs`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Queued
+    Queued --> FailedCancelled: POST cancel -> one store transaction
+    Queued --> Running: claim
+    Running --> FailedCancelled: POST cancel -> executor channel
+    Running --> Succeeded: outcome succeeded
+    Running --> Failed: outcome failed / timed_out / worker_error / protocol_violation
+    FailedCancelled --> [*]: no retry; job enabled/next_run_at unchanged
+    Succeeded --> [*]
+    Failed --> [*]
+
+    note right of FailedCancelled
+        Cancellation reuses state=failed with
+        outcome=cancelled. A queued cancel sets
+        finished_at and no execution_id and writes
+        no history row. A running cancel terminates
+        the worker process group, then the normal
+        dispatch path writes the terminal row with
+        the real execution_id and one history
+        receipt. There is no cancelled state or
+        failure code.
+    end note
+    note right of Running
+        Cancel is per run. The dispatch task is
+        not aborted: it remains the single writer
+        of the terminal completion. A claim-to-
+        sender registration race returns 409
+        run_not_cancellable and may be retried.
+    end note
+```
+
+Cancelling a run does not change the job's `enabled` flag or `next_run_at` and
+does not cancel other runs. Queued retries of the same job are separate runs.
+Drain and stop still do not cancel individual runs. There is no durable
+pending-cancel marker, so a crash between accept and the terminal write is
+recovered like any other in-flight run: startup marks a remaining `running` row
+`interrupted`, and interrupted runs are still not replayed.
 
 ## 12. Rejection audit (`audit`)
 
@@ -588,7 +634,7 @@ guarantee beyond the dependencies noted.
 
 | Priority | Work item | Current evidence | Blocks |
 | --- | --- | --- | --- |
-| 1 | **Scheduler / triggering**: durable job definitions, cron/interval triggers, queueing, dispatch, retry/attempt semantics, cancellation, scheduler readiness hook, job-wait histogram | Slice 4 implements durable manual, interval, and UTC five-field cron jobs, bounded retries with deterministic backoff, due enqueue for both scheduled kinds, queue/dispatch, recovery, readiness, and job wait/queue/active metrics. Slice 5 adds a bounded graceful drain on host shutdown. Cancellation, interrupted-run replay, timezone/DST cron, and multi-process ownership remain | Produces the jobs the platform exists to run |
+| 1 | **Scheduler / triggering**: durable job definitions, cron/interval triggers, queueing, dispatch, retry/attempt semantics, cancellation, scheduler readiness hook, job-wait histogram | Slice 4 implements durable manual, interval, and UTC five-field cron jobs, bounded retries with deterministic backoff, due enqueue for both scheduled kinds, queue/dispatch, recovery, readiness, and job wait/queue/active metrics. Slice 5 adds a bounded graceful drain on host shutdown. Slice 6 adds authenticated per-run cancellation for queued and running runs. Interrupted-run replay, timezone/DST cron, and multi-process ownership remain | Produces the jobs the platform exists to run |
 | 2 | **Operator CLI**: upload, validate, activate, execute, history, lifecycle, reconcile commands | `tests/cli.rs` only drives startup failures; no CLI module | Operator usability; today everything is raw HTTP |
 | 3 | **Module lifecycle transitions**: deactivate, remove, rollback, drain running work, reference counting | `src/control_plane/lifecycle.rs` is a placeholder; `clear_active` / `remove_version` are registry primitives with no caller | Artifact GC and safe upgrades |
 | 4 | **Startup reconciliation**: scan registry vs artifact store, populate `Missing`/`Mismatch`, repair or quarantine, record `reconciliation_runs` | Classifier and startup wiring implemented in `Host::assemble`; repair, orphan detection, and `reconciliation_runs` deferred; design says PR4 | Trustworthy restart state |

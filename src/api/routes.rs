@@ -50,12 +50,14 @@ use tower_http::trace::TraceLayer;
 
 use crate::api::errors::ApiError;
 use crate::api::executions::{get_execution, get_executions, post_activate, post_execute};
-use crate::api::jobs::{get_job_runs, get_jobs, post_disable, post_enable, post_job, post_trigger};
+use crate::api::jobs::{
+    get_job_runs, get_jobs, post_cancel_run, post_disable, post_enable, post_job, post_trigger,
+};
 use crate::api::uploads::{post_package, request_id, require_bearer, AppState};
 use crate::api::{
     ACTIVATE_MODULE_PATH, EXECUTE_MODULE_PATH, EXECUTIONS_PATH, EXECUTION_DETAIL_PATH, JOBS_PATH,
-    JOB_DISABLE_PATH, JOB_ENABLE_PATH, JOB_RUNS_PATH, JOB_TRIGGER_PATH, JSON_BODY_LIMIT_BYTES,
-    PACKAGE_UPLOAD_PATH,
+    JOB_DISABLE_PATH, JOB_ENABLE_PATH, JOB_RUNS_PATH, JOB_RUN_CANCEL_PATH, JOB_TRIGGER_PATH,
+    JSON_BODY_LIMIT_BYTES, PACKAGE_UPLOAD_PATH,
 };
 use crate::audit::event::{RejectionEvent, RejectionStage};
 
@@ -190,6 +192,13 @@ pub fn router(state: AppState) -> Router {
         .route(
             JOB_RUNS_PATH,
             get(get_job_runs).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_bearer,
+            )),
+        )
+        .route(
+            JOB_RUN_CANCEL_PATH,
+            post(post_cancel_run).route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 require_bearer,
             )),

@@ -6,9 +6,9 @@
 > **Development is not finished:** this is an in-progress implementation, not a
 > complete job scheduler. Package ingestion, host startup wiring, the
 > worker execution library, the activation/execution HTTP endpoints,
-> durable execution history, and Scheduler slice 5 (durable manual, interval,
-> and UTC five-field cron jobs with bounded retries and a bounded graceful
-> drain on host shutdown) exist, but lifecycle
+> durable execution history, and Scheduler slice 6 (durable manual, interval,
+> and UTC five-field cron jobs with bounded retries, a bounded graceful
+> drain on host shutdown, and authenticated per-run cancellation) exist, but lifecycle
 > transitions and the operator CLI are still outstanding. Do not treat it as a
 > finished or production-ready product.
 
@@ -153,7 +153,7 @@ no retention or garbage collection yet, so history grows without bound.
 ### Jobs API (unstable)
 
 Scheduler slice 4 adds durable manual, interval, and UTC five-field cron jobs
-with bounded retries.
+with bounded retries; slice 6 adds authenticated per-run cancellation.
 Every route is bearer-authenticated. The job definition pins `module_id`,
 `version`, and `function`; dispatch always goes through the same pinned
 execution service as `POST /v1/modules/{module_id}/executions`, so activation,
@@ -190,6 +190,24 @@ still apply.
   newest first. A run records its stable state, timestamps, linked
   `execution_id`, worker outcome, or bounded scheduler failure code. No payload,
   stdout, or stderr is stored on the run.
+- `POST /v1/jobs/{job_id}/runs/{run_id}/cancel` accepts no body and returns
+  `202` with the run row. A `queued` run is terminalized in one transaction as
+  `failed`/`cancelled` with `finished_at` and no `execution_id`, so it is never
+  claimed and no history row is created. A `running` run gets `"cancel
+  requested"` through the executor's cancellation channel; the worker process
+  group is terminated and the normal dispatch path writes one `failed`/
+  `cancelled` terminal row with the real `execution_id` and history receipt.
+  Cancelled runs never retry. Cancellation is best-effort at the exchange
+  boundary: a cancel that races an execution which already produced its worker
+  outcome is accepted, but the already-decided outcome stands. Cancelling one
+  run does not change the job's
+  `enabled` flag or `next_run_at` and does not touch other runs. An unknown run
+  or a run addressed through another job is `404 run_not_found`; an already
+  terminal run, or a running row whose dispatch sender is not registered yet,
+  is `409 run_not_cancellable`. Invalid path identities are `400
+  invalid_job_id` or `400 invalid_run_id`; host-side store failures are a
+  generic `500`. The route returns `503 scheduler_unavailable` while the
+  scheduler is not running, matching the trigger lifecycle gate.
 
 Each scheduler tick enqueues at most one run for each enabled interval or cron
 job whose `next_run_at` is due, using `job_runs` with `trigger_kind="interval"`
@@ -243,10 +261,21 @@ HTTP serving stops before drain begins, and HTTP graceful shutdown is bounded
 at 30 s, so a worst-case host shutdown can take the sum of the two windows.
 Drain reuses `SchedulerState::Stopping` and adds no metric, route, state, or
 schema.
-Per-run cancellation (no cancel route, failure code, or worker cancellation
-channel) and replay of interrupted runs are still not implemented. In-flight
-run rows remain `running` after a crash until restart recovery marks them
-`interrupted`. There is no job/run retention yet, so terminal rows and job
+Slice 6 adds per-run cancellation without changing drain or stop. Queued
+cancellation is a single durable store transaction; running cancellation uses
+the executor cancellation channel rather than aborting the dispatch task, so
+the terminal row and history receipt are preserved. Cancellation is recorded as
+`failed` with outcome `cancelled`, not a first-class cancelled state or failure
+code; clients must read both fields. There is no durable pending-cancel marker,
+so a cancel that races the claim-to-sender registration returns `409
+run_not_cancellable` and the caller may retry. Cancellation during blocking
+preparation is observed only when the worker exchange starts; preparation
+itself is not interrupted. Queued cancellation creates no history row because
+no worker ran. Cancel is per run: queued retries of the same job are separate
+runs, and disable remains the job-level kill-switch. Drain and stop still do not
+cancel individual runs. Replay of interrupted runs is still not implemented:
+in-flight run rows remain `running` after a crash until restart recovery marks
+them `interrupted`. There is no job/run retention yet, so terminal rows and job
 payloads grow until a later retention slice. Distributed scheduling,
 timezone/DST selection, and retention are later slices.
 
@@ -432,8 +461,9 @@ included), output bounds, and staged-file tamper detection at resolve time.
   database, durable rejection sink), the worker execution library,
   activation/execution HTTP endpoints, and durable execution history are
   implemented. Manual, interval, and UTC five-field cron scheduler triggers,
-  bounded retries, and the bounded shutdown drain are implemented; per-run
-  cancellation and the operator CLI are not built yet — see
+  bounded retries, the bounded shutdown drain, and authenticated per-run
+  cancellation are implemented; the operator CLI and interrupted-run replay
+  are not built yet — see
   [Not built yet](docs/architecture.md#not-built-yet).
 - Specification: [`docs/architecture.md`](docs/architecture.md) describes the
   Rust system as built. `docs/storage-reconciliation.md` and

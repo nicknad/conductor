@@ -1,8 +1,9 @@
 # Architecture
 
 > Current as of the Rust rewrite. The scheduler supports manual, interval, and
-> UTC five-field cron triggers with bounded retries; an in-process plugin
-> runtime and a CLI are not built yet — see
+> UTC five-field cron triggers with bounded retries, a bounded shutdown drain,
+> and authenticated per-run cancellation; an in-process plugin runtime and a
+> CLI are not built yet — see
 > [Not built yet](#not-built-yet).
 
 Conductor is a single-machine job execution platform: operators upload signed
@@ -278,8 +279,8 @@ retries survive restart and dispatch when due. The loop owns scheduler
 readiness and emits job wait/queue/active metrics; due and retry enqueue move
 the queue gauge and log bounded counts. A loop panic or tick failure flips
 readiness false; in-flight run rows remain `running` until restart recovery
-marks them `interrupted`. Cron timezone/DST selection, cancellation,
-multi-process ownership, and retention are later slices.
+marks them `interrupted`. Cron timezone/DST selection, per-run cancellation
+(slice 6), multi-process ownership, and retention are later slices.
 
 ### Scheduler slice 5 (`control_plane::scheduler` shutdown drain)
 
@@ -308,10 +309,46 @@ share `SchedulerState::Stopping`; the slice adds no new scheduler state, route,
 metric, schema, or dependency.
 
 The drain bound is separate from HTTP graceful shutdown, so a worst-case host
-shutdown is the sum of the two windows. Per-run cancellation is still absent: no
-cancel route, cancellation failure code/state, or worker cancellation channel.
-Interrupted runs are still not replayed on startup, and a `SIGKILL` still
+shutdown is the sum of the two windows. Drain and stop do not cancel individual
+runs. Interrupted runs are still not replayed on startup, and a `SIGKILL` still
 leaves `running` rows for recovery.
+
+### Scheduler slice 6 (`control_plane::scheduler` per-run cancellation)
+
+`POST /v1/jobs/{job_id}/runs/{run_id}/cancel` is bearer-authenticated and takes
+no body. Both path identities use `is_safe_identity` and the existing
+job/run byte bounds. The store decides queued versus running in one immediate
+transaction: it reads the row by `run_id`, requires the stored `job_id` to
+match (a mismatch is reported as not found, so another job's run ids are not
+addressable), terminalizes a `queued` row as `failed`/`cancelled` with
+`finished_at`, and reports a `running` row without writing. A terminal row is
+reported as not cancellable; a missing row as not found. No schema value, state,
+or failure code is added.
+
+Queued cancellation requires a running scheduler, like the trigger route: a
+stopped scheduler returns `503 scheduler_unavailable`. Once accepted, it is
+durable: the row is never claimed, no worker runs, and no history row is
+created. Running cancellation removes the
+run's `oneshot::Sender<String>` from the service registry and sends the fixed
+reason `"cancel requested"`. The dispatch task remains the single writer of the
+terminal row: the executor terminates the worker process group and returns
+`ExecutionOutcome::Cancelled`, which the existing dispatch arm maps to
+`RunCompletion::worker_failure(execution_id, "cancelled")`. One history receipt
+is written and `is_retryable_completion` excludes it, so no retry is scheduled.
+The dispatch task is never aborted from the cancel path. Cancellation is
+best-effort at the exchange boundary: if the worker has already produced its
+outcome when the reason is sent, the already-decided outcome stands and the
+accepted request does not rewrite it.
+
+The sender registry is keyed by `run_id`. `fill_slots` registers the sender
+before spawning the dispatch task and moves an RAII guard into that task; the
+guard removes the entry on normal completion, panic, drain abort, or stop abort.
+There is no durable pending-cancel marker: a cancel that races the
+claim-to-registration gap returns `409 run_not_cancellable`, and the caller may
+retry. The method adds no metric, schema, job-run state, failure code, or route
+beyond the cancel path. Cancelling a run does not change the job's `enabled`
+flag or `next_run_at` and does not touch other runs. Drain and stop keep their
+existing semantics and do not cancel runs.
 
 ### Execution history (`executions::history`)
 
@@ -411,20 +448,25 @@ cannot false-503 under probe flood. Readiness is not a write/disk-full proof.
 
 ## Not built yet
 
-Manual, interval, and UTC five-field cron triggering plus bounded retries and
-the bounded shutdown drain are implemented in slices 4 and 5. Per-run
-cancellation, replay of interrupted runs, distributed scheduling, CLI, artifact
-GC, and execution-history retention/GC remain. Scheduler slice 4 provides durable
-manual, interval, and cron jobs, retries with deterministic backoff, due
-enqueue for both scheduled kinds, a single-process dispatcher, readiness, and
-job metrics. Slice 5 bounds host shutdown: already-claimed runs finish up to
-`drain_timeout` (30 s default), then remaining dispatch tasks are aborted and
-their rows stay `running` for startup recovery. The retry policy is global, not
-per job, and has no API or CLI surface. Cron is UTC only; there is no
-timezone/DST selection, seconds/7-field syntax, macros, names, or
-`?`/`L`/`W`/`#` extensions. Startup reconciliation is classify-only: it sets
-`ok`/`missing`/`mismatch` but does not repair artifacts or detect orphans,
-and it does not yet record `reconciliation_runs`.
+Manual, interval, and UTC five-field cron triggering plus bounded retries, the
+bounded shutdown drain, and authenticated per-run cancellation are implemented
+in slices 4, 5, and 6. Replay of interrupted runs, distributed scheduling, CLI,
+artifact GC, and execution-history retention/GC remain. Scheduler slice 4
+provides durable manual, interval, and cron jobs, retries with deterministic
+backoff, due enqueue for both scheduled kinds, a single-process dispatcher,
+readiness, and job metrics. Slice 5 bounds host shutdown: already-claimed runs
+finish up to `drain_timeout` (30 s default), then remaining dispatch tasks are
+aborted and their rows stay `running` for startup recovery. Slice 6 cancels one
+queued or running run on request: a queued row terminalizes immediately; a
+running row uses the executor cancellation channel so the worker group is
+terminated and the normal terminal write plus history receipt are preserved.
+Cancelled runs are `failed`/`cancelled`, never retried, and there is no
+first-class cancelled state. The retry policy is global, not per job, and has no
+API or CLI surface. Cron is UTC only; there is no timezone/DST selection,
+seconds/7-field syntax, macros, names, or `?`/`L`/`W`/`#` extensions. Startup
+reconciliation is classify-only: it sets `ok`/`missing`/`mismatch` but does not
+repair artifacts or detect orphans, and it does not yet record
+`reconciliation_runs`.
 `control_plane/lifecycle.rs` is currently a placeholder for
 deactivate/remove/rollback transitions. Leftover quarantine/staging sweeps
 and classify-only startup reconciliation already run at startup. See

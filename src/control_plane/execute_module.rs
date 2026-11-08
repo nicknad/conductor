@@ -63,7 +63,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use thiserror::Error;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
 use crate::control_plane::activate_module::{
     activate, activate_active, ActivatedModule, ActivationError, ActivationPolicy,
@@ -502,8 +502,9 @@ impl ExecutionService {
     /// A bounded permit is acquired before any work and held until the
     /// worker finishes (or preparation fails). In-flight capacity exhaustion
     /// is a fail-fast [`ExecutionError::Overloaded`], never an unbounded
-    /// queue. All integrity work happens before [`WorkerExecutor::execute`]
-    /// is called: deadline ceiling, activation policy, record lookup, signer
+    /// queue. All integrity work happens before
+    /// [`WorkerExecutor::execute_cancellable`] is called: deadline ceiling,
+    /// activation policy, record lookup, signer
     /// allowlist, artifact path canonicalization/confinement, size/digest,
     /// stored and archive manifest agreement, extraction, and entrypoint
     /// resolution. Any failure is a typed error and no worker is spawned.
@@ -515,8 +516,40 @@ impl ExecutionService {
         configuration: serde_json::Value,
         deadline: Duration,
     ) -> Result<ExecutionReceipt, ExecutionError> {
+        self.execute_cancellable(
+            module_id,
+            pinned_version,
+            function,
+            configuration,
+            deadline,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`execute`](Self::execute), with an optional cancellation channel.
+    /// A value sent on `cancel` terminates the worker and yields an
+    /// [`ExecutionOutcome::Cancelled`] receipt; dropping the sender cancels
+    /// nothing. The refusal/integrity metrics stay here so both entry points
+    /// classify errors exactly once.
+    pub async fn execute_cancellable(
+        &self,
+        module_id: &str,
+        pinned_version: Option<&str>,
+        function: &str,
+        configuration: serde_json::Value,
+        deadline: Duration,
+        cancel: Option<oneshot::Receiver<String>>,
+    ) -> Result<ExecutionReceipt, ExecutionError> {
         let result = self
-            .execute_inner(module_id, pinned_version, function, configuration, deadline)
+            .execute_inner(
+                module_id,
+                pinned_version,
+                function,
+                configuration,
+                deadline,
+                cancel,
+            )
             .await;
         if let Err(error) = &result {
             if let Some(reason) = classify_refusal(error) {
@@ -536,6 +569,7 @@ impl ExecutionService {
         function: &str,
         configuration: serde_json::Value,
         deadline: Duration,
+        cancel: Option<oneshot::Receiver<String>>,
     ) -> Result<ExecutionReceipt, ExecutionError> {
         if deadline > self.max_deadline {
             return Err(ExecutionError::DeadlineExceeded {
@@ -614,7 +648,7 @@ impl ExecutionService {
         );
         let started_at = SystemTime::now();
         let report = WorkerExecutor::new(self.limits)
-            .execute(&target, request)
+            .execute_cancellable(&target, request, cancel)
             .await?;
         let finished_at = SystemTime::now();
 

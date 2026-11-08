@@ -2576,3 +2576,55 @@ async fn execution_service_rejects_unusable_storage_directories() {
         other => panic!("expected a storage-directory refusal, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn cancellable_execution_records_one_cancelled_receipt_and_releases_capacity() {
+    let scratch = Scratch::new("execute-cancel");
+    let fixture = fixture(&scratch, MODULE_ID, VERSION, "#!/bin/sh\nsleep 60\n");
+    let history =
+        Arc::new(ExecutionHistoryStore::open_in_memory().expect("execution history must open"));
+    let service = fixture
+        .try_service_with_history(
+            Arc::clone(&fixture.active_registry(fixture.record())),
+            Duration::from_secs(30),
+            HashSet::from(["k1".to_owned()]),
+            1,
+            PackageValidationPolicy::production(),
+            Arc::clone(&history),
+        )
+        .expect("execution service must build");
+
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = sender.send("operator requested stop".to_owned());
+    });
+    let started = Instant::now();
+    let receipt = service
+        .execute_cancellable(
+            MODULE_ID,
+            None,
+            "run",
+            serde_json::json!({}),
+            Duration::from_secs(10),
+            Some(receiver),
+        )
+        .await
+        .expect("host side must succeed");
+    assert!(matches!(
+        receipt.outcome,
+        ExecutionOutcome::Cancelled { .. }
+    ));
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    let rows = history.list(10, 0).expect("history must read");
+    assert_eq!(rows.len(), 1, "one completed execution writes one receipt");
+    assert_eq!(rows[0].execution_id, receipt.execution_id);
+    assert_eq!(rows[0].outcome, "cancelled");
+
+    let error = refused_execution(&service, "missing-module").await;
+    assert!(
+        !matches!(error, ExecutionError::Overloaded { .. }),
+        "cancellation must release the execution permit: {error:?}"
+    );
+}

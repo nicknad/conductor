@@ -2,7 +2,8 @@
 //!
 //! The scheduler is a control-plane component: it sequences work but never
 //! executes it directly. Dispatch goes through [`dispatch::ExecutionDispatcher`],
-//! which exposes only a pinned `ExecutionService::execute` call.
+//! which exposes only pinned `ExecutionService::execute` and
+//! `execute_cancellable` calls.
 
 pub mod dispatch;
 pub mod job;
@@ -17,5 +18,7 @@ pub use job::{
     ClaimedRun, JobDefinition, JobFailureCode, JobRun, JobRunState, NewJob, RunCompletion, Trigger,
     TriggerKind,
 };
-pub use service::{SchedulerConfig, SchedulerError, SchedulerService, SchedulerState};
+pub use service::{
+    CancelResult, SchedulerConfig, SchedulerError, SchedulerService, SchedulerState,
+};
 pub use store::{EnableResult, JobStore, JobStoreError, JobStoreLimits, RecoveryReport};

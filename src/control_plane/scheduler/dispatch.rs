@@ -7,6 +7,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::oneshot;
+
 use crate::control_plane::execute_module::{ExecutionError, ExecutionReceipt, ExecutionService};
 
 /// Pinned execution adapter used by the scheduler.
@@ -38,8 +40,31 @@ impl ExecutionDispatcher {
         configuration: serde_json::Value,
         deadline: Duration,
     ) -> Result<ExecutionReceipt, ExecutionError> {
+        self.execute_cancellable(module_id, version, function, configuration, deadline, None)
+            .await
+    }
+
+    /// Like [`execute`](Self::execute), with an optional worker cancellation
+    /// channel. The version pin is always explicit; a value sent on `cancel`
+    /// terminates the worker and is reported as a cancelled receipt.
+    pub async fn execute_cancellable(
+        &self,
+        module_id: &str,
+        version: &str,
+        function: &str,
+        configuration: serde_json::Value,
+        deadline: Duration,
+        cancel: Option<oneshot::Receiver<String>>,
+    ) -> Result<ExecutionReceipt, ExecutionError> {
         self.service
-            .execute(module_id, Some(version), function, configuration, deadline)
+            .execute_cancellable(
+                module_id,
+                Some(version),
+                function,
+                configuration,
+                deadline,
+                cancel,
+            )
             .await
     }
 }

@@ -458,6 +458,36 @@ paths:
           description: Job not found (`job_not_found`).
         "500":
           description: Run read failure; generic body only.
+  /v1/jobs/{job_id}/runs/{run_id}/cancel:
+    post:
+      operationId: cancelJobRun
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "202":
+          description: >-
+            Cancellation accepted. A queued run is already terminal
+            (`state=failed`, `outcome=cancelled`, no `execution_id`); a running
+            run's worker was asked to stop and its terminal row follows.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobRun"
+        "400":
+          description: Invalid job or run identity (`invalid_job_id` or `invalid_run_id`).
+        "401":
+          description: Missing or invalid bearer token.
+        "404":
+          description: Run not found for that job (`run_not_found`).
+        "409":
+          description: Run is already terminal or cannot accept a cancel (`run_not_cancellable`).
+        "503":
+          description: Scheduler is not running (`scheduler_unavailable`).
+        "500":
+          description: Store failure; generic body only.
 components:
   parameters:
     JobId:
@@ -468,8 +498,72 @@ components:
         type: string
         minLength: 1
         maxLength: 128
-        pattern: "^[A-Za-z0-9._+-]+$"
+        pattern: "^[A-Za-z0-9_+-](?:[A-Za-z0-9._+-]{0,126}[A-Za-z0-9_+-])?$"
+    RunId:
+      name: run_id
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: "^[A-Za-z0-9_+-](?:[A-Za-z0-9._+-]{0,126}[A-Za-z0-9_+-])?$"
   schemas:
+    JobRun:
+      type: object
+      required:
+        - run_id
+        - job_id
+        - attempt
+        - trigger
+        - state
+        - scheduled_for_ms
+        - created_at_ms
+      properties:
+        run_id:
+          type: string
+        job_id:
+          type: string
+        attempt:
+          type: integer
+          minimum: 1
+        trigger:
+          type: string
+          enum: [manual, interval, cron]
+        state:
+          type: string
+          enum: [queued, running, succeeded, failed, refused, interrupted]
+        scheduled_for_ms:
+          type: integer
+          format: int64
+        created_at_ms:
+          type: integer
+          format: int64
+        started_at_ms:
+          type: integer
+          format: int64
+          nullable: true
+        finished_at_ms:
+          type: integer
+          format: int64
+          nullable: true
+        execution_id:
+          type: string
+          nullable: true
+        outcome:
+          type: string
+          nullable: true
+          enum:
+            - succeeded
+            - failed
+            - timed_out
+            - cancelled
+            - worker_error
+            - protocol_violation
+            - null
+        failure_code:
+          type: string
+          nullable: true
     ExecutionRecord:
       type: object
       required:

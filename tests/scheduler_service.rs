@@ -15,8 +15,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use conductor::control_plane::activate_module::ActivationPolicy;
 use conductor::control_plane::execute_module::ExecutionService;
 use conductor::control_plane::scheduler::{
-    JobFailureCode, JobRun, JobRunState, NewJob, SchedulerConfig, SchedulerError, SchedulerService,
-    SchedulerState, Trigger, TriggerKind,
+    CancelResult, JobFailureCode, JobRun, JobRunState, NewJob, SchedulerConfig, SchedulerError,
+    SchedulerService, SchedulerState, Trigger, TriggerKind,
 };
 use conductor::executions::executor::ExecutionLimits;
 use conductor::executions::history::ExecutionHistoryStore;
@@ -195,6 +195,8 @@ const RETRY_BACKOFF: Duration = Duration::from_secs(30);
 const TRANSIENT_FAILURE_SCRIPT: &str = "#!/bin/sh\nread -r line\nprintf '{\"protocol_version\":1,\"status\":\"failed\",\"message\":\"transient\"}\\n'\n";
 const DRAIN_MODULE_ID: &str = "drain-worker";
 const DRAIN_VERSION: &str = "1.0.0";
+const CANCEL_MODULE_ID: &str = "cancel-worker";
+const CANCEL_VERSION: &str = "1.0.0";
 
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256DigestProvider
@@ -320,6 +322,29 @@ fn build_drain_scheduler(
         &artifact_dir,
         DRAIN_MODULE_ID,
         DRAIN_VERSION,
+        &script,
+    );
+    (scheduler, scratch)
+}
+
+fn build_cancel_scheduler(
+    metrics: Arc<Metrics>,
+    readiness: Arc<Readiness>,
+    tag: &str,
+    max_concurrent_runs: usize,
+) -> (Arc<SchedulerService>, Scratch) {
+    let config = SchedulerConfig {
+        max_concurrent_runs,
+        ..SchedulerConfig::default()
+    };
+    let (scheduler, scratch, registry, artifact_dir) =
+        build_scheduler_with_config(metrics, readiness, tag, config);
+    let script = slow_success_script("5");
+    install_package(
+        &registry,
+        &artifact_dir,
+        CANCEL_MODULE_ID,
+        CANCEL_VERSION,
         &script,
     );
     (scheduler, scratch)
@@ -1337,4 +1362,168 @@ async fn drain_is_a_noop_before_start_and_safe_to_repeat() {
     scheduler.drain().await;
     assert_eq!(scheduler.state(), SchedulerState::Stopping);
     assert!(!readiness.is_ready());
+}
+
+#[tokio::test]
+async fn cancelling_a_queued_run_terminalizes_it_without_dispatch() {
+    let (metrics, _exporter) = capture(MetricsOptions::default());
+    let readiness = Arc::new(Readiness::new(true));
+    let (scheduler, _scratch) = build_scheduler_with_capacity(
+        Arc::clone(&metrics),
+        Arc::clone(&readiness),
+        "cancel-queued",
+        0,
+    );
+    scheduler
+        .create_job(manual_job("job-cancel", "missing-module"))
+        .await
+        .expect("create job");
+    scheduler.start().await.expect("start");
+    let queued = scheduler
+        .enqueue_manual("job-cancel")
+        .await
+        .expect("enqueue");
+    let job_before = scheduler
+        .get_job("job-cancel")
+        .await
+        .expect("get")
+        .expect("exists");
+
+    let result = scheduler
+        .cancel_run("job-cancel", &queued.run_id)
+        .await
+        .expect("cancel");
+    let CancelResult::Queued(cancelled) = result else {
+        panic!("expected a queued cancellation, got {result:?}");
+    };
+    assert_eq!(cancelled.state, JobRunState::Failed);
+    assert_eq!(cancelled.outcome.as_deref(), Some("cancelled"));
+    assert!(cancelled.finished_at.is_some());
+    assert!(cancelled.execution_id.is_none());
+
+    let runs = scheduler
+        .list_runs("job-cancel", 10, 0)
+        .await
+        .expect("runs");
+    assert_eq!(runs.len(), 1, "a cancelled run must not enqueue a retry");
+    assert_eq!(runs[0].state, JobRunState::Failed);
+    assert_eq!(runs[0].outcome.as_deref(), Some("cancelled"));
+
+    let job_after = scheduler
+        .get_job("job-cancel")
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(job_after.enabled, job_before.enabled);
+    assert_eq!(job_after.next_run_at, job_before.next_run_at);
+    assert!(matches!(
+        scheduler.cancel_run("job-cancel", &queued.run_id).await,
+        Err(SchedulerError::RunNotCancellable)
+    ));
+    scheduler.stop().await;
+}
+
+#[tokio::test]
+async fn cancelling_a_running_run_terminates_the_worker_and_records_cancelled() {
+    let (metrics, _exporter) = capture(MetricsOptions::default());
+    let readiness = Arc::new(Readiness::new(true));
+    let (scheduler, _scratch) = build_cancel_scheduler(
+        Arc::clone(&metrics),
+        Arc::clone(&readiness),
+        "cancel-running",
+        1,
+    );
+    scheduler
+        .create_job(manual_job("job-cancel", CANCEL_MODULE_ID))
+        .await
+        .expect("create job");
+    scheduler
+        .enqueue_manual("job-cancel")
+        .await
+        .expect("enqueue");
+    let job_before = scheduler
+        .get_job("job-cancel")
+        .await
+        .expect("get")
+        .expect("exists");
+    scheduler.start().await.expect("start");
+
+    let running = wait_for_run_state(&scheduler, "job-cancel", JobRunState::Running).await;
+    let result = scheduler
+        .cancel_run("job-cancel", &running.run_id)
+        .await
+        .expect("cancel");
+    let CancelResult::Running(snapshot) = result else {
+        panic!("expected a running cancellation, got {result:?}");
+    };
+    assert_eq!(snapshot.run_id, running.run_id);
+    assert!(
+        matches!(snapshot.state, JobRunState::Running | JobRunState::Failed),
+        "the accepted cancel returns the current row, got {:?}",
+        snapshot.state
+    );
+
+    let finished = wait_for_run_state(&scheduler, "job-cancel", JobRunState::Failed).await;
+    assert_eq!(finished.run_id, running.run_id);
+    assert_eq!(finished.outcome.as_deref(), Some("cancelled"));
+    assert!(
+        finished.execution_id.is_some(),
+        "a cancelled worker must still write its execution receipt"
+    );
+    let runs = scheduler
+        .list_runs("job-cancel", 10, 0)
+        .await
+        .expect("runs");
+    assert_eq!(runs.len(), 1, "a cancelled run must not enqueue a retry");
+
+    let job_after = scheduler
+        .get_job("job-cancel")
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(job_after.enabled, job_before.enabled);
+    assert_eq!(job_after.next_run_at, job_before.next_run_at);
+    scheduler.stop().await;
+}
+
+#[tokio::test]
+async fn cancelling_an_unknown_or_terminal_run_is_rejected() {
+    let (metrics, _exporter) = capture(MetricsOptions::default());
+    let readiness = Arc::new(Readiness::new(true));
+    let (scheduler, _scratch) = build_scheduler(
+        Arc::clone(&metrics),
+        Arc::clone(&readiness),
+        "cancel-rejected",
+    );
+    scheduler
+        .create_job(manual_job("job-cancel", "missing-module"))
+        .await
+        .expect("create job");
+    scheduler
+        .create_job(manual_job("job-other", "missing-module"))
+        .await
+        .expect("create other job");
+    scheduler.start().await.expect("start");
+    scheduler
+        .enqueue_manual("job-cancel")
+        .await
+        .expect("enqueue");
+    let terminal = wait_for_run_state(&scheduler, "job-cancel", JobRunState::Refused).await;
+
+    assert!(matches!(
+        scheduler.cancel_run("job-cancel", &terminal.run_id).await,
+        Err(SchedulerError::RunNotCancellable)
+    ));
+    assert!(matches!(
+        scheduler.cancel_run("job-cancel", "missing-run").await,
+        Err(SchedulerError::RunNotFound)
+    ));
+    assert!(
+        matches!(
+            scheduler.cancel_run("job-other", &terminal.run_id).await,
+            Err(SchedulerError::RunNotFound)
+        ),
+        "a run must not be addressable through another job"
+    );
+    scheduler.stop().await;
 }

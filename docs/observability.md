@@ -120,7 +120,18 @@ already-claimed runs. The loop logs one info event with `completed` and
 window writes its normal terminal row; a run still executing at the deadline is
 aborted and its row stays `running` until startup recovery marks it
 `interrupted`. Queued rows stay `queued` for the next start. This is
-host-lifecycle behavior only: there is no per-run cancellation metric or route.
+host-lifecycle behavior only.
+
+Scheduler slice 6 adds the authenticated cancel route but no metric, label, or
+`/metrics` surface. The route follows the trigger lifecycle gate and returns
+`scheduler_unavailable` while the scheduler is not running. A queued cancel
+moves `conductor.job.queue.depth` down once through the existing
+`job_terminalized_queued` path. A running cancel sends
+through the executor channel; the worker reports `cancelled`, so the existing
+`conductor.execution.completed{outcome="cancelled"}` and the dispatch finish log
+are the observable signals. There is no cancel-specific counter, no history row
+for a queued cancel, and no new run state or code: clients read `state=failed`
+and `outcome=cancelled` on `GET /v1/jobs/{job_id}/runs`.
 
 After your backend normalizes OTLP names, useful queries are conceptually:
 
@@ -220,6 +231,8 @@ worker-provided failure text.
 | A manual job ran | `202` trigger + `job_runs.state=succeeded` + matching `executions` row + `conductor.job.wait.duration` | Trigger, poll `/v1/jobs/{id}/runs`, SQL, metric backend | Run rows store no payload/stdout/stderr; at-most-once |
 | An interval job ran | one `job_runs` row with `trigger_kind=interval` and `scheduled_for=next_run_at`, then a matching `executions` row, plus `conductor.job.queue.depth` movement | Create interval job, wait for the boundary, poll `/v1/jobs/{id}/runs`, SQL, metric backend | Restart catch-up enqueues at most one missed run, not a burst |
 | A cron job ran | one `job_runs` row with `trigger_kind=cron` and `scheduled_for=next_run_at`, then a matching `executions` row, plus `conductor.job.queue.depth` movement and the due-pass debug counts | Create cron job, wait for the UTC boundary, poll `/v1/jobs/{id}/runs`, SQL, debug log, metric backend | Catch-up enqueues at most one missed occurrence; tampered or impossible rows are skipped and counted |
+| A queued run was cancelled | `202` cancel + one `job_runs` row with `state=failed`, `outcome=cancelled`, `finished_at`, no `execution_id`, no `executions` row, and no retry row | Trigger, cancel before claim, poll runs and SQL | There is no durable pending-cancel marker; a claim race returns `409 run_not_cancellable` |
+| A running run was cancelled | `202` cancel + eventual `state=failed`, `outcome=cancelled`, real `execution_id`, one `executions` row with `outcome=cancelled`, and `conductor.execution.completed{outcome="cancelled"}` | Trigger a slow worker, cancel while running, poll runs, SQL, metric backend | Cancellation during blocking preparation is observed when the worker exchange starts; a cancel racing an already-decided worker outcome leaves that outcome in place |
 | An artifact is damaged | `conductor.artifact.integrity.failures{kind}` + activation/execution refusal | Activate/execute, then metric backend and SQL | `ok` means bytes match the row, not safe-to-execute |
 | Startup reconciliation ran | `artifact reconciliation complete scanned=...` log + `integrity_state` rows | Startup log and SQL | No reconciliation metric or readiness signal yet |
 | Execution capacity is saturated | `slots.in_use` vs `slots.capacity`, `overload` | Metric backend | No per-module labels |
@@ -308,7 +321,8 @@ Do **not** use `/readyz` as proof that reconciliation found healthy artifacts.
 | Bounded metric labels | Module/version/execution diagnosis is via logs/SQL, not metrics |
 | No retention/GC for rejections, history, or job runs | All three grow without bound; queue/job counts are capped but terminal `job_runs` are not |
 | No cron, retry, or due-enqueue scheduler metrics | Slice 4 emits job wait/queue/active signals and debug counts for due enqueue (enqueued, deduped, skipped-full, skipped-invalid) and retry skips, but no counter for cron lag, retries, or skipped rows |
-| No scheduler drain metric | Slice 5 logs bounded `completed`/`remaining` dispatch counts and reuses readiness; there is no drain histogram/counter, and there is still no per-run cancellation |
+| No scheduler drain metric | Slice 5 logs bounded `completed`/`remaining` dispatch counts and reuses readiness; there is no drain histogram/counter |
+| No per-run cancellation metric | Slice 6 reuses the job queue gauge and `conductor.execution.completed{outcome="cancelled"}`; a queued cancel has no history row and there is no cancel-specific counter or pending-cancel state |
 | `Readiness::new` defaults the scheduler flag true for fixtures | A direct `Host::into_state()` embedder that never starts the scheduler can report `/readyz` 200; triggers still return `scheduler_unavailable` |
 | Metrics are ephemeral | No durable metrics store; SQLite is the durable authority |
 

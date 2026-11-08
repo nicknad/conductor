@@ -18,7 +18,7 @@ use crate::api::errors::ApiError;
 use crate::api::uploads::{request_id, AppState};
 use crate::control_plane::scheduler::job::{
     next_job_id, next_run_at, validate_payload, JobDefinition, JobFailureCode, JobRun, NewJob,
-    Trigger, MAX_INTERVAL_SECS, MAX_JOB_ID_BYTES, MIN_INTERVAL_SECS,
+    Trigger, MAX_INTERVAL_SECS, MAX_JOB_ID_BYTES, MAX_RUN_ID_BYTES, MIN_INTERVAL_SECS,
 };
 use crate::control_plane::scheduler::service::SchedulerError;
 use crate::control_plane::scheduler::store::JobStoreError;
@@ -294,6 +294,28 @@ pub async fn get_job_runs(
     }
 }
 
+/// Cancels one queued or running run and returns its current row.
+#[tracing::instrument(name = "cancel_job_run", skip(state, headers))]
+pub async fn post_cancel_run(
+    State(state): State<AppState>,
+    path: Result<Path<(String, String)>, PathRejection>,
+    headers: HeaderMap,
+) -> Response {
+    let id = request_id(&headers);
+    let (job_id, run_id) = match run_path(path) {
+        Ok(ids) => ids,
+        Err(api) => return refuse(&id, api),
+    };
+    match state.scheduler.cancel_run(&job_id, &run_id).await {
+        Ok(result) => (
+            StatusCode::ACCEPTED,
+            Json(RunResponse::from(result.into_run())),
+        )
+            .into_response(),
+        Err(error) => refuse(&id, scheduler_error(error)),
+    }
+}
+
 fn validate_create(request: &CreateJobRequest) -> Result<(), ApiError> {
     validate_identity_field("module_id", &request.module_id)?;
     validate_identity_field("version", &request.version)?;
@@ -342,6 +364,23 @@ fn job_id_path(path: Result<Path<String>, PathRejection>) -> Result<String, ApiE
 
 fn invalid_job_id() -> ApiError {
     ApiError::BadRequest("invalid_job_id", "job id is not valid".to_owned())
+}
+
+fn run_path(
+    path: Result<Path<(String, String)>, PathRejection>,
+) -> Result<(String, String), ApiError> {
+    let Path((job_id, run_id)) = path.map_err(|_| invalid_job_id())?;
+    if !is_safe_identity(&job_id) || job_id.len() > MAX_JOB_ID_BYTES {
+        return Err(invalid_job_id());
+    }
+    if !is_safe_identity(&run_id) || run_id.len() > MAX_RUN_ID_BYTES {
+        return Err(invalid_run_id());
+    }
+    Ok((job_id, run_id))
+}
+
+fn invalid_run_id() -> ApiError {
+    ApiError::BadRequest("invalid_run_id", "run id is not valid".to_owned())
 }
 
 fn job_not_found() -> ApiError {
@@ -399,6 +438,12 @@ fn scheduler_error(error: SchedulerError) -> ApiError {
             "scheduler_unavailable",
             "scheduler is not available".to_owned(),
         ),
+        SchedulerError::RunNotFound => {
+            ApiError::NotFound("run_not_found", "run was not found".to_owned())
+        }
+        SchedulerError::RunNotCancellable => {
+            ApiError::Conflict("run_not_cancellable", "run cannot be cancelled".to_owned())
+        }
         SchedulerError::Store(JobStoreError::Storage(_)) | SchedulerError::Task(_) => {
             ApiError::Internal("scheduler host failure".to_owned())
         }

@@ -76,6 +76,15 @@ pub struct EnableResult {
     pub cancelled_queued: usize,
 }
 
+/// Outcome of one per-run cancellation request.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum RunCancel {
+    Queued(JobRun),
+    Running,
+    Terminal(JobRun),
+    NotFound,
+}
+
 /// Startup recovery counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
@@ -514,6 +523,26 @@ impl JobStore {
         })
     }
 
+    /// Reads one run scoped to its job. A run that belongs to a different job
+    /// is reported as absent so callers cannot probe another job's run ids.
+    pub(crate) fn get_run(
+        &self,
+        job_id: &str,
+        run_id: &str,
+    ) -> Result<Option<JobRun>, JobStoreError> {
+        self.database.with_connection(|conn| {
+            let run = conn
+                .query_row(
+                    &format!("{SELECT_RUN} WHERE run_id = ?1"),
+                    params![run_id],
+                    row_to_run,
+                )
+                .optional()
+                .map_err(JobStoreError::from)?;
+            Ok(run.filter(|run| run.job_id == job_id))
+        })
+    }
+
     /// Claims the oldest queued run from an enabled job. The claim and the
     /// queue-state transition are one immediate transaction.
     pub fn claim_next_run(
@@ -588,6 +617,43 @@ impl JobStore {
         })
     }
 
+    /// Decision for one per-run cancel request. A queued row is terminalized
+    /// atomically; a running row is reported without a write so the dispatch
+    /// task stays the single owner of the terminal completion.
+    pub(crate) fn request_run_cancel(
+        &self,
+        job_id: &str,
+        run_id: &str,
+        now: SystemTime,
+    ) -> Result<RunCancel, JobStoreError> {
+        self.database.with_write_tx(|tx| {
+            let Some(run) = get_run_tx(tx, run_id)? else {
+                return Ok(RunCancel::NotFound);
+            };
+            if run.job_id != job_id {
+                return Ok(RunCancel::NotFound);
+            }
+            match run.state {
+                JobRunState::Queued => {
+                    let updated = tx.execute(
+                        "UPDATE job_runs SET state = 'failed', outcome = 'cancelled', \
+                         finished_at = ?1 WHERE run_id = ?2 AND job_id = ?3 AND state = 'queued'",
+                        params![to_millis(now), run_id, job_id],
+                    )?;
+                    if updated == 0 {
+                        return Ok(RunCancel::NotFound);
+                    }
+                    let cancelled = get_run_tx(tx, run_id)?.ok_or_else(|| {
+                        JobStoreError::InvalidRun(format!("cancelled run {run_id} disappeared"))
+                    })?;
+                    Ok(RunCancel::Queued(cancelled))
+                }
+                JobRunState::Running => Ok(RunCancel::Running),
+                _ => Ok(RunCancel::Terminal(run)),
+            }
+        })
+    }
+
     /// Startup recovery: running rows become interrupted and queued rows for
     /// disabled jobs become refused. No worker is replayed.
     pub fn recover_startup(&self, now: SystemTime) -> Result<RecoveryReport, JobStoreError> {
@@ -656,6 +722,15 @@ fn get_job_tx(
         &format!("{SELECT_JOB} WHERE job_id = ?1"),
         params![job_id],
         row_to_job,
+    )
+    .optional()
+}
+
+fn get_run_tx(tx: &rusqlite::Transaction<'_>, run_id: &str) -> rusqlite::Result<Option<JobRun>> {
+    tx.query_row(
+        &format!("{SELECT_RUN} WHERE run_id = ?1"),
+        params![run_id],
+        row_to_run,
     )
     .optional()
 }
@@ -1910,5 +1985,111 @@ mod tests {
             .expect("claim manual")
             .expect("manual due");
         assert_eq!(manual.run.trigger, TriggerKind::Manual);
+    }
+
+    #[test]
+    fn cancelling_a_queued_run_terminalizes_it_without_a_claim() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        store.create_job(new_job("job-1", true)).expect("create");
+        let run = store
+            .enqueue_manual_run("job-1", at(2_000))
+            .expect("enqueue");
+
+        let cancelled = store
+            .request_run_cancel("job-1", &run.run_id, at(3_000))
+            .expect("cancel");
+        let RunCancel::Queued(updated) = cancelled else {
+            panic!("expected a queued cancellation, got {cancelled:?}");
+        };
+        assert_eq!(updated.state, JobRunState::Failed);
+        assert_eq!(updated.outcome.as_deref(), Some("cancelled"));
+        assert_eq!(updated.finished_at, Some(at(3_000)));
+        assert!(updated.execution_id.is_none());
+
+        assert!(
+            store
+                .claim_next_run("owner-1", at(4_000), Duration::from_secs(30))
+                .expect("claim")
+                .is_none(),
+            "a cancelled queued run must not be claimable"
+        );
+        assert_eq!(
+            store.get_run("job-1", &run.run_id).expect("get"),
+            Some(updated)
+        );
+        let job = store.get_job("job-1").expect("get job").expect("exists");
+        assert!(job.enabled, "cancelling a run must not disable the job");
+    }
+
+    #[test]
+    fn cancelling_a_running_run_reports_running_without_mutation() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        store.create_job(new_job("job-1", true)).expect("create");
+        let run = store
+            .enqueue_manual_run("job-1", at(2_000))
+            .expect("enqueue");
+        store
+            .claim_next_run("owner-1", at(2_500), Duration::from_secs(30))
+            .expect("claim")
+            .expect("run");
+        let before = store
+            .get_run("job-1", &run.run_id)
+            .expect("get")
+            .expect("exists");
+
+        assert_eq!(
+            store
+                .request_run_cancel("job-1", &run.run_id, at(3_000))
+                .expect("cancel"),
+            RunCancel::Running
+        );
+        assert_eq!(
+            store.get_run("job-1", &run.run_id).expect("get"),
+            Some(before),
+            "the running row must be left for the dispatch task to finish"
+        );
+    }
+
+    #[test]
+    fn cancel_requires_matching_job_and_rejects_terminal_or_missing_runs() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        store.create_job(new_job("job-1", true)).expect("create");
+        store.create_job(new_job("job-2", true)).expect("create");
+        let run = store
+            .enqueue_manual_run("job-1", at(2_000))
+            .expect("enqueue");
+        let claimed = store
+            .claim_next_run("owner-1", at(2_500), Duration::from_secs(30))
+            .expect("claim")
+            .expect("run");
+        store
+            .finish_run(
+                &claimed.run.run_id,
+                &RunCompletion::succeeded("exec-1".to_owned()),
+                at(3_000),
+            )
+            .expect("finish");
+
+        assert_eq!(
+            store
+                .request_run_cancel("job-2", &run.run_id, at(4_000))
+                .expect("wrong job"),
+            RunCancel::NotFound,
+            "a run must not be addressable through another job"
+        );
+        assert_eq!(
+            store
+                .request_run_cancel("job-1", "missing-run", at(4_000))
+                .expect("missing run"),
+            RunCancel::NotFound
+        );
+        let terminal = store
+            .request_run_cancel("job-1", &run.run_id, at(4_000))
+            .expect("terminal");
+        let RunCancel::Terminal(row) = terminal else {
+            panic!("expected a terminal row, got {terminal:?}");
+        };
+        assert_eq!(row.state, JobRunState::Succeeded);
+        assert_eq!(row.execution_id.as_deref(), Some("exec-1"));
     }
 }
