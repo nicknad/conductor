@@ -1,7 +1,7 @@
 # Next session context
 
 Upload, validation, persistence, activation, execution, history, metrics,
-readiness, classify-only startup reconciliation, and Scheduler slices 1-4 are
+readiness, classify-only startup reconciliation, and Scheduler slices 1-5 are
 implemented. Slice 1 added durable manual jobs, manual triggers, queue/dispatch,
 recovery, and job metrics. Slice 2 added bounded interval triggers, durable
 `next_run_at` scheduling, due-tick enqueue with duplicate-tick protection,
@@ -11,16 +11,20 @@ enqueue, duplicate-tick protection, restart catch-up, defensive tamper
 skipping, and the existing pinned dispatcher. Slice 4 added global bounded
 retries for worker-reported transient failures: durable `attempt_no+1` rows,
 deterministic exponential backoff, claim gating on `scheduled_for <= now`, the
-shared queue bound, and the disable kill-switch.
+shared queue bound, and the disable kill-switch. Slice 5 added a bounded
+graceful drain: host shutdown stops new claims, clears readiness, waits up to
+`SchedulerConfig::drain_timeout` for already-claimed dispatch tasks, then aborts
+the remainder while queued rows survive for the next start.
 
-## Recommended: Scheduler slice 5 (graceful drain on shutdown)
+## Recommended: Scheduler slice 6 (per-run cancellation)
 
-Start with [handover-scheduler-slice-5.md](handover-scheduler-slice-5.md).
-Add a bounded graceful drain: stop claiming new runs, clear readiness, wait for
-already-claimed dispatch tasks up to `SchedulerConfig::drain_timeout` (default
-30s), then abort the remainder. Wire host shutdown to drain instead of the
-immediate-abort `stop()`, leave queued runs queued, and reuse
-`SchedulerState::Stopping`. Defer per-run cancellation, worker cancel channels,
+Start with [handover-scheduler-slice-6.md](handover-scheduler-slice-6.md).
+Add an authenticated per-run cancel route for queued and running runs. Queued
+cancellation is one durable transaction; running cancellation uses the existing
+executor cancellation channel so the worker group is terminated and the normal
+terminal write and history receipt are preserved. Reuse terminal
+`failed`/`cancelled`, do not add a new state, failure code, or schema, and defer
+job-level/bulk cancellation, cancel on shutdown, pending-cancel state,
 interrupted-run replay, per-job retry policy, jitter, distributed scheduling,
 retention, timezone/DST, and artifact GC.
 
