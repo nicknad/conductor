@@ -25,6 +25,7 @@ use crate::audit::store::RejectionStore;
 use crate::config::{Config, ConfigError};
 use crate::control_plane::activate_module::{ActivationError, ActivationPolicy};
 use crate::control_plane::execute_module::{ExecutionError, ExecutionService};
+use crate::control_plane::reconcile::{reconcile_registry, ReconcileError};
 use crate::control_plane::validate_package::{BuildError, PackageValidationBuilder};
 use crate::executions::executor::ExecutionLimits;
 use crate::executions::history::ExecutionHistoryStore;
@@ -55,6 +56,8 @@ pub enum StartupError {
     Execution(#[from] ExecutionError),
     #[error(transparent)]
     Metrics(#[from] MetricsError),
+    #[error(transparent)]
+    Reconciliation(#[from] ReconcileError),
 }
 
 /// Fully assembled host: one immutable configuration plus the state the
@@ -118,10 +121,18 @@ impl Host {
         );
         let database = Arc::new(Database::open(&config.database_path())?);
         database.migrate()?;
+        let registry = Arc::new(ModuleRegistry::from_database(Arc::clone(&database)));
+        // Classify before readiness/execution so no consumer sees a stale
+        // integrity state.
+        let artifact_dir = config.artifact_dir();
+        reconcile_registry(
+            &registry,
+            &artifact_dir,
+            package_policy.archive.max_compressed_bytes,
+        )?;
         // Cache the post-migration probe result. A later divergence is picked
         // up by the bounded watcher started in `serve_with_handle`.
         let readiness = Arc::new(Readiness::new(database.check_ready().is_ok()));
-        let registry = Arc::new(ModuleRegistry::from_database(Arc::clone(&database)));
         let rejection_store = Arc::new(RejectionStore::new(Arc::clone(&database)));
         let execution_history = Arc::new(ExecutionHistoryStore::new(Arc::clone(&database)));
 
@@ -135,7 +146,7 @@ impl Host {
             .collect();
         let execution_service = Arc::new(ExecutionService::new(
             Arc::clone(&registry),
-            config.artifact_dir(),
+            artifact_dir.clone(),
             config.staging_dir(),
             activation_policy,
             ExecutionLimits::default(),
@@ -156,7 +167,7 @@ impl Host {
         let state = AppState {
             validator: Arc::new(validator),
             quarantine_dir: config.quarantine_dir(),
-            artifact_dir: config.artifact_dir(),
+            artifact_dir,
             registry,
             recorder: Arc::new(RejectionRecorder::with_store(rejection_store)),
             request_timeout: Duration::from_secs(config.request_timeout_secs),
@@ -389,6 +400,7 @@ mod tests {
     use crate::modules::registry::{IntegrityState, ModuleRecord};
     use crate::packages::artifact::ArtifactDigest;
     use crate::packages::signature::SignatureAlgorithm;
+    use crate::storage::artifact_store::canonical_artifact_relpath;
 
     fn temp_root(tag: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -566,15 +578,16 @@ mod tests {
     fn assembled_registry_survives_a_restart() {
         let root = temp_root("persistence");
         let config = test_config(&root);
+        let digest = ArtifactDigest::new([7u8; 32]);
         let record = ModuleRecord {
             module_id: "reporting-service".to_owned(),
             version: "1.2.0".to_owned(),
-            digest: ArtifactDigest::new([7u8; 32]),
+            digest,
             signer_key_id: "k1".to_owned(),
             runtime: "rust".to_owned(),
             manifest_version: 1,
             manifest_json: "{}".to_owned(),
-            artifact_relpath: "reporting-service/1.2.0/pkg.zip".to_owned(),
+            artifact_relpath: canonical_artifact_relpath("reporting-service", "1.2.0", &digest),
             artifact_size: 123,
             integrity_state: IntegrityState::Ok,
             registered_at: SystemTime::now(),
@@ -598,6 +611,11 @@ mod tests {
         assert_eq!(stored.digest, record.digest);
         assert_eq!(stored.signer_key_id, "k1");
         assert_eq!(stored.artifact_relpath, record.artifact_relpath);
+        assert_eq!(
+            stored.integrity_state,
+            IntegrityState::Missing,
+            "restart reconciliation must classify the absent artifact"
+        );
         cleanup(&root);
     }
 

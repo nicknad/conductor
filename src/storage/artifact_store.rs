@@ -49,8 +49,8 @@ pub fn canonical_artifact_relpath(
 
 /// Artifact address relative to the configured artifacts root:
 /// `{module_id}/{version}/{digest_hex}.zip`. The layout lives here and
-/// nowhere else; the registry stores this string so reconciliation does
-/// not re-derive it.
+/// nowhere else; the registry stores this string for audit and exact-equality
+/// checks, while execution and reconciliation re-derive the canonical address.
 #[must_use]
 pub fn artifact_relative_path(validated: &ValidatedPackage) -> String {
     canonical_artifact_relpath(
