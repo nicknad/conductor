@@ -6,9 +6,9 @@
 > **Development is not finished:** this is an in-progress implementation, not a
 > complete job scheduler. Package ingestion, host startup wiring, the
 > worker execution library, the activation/execution HTTP endpoints,
-> durable execution history, and Scheduler slice 1 (durable manual jobs)
-> exist, but interval/cron scheduling, retries, lifecycle transitions, and
-> the operator CLI are still outstanding. Do not treat it as a finished or
+> durable execution history, and Scheduler slice 2 (durable manual and
+> interval jobs) exist, but cron scheduling, retries, lifecycle transitions,
+> and the operator CLI are still outstanding. Do not treat it as a finished or
 > production-ready product.
 
 A single-machine job execution platform supporting installing, validating, activating,
@@ -151,38 +151,54 @@ no retention or garbage collection yet, so history grows without bound.
 
 ### Jobs API (unstable)
 
-Scheduler slice 1 adds durable manual jobs. Every route is
+Scheduler slice 2 adds durable manual and interval jobs. Every route is
 bearer-authenticated. The job definition pins `module_id`, `version`, and
 `function`; dispatch always goes through the same pinned execution service as
 `POST /v1/modules/{module_id}/executions`, so activation, runtime, integrity,
 signer, manifest, artifact, staging, and target checks still apply.
 
 - `POST /v1/jobs` with `{module_id, version, function, trigger, payload?,
-  enabled?}` creates a durable job. Slice 1 accepts
-  `{"trigger":{"kind":"manual"}}`; interval and cron are rejected with
-  `invalid_trigger`. The payload is bounded to 64 KiB of canonical JSON and is
-  never returned by the API.
+  enabled?}` creates a durable job. Slice 2 accepts
+  `{"trigger":{"kind":"manual"}}` and
+  `{"trigger":{"kind":"interval","interval_secs":N}}` where `N` is
+  `1..=31536000` (one year). Cron is still rejected with `invalid_trigger`.
+  An enabled interval job starts at `next_run_at = now + interval_secs`; a
+  disabled one has no next run. The payload is bounded to 64 KiB of canonical
+  JSON and is never returned by the API.
 - `GET /v1/jobs?limit=<1..=200>&offset=<0..=1000000>` lists jobs newest first.
 - `POST /v1/jobs/{job_id}/enable` and `POST /v1/jobs/{job_id}/disable` toggle
-  the job. Disable terminalizes queued runs as `refused`/`job_disabled`.
+  the job. Enable recomputes `next_run_at = now + interval_secs` for an
+  interval job; disable clears it and terminalizes queued runs as
+  `refused`/`job_disabled`.
 - `POST /v1/jobs/{job_id}/trigger` enqueues one manual run and returns `202
-  {job_id, run_id, state:"queued"}`. Manual triggers are not idempotent in this
-  slice; two calls are two runs.
+  {job_id, run_id, state:"queued"}`. A manual run on an enabled interval job
+  records `trigger_kind="manual"` and does not move `next_run_at`. Manual
+  triggers are not idempotent in this slice; two calls are two runs.
 - `GET /v1/jobs/{job_id}/runs?limit=...&offset=...` lists durable run rows
   newest first. A run records its stable state, timestamps, linked
   `execution_id`, worker outcome, or bounded scheduler failure code. No payload,
   stdout, or stderr is stored on the run.
 
+Each scheduler tick enqueues at most one run for each enabled interval job
+whose `next_run_at` is due, using `job_runs` with
+`trigger_kind="interval"` and `scheduled_for=next_run_at`. It then advances
+`next_run_at` to the first boundary strictly after `now`. Advancing
+`next_run_at` prevents repeated ticks for the same boundary; the partial unique
+index is the backstop if a boundary is seen twice. A restart enqueues at most
+one missed run per job rather than a burst. When the global
+queued-run bound is full, the due boundary is left unchanged so a later tick
+retries it.
+
 A trigger while the scheduler loop is not running returns `503
 scheduler_unavailable`; a disabled job returns `409 job_disabled`; a full job
 or queue bound returns `503 server_busy`. Startup recovery marks previously
-running rows `interrupted` and refuses queued rows for disabled jobs. Slice 1
+running rows `interrupted` and refuses queued rows for disabled jobs. Slice 2
 is single-process and at-most-once: a crash after claim does not replay the
 worker. A loop panic or tick failure flips `/readyz` to `503`; in-flight run
 rows remain `running` until restart recovery marks them `interrupted`. There is
 no job/run retention yet, so terminal rows and job payloads grow until a later
-retention slice. Interval/cron triggers, retries, cancellation, and retention
-are later slices.
+retention slice. Cron triggers, retries, cancellation, distributed scheduling,
+and retention are later slices.
 
 ## Host configuration
 
@@ -365,8 +381,9 @@ included), output bounds, and staged-file tamper detection at resolve time.
   startup assembly (configuration, trust store, storage layout, shared
   database, durable rejection sink), the worker execution library,
   activation/execution HTTP endpoints, and durable execution history are
-  implemented. Scheduler/triggering and the operator CLI are not built yet —
-  see [Not built yet](docs/architecture.md#not-built-yet).
+  implemented. Manual and interval scheduler triggers are implemented; cron,
+  retries, and the operator CLI are not built yet — see
+  [Not built yet](docs/architecture.md#not-built-yet).
 - Specification: [`docs/architecture.md`](docs/architecture.md) describes the
   Rust system as built. `docs/storage-reconciliation.md` and
   `docs/design-persistence.md` are background/planning notes, not specs.

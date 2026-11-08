@@ -1,7 +1,8 @@
 # Architecture
 
-> Current as of the Rust rewrite. There is no scheduler, no in-process plugin
-> runtime, and no CLI yet — see [Not built yet](#not-built-yet).
+> Current as of the Rust rewrite. The scheduler supports manual and interval
+> triggers; cron, an in-process plugin runtime, and a CLI are not built yet —
+> see [Not built yet](#not-built-yet).
 
 Conductor is a single-machine job execution platform: operators upload signed
 service packages, the host validates and stores them as immutable artifacts,
@@ -206,29 +207,42 @@ is not atomic with `exec`, so a same-uid writer inside the 0700 staging
 directory can still race the final path resolution. HTTP exposure must not
 weaken these invariants.
 
-### Scheduler slice 1 (`control_plane::scheduler`)
+### Scheduler slice 2 (`control_plane::scheduler`)
 
 Durable job definitions live in `jobs`; `job_runs.state` is the durable queue.
-Scheduler slice 1 supports manual jobs and manual triggers only. A job pins
-`(module_id, version, function)` and a bounded JSON payload.
+Scheduler slice 2 supports manual triggers and interval triggers. A job pins
+`(module_id, version, function)` and a bounded JSON payload. `interval_secs` is
+bounded to `1..=31_536_000` (one year); cron is rejected.
 
-One `SchedulerService` loop claims queued runs with an immediate SQLite
-transaction, records `started_at`/`claimed_by`/`lease_expires_at`, and hands
-the run to a narrow `ExecutionDispatcher`. That wrapper exposes only
-`ExecutionService::execute` with a mandatory pinned version and the host
-deadline; it has no activation, registry, artifact, staging, or worker-spawn
-surface. The scheduler cannot repoint `active_versions` and cannot bypass the
-execution checks described above.
+Each loop iteration first enqueues due interval runs in one immediate
+transaction. For every enabled interval job with `next_run_at <= now` it
+inserts one `queued` run with `trigger_kind='interval'` and
+`scheduled_for=next_run_at`, then advances `next_run_at` to the first boundary
+strictly after `now`. Advancing `next_run_at` prevents repeated ticks for the
+same boundary; the partial `idx_job_runs_tick` index is the backstop if a
+boundary is seen twice. When the global queued-run bound is full, the due
+boundary is left unchanged so a later tick retries it. Restart catch-up
+therefore enqueues at most one missed run per job, not a burst. The loop then
+claims queued runs with an immediate SQLite transaction, records
+`started_at`/`claimed_by`/`lease_expires_at`, and hands the run to a narrow
+`ExecutionDispatcher`. That wrapper exposes only `ExecutionService::execute`
+with a mandatory pinned version and the host deadline; it has no activation,
+registry, artifact, staging, or worker-spawn surface. The scheduler cannot
+repoint `active_versions` and cannot bypass the execution checks described
+above.
 
 Terminal run states are `succeeded`, `failed`, `refused`, and `interrupted`,
-with a closed failure-code vocabulary. Disabling a job terminalizes its queued
-runs. Startup marks previously running rows `interrupted` and refuses queued
-rows for disabled jobs; Slice 1 is at-most-once and does not replay a worker.
-The loop owns scheduler readiness and emits job wait/queue/active metrics.
+with a closed failure-code vocabulary. Disabling a job clears `next_run_at` and
+terminalizes its queued runs; enabling an interval job recomputes
+`next_run_at = now + interval_secs`. A manual trigger on an interval job stays
+allowed and does not move `next_run_at`. Startup marks previously running rows
+`interrupted` and refuses queued rows for disabled jobs; slice 2 is
+at-most-once and does not replay a worker. The loop owns scheduler readiness
+and emits job wait/queue/active metrics; due enqueue moves the queue gauge.
 A loop panic or tick failure flips readiness false; in-flight run rows remain
-`running` until restart recovery marks them `interrupted`. Interval/cron
-triggers, retries, cancellation, multi-process ownership, and retention are
-later slices.
+`running` until restart recovery marks them `interrupted`. Cron triggers,
+retries, cancellation, multi-process ownership, and retention are later
+slices.
 
 ### Execution history (`executions::history`)
 
@@ -265,14 +279,13 @@ validation. There is no `/metrics` route and no metrics table: SQLite remains
 the durable authority only for registry, rejections, and execution history.
 
 Views fix explicit histogram buckets for HTTP request duration, execution
-duration, and DB lock wait, plus a future job-wait instrument that this slice
-does not emit. Every stream has a bounded cardinality limit and cumulative
-histograms skip min/max. Attributes are closed vocabularies: matched route
-templates (or `unmatched`), normalized methods (standard set or `_OTHER`),
-status codes, stable outcome names, bounded refusal/integrity reasons
-(including `registry_state`), and auth reasons. Module/version/execution ids,
-request ids, paths, tokens, configuration, stdout/stderr, and free-form error
-text are never attributes.
+duration, DB lock wait, and job wait. Every stream has a bounded cardinality
+limit and cumulative histograms skip min/max. Attributes are closed
+vocabularies: matched route templates (or `unmatched`), normalized methods
+(standard set or `_OTHER`), status codes, stable outcome names, bounded
+refusal/integrity reasons (including `registry_state`), and auth reasons.
+Module/version/execution ids, request ids, paths, tokens, configuration,
+stdout/stderr, and free-form error text are never attributes.
 
 `DatabaseError::from` classifies SQLite `Busy`/`Locked` errors and
 `Database::lock` records mutex wait through a process-global handle installed
@@ -327,10 +340,11 @@ cannot false-503 under probe flood. Readiness is not a write/disk-full proof.
 
 ## Not built yet
 
-Interval/cron triggering, retries, cancellation, distributed scheduling, CLI,
-artifact GC, and execution-history retention/GC. Scheduler slice 1 provides
-durable manual jobs, manual triggers, a single-process dispatcher, readiness,
-and job metrics. Startup reconciliation is classify-only: it sets
+Interval triggering is implemented in slice 2. Cron triggering, retries,
+cancellation, distributed scheduling, CLI, artifact GC, and
+execution-history retention/GC remain. Scheduler slice 2 provides durable
+manual and interval jobs, interval due enqueue, a single-process dispatcher,
+readiness, and job metrics. Startup reconciliation is classify-only: it sets
 `ok`/`missing`/`mismatch` but does not repair artifacts or detect orphans,
 and it does not yet record `reconciliation_runs`.
 `control_plane/lifecycle.rs` is currently a placeholder for

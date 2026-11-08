@@ -9,7 +9,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 
@@ -27,6 +27,10 @@ pub const MAX_RUN_ID_BYTES: usize = 128;
 pub const MAX_JOB_PAYLOAD_BYTES: usize = 64 * 1024;
 /// Default execution deadline for a scheduled run, clamped to the host ceiling.
 pub const DEFAULT_JOB_DEADLINE_SECS: u64 = 30;
+/// Smallest accepted interval trigger, in seconds.
+pub const MIN_INTERVAL_SECS: u64 = 1;
+/// Largest accepted interval trigger, in seconds (one year).
+pub const MAX_INTERVAL_SECS: u64 = 31_536_000;
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
 static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -116,6 +120,37 @@ impl Trigger {
             Self::Manual | Self::Interval { .. } => None,
         }
     }
+}
+
+/// First run for a newly enabled interval trigger.
+#[must_use]
+pub fn next_interval_at(now: SystemTime, interval_secs: u64) -> Option<SystemTime> {
+    now.checked_add(Duration::from_secs(interval_secs))
+}
+
+/// Boundary for the next interval tick. A still-future boundary is returned
+/// unchanged; a due one advances to the first boundary strictly after `now`,
+/// so a restart enqueues at most one missed run instead of a burst.
+#[must_use]
+pub fn advance_interval_due(
+    scheduled_for: SystemTime,
+    interval_secs: u64,
+    now: SystemTime,
+) -> Option<SystemTime> {
+    if interval_secs == 0 {
+        return None;
+    }
+    if scheduled_for > now {
+        return Some(scheduled_for);
+    }
+    let interval = Duration::from_secs(interval_secs);
+    let elapsed = now.duration_since(scheduled_for).ok()?;
+    let interval_nanos = interval.as_nanos();
+    let remainder = elapsed.as_nanos() % interval_nanos;
+    let delay_nanos = interval_nanos - remainder;
+    let delay_secs = u64::try_from(delay_nanos / 1_000_000_000).ok()?;
+    let delay_subsec_nanos = u32::try_from(delay_nanos % 1_000_000_000).ok()?;
+    now.checked_add(Duration::new(delay_secs, delay_subsec_nanos))
 }
 
 /// One durable job definition. Payload is intentionally absent from `Debug`
@@ -480,10 +515,10 @@ pub(crate) fn validate_new_job(job: &NewJob) -> Result<(), JobValidationError> {
             }
         }
         Trigger::Interval { interval_secs } => {
-            if *interval_secs == 0 {
-                return Err(JobValidationError::Trigger(
-                    "interval_secs must be greater than zero".to_owned(),
-                ));
+            if !(MIN_INTERVAL_SECS..=MAX_INTERVAL_SECS).contains(interval_secs) {
+                return Err(JobValidationError::Trigger(format!(
+                    "interval_secs must be between {MIN_INTERVAL_SECS} and {MAX_INTERVAL_SECS}"
+                )));
             }
             if job.enabled && job.next_run_at.is_none() {
                 return Err(JobValidationError::Trigger(
@@ -682,4 +717,85 @@ pub(crate) fn validate_run_semantics(run: &JobRun) -> Result<(), JobValidationEr
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn next_interval_at_adds_the_interval_and_fails_closed_on_overflow() {
+        assert_eq!(next_interval_at(at(100), 60), Some(at(160)));
+        assert_eq!(
+            next_interval_at(at(10), u64::MAX),
+            None,
+            "an overflowing boundary must not wrap"
+        );
+    }
+
+    #[test]
+    fn advance_interval_due_returns_a_future_boundary_unchanged() {
+        let scheduled = at(1_000);
+        assert_eq!(
+            advance_interval_due(scheduled, 60, at(999)),
+            Some(scheduled)
+        );
+    }
+
+    #[test]
+    fn advance_interval_due_moves_an_equal_boundary_to_the_next_interval() {
+        assert_eq!(
+            advance_interval_due(at(1_000), 60, at(1_000)),
+            Some(at(1_060))
+        );
+    }
+
+    #[test]
+    fn advance_interval_due_handles_one_missed_boundary() {
+        // 65 s after the boundary: the next one is 55 s from now.
+        assert_eq!(
+            advance_interval_due(at(1_000), 60, at(1_065)),
+            Some(at(1_120))
+        );
+    }
+
+    #[test]
+    fn advance_interval_due_collapses_many_missed_boundaries_to_one() {
+        let scheduled = at(1_000);
+        let interval = 60;
+        let now = at(1_000 + 1_000 * interval + 7);
+        let next = advance_interval_due(scheduled, interval, now).expect("next boundary");
+        assert_eq!(next, at(1_000 + 1_001 * interval));
+    }
+
+    #[test]
+    fn advance_interval_due_rejects_zero_and_reports_overflow() {
+        assert_eq!(advance_interval_due(at(10), 0, at(20)), None);
+        assert_eq!(advance_interval_due(at(10), u64::MAX, at(20)), None);
+    }
+
+    #[test]
+    fn validate_new_job_rejects_out_of_range_interval_bounds() {
+        for interval_secs in [0, MAX_INTERVAL_SECS + 1] {
+            let job = NewJob {
+                job_id: "job-a".to_owned(),
+                module_id: "reporting-service".to_owned(),
+                version: "1.2.0".to_owned(),
+                function: "run".to_owned(),
+                trigger: Trigger::Interval { interval_secs },
+                payload: serde_json::json!({}),
+                enabled: true,
+                next_run_at: Some(at(600)),
+                created_at: at(0),
+            };
+            assert!(
+                matches!(validate_new_job(&job), Err(JobValidationError::Trigger(_))),
+                "interval_secs {interval_secs} must be rejected"
+            );
+        }
+    }
 }

@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use crate::api::errors::ApiError;
 use crate::api::uploads::{request_id, AppState};
 use crate::control_plane::scheduler::job::{
-    next_job_id, validate_payload, JobDefinition, JobFailureCode, JobRun, NewJob, Trigger,
-    MAX_JOB_ID_BYTES,
+    next_interval_at, next_job_id, validate_payload, JobDefinition, JobFailureCode, JobRun, NewJob,
+    Trigger, MAX_INTERVAL_SECS, MAX_JOB_ID_BYTES, MIN_INTERVAL_SECS,
 };
 use crate::control_plane::scheduler::service::SchedulerError;
 use crate::control_plane::scheduler::store::JobStoreError;
@@ -136,16 +136,24 @@ pub async fn post_job(
     if let Err(api) = validate_create(&request) {
         return refuse(&id, api);
     }
+    let trigger: Trigger = request.trigger.into();
+    let now = SystemTime::now();
+    let next_run_at = match &trigger {
+        Trigger::Interval { interval_secs } if request.enabled => {
+            next_interval_at(now, *interval_secs)
+        }
+        Trigger::Manual | Trigger::Interval { .. } | Trigger::Cron { .. } => None,
+    };
     let new = NewJob {
         job_id: next_job_id(),
         module_id: request.module_id,
         version: request.version,
         function: request.function,
-        trigger: request.trigger.into(),
+        trigger,
         payload: request.payload.unwrap_or(serde_json::Value::Null),
         enabled: request.enabled,
-        next_run_at: None,
-        created_at: SystemTime::now(),
+        next_run_at,
+        created_at: now,
     };
     match state.scheduler.create_job(new).await {
         Ok(job) => (StatusCode::CREATED, Json(JobResponse::from(job))).into_response(),
@@ -186,7 +194,20 @@ pub async fn post_enable(
         Ok(job_id) => job_id,
         Err(api) => return refuse(&id, api),
     };
-    match state.scheduler.set_enabled(&job_id, true, None).await {
+    let job = match state.scheduler.get_job(&job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => return refuse(&id, job_not_found()),
+        Err(error) => return refuse(&id, scheduler_error(error)),
+    };
+    let next_run_at = match &job.trigger {
+        Trigger::Interval { interval_secs } => next_interval_at(SystemTime::now(), *interval_secs),
+        Trigger::Manual | Trigger::Cron { .. } => None,
+    };
+    match state
+        .scheduler
+        .set_enabled(&job_id, true, next_run_at)
+        .await
+    {
         Ok(Some(result)) => Json(JobResponse::from(result.job)).into_response(),
         Ok(None) => refuse(&id, job_not_found()),
         Err(error) => refuse(&id, scheduler_error(error)),
@@ -279,9 +300,20 @@ fn validate_create(request: &CreateJobRequest) -> Result<(), ApiError> {
     }
     match &request.trigger {
         TriggerRequest::Manual => Ok(()),
-        TriggerRequest::Interval { .. } | TriggerRequest::Cron { .. } => Err(ApiError::BadRequest(
+        TriggerRequest::Interval { interval_secs } => {
+            if !(MIN_INTERVAL_SECS..=MAX_INTERVAL_SECS).contains(interval_secs) {
+                return Err(ApiError::BadRequest(
+                    "invalid_trigger",
+                    format!(
+                        "interval_secs must be between {MIN_INTERVAL_SECS} and {MAX_INTERVAL_SECS}"
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        TriggerRequest::Cron { .. } => Err(ApiError::BadRequest(
             "invalid_trigger",
-            "only manual triggers are supported".to_owned(),
+            "interval triggers are supported; cron triggers are not".to_owned(),
         )),
     }
 }

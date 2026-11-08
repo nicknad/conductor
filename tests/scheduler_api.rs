@@ -14,6 +14,7 @@ use base64::prelude::*;
 use conductor::api::routes::router;
 use conductor::api::uploads::AppState;
 use conductor::config::{Config, TrustedKeyConfig};
+use conductor::control_plane::scheduler::job::MAX_INTERVAL_SECS;
 use conductor::control_plane::scheduler::JobFailureCode;
 use conductor::modules::registry::{IntegrityState, ModuleRecord};
 use conductor::packages::artifact::ArtifactDigest;
@@ -499,12 +500,72 @@ async fn trigger_before_start_and_readyz_after_stop_are_unavailable() {
 
 #[tokio::test]
 #[serial]
-async fn interval_and_cron_are_rejected() {
-    let (state, _scratch) = state("triggers").await;
-    for trigger in [
-        json!({"kind": "interval", "interval_secs": 60}),
-        json!({"kind": "cron", "expression": "*/5 * * * *"}),
-    ] {
+async fn interval_create_is_accepted_and_schedules_the_first_run() {
+    let (state, _scratch) = state("interval-create").await;
+    let before = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as i64;
+    let (status, body) = send_json(
+        &state,
+        "POST",
+        "/v1/jobs",
+        Some(json!({
+            "module_id": "missing-module",
+            "version": "1.0.0",
+            "function": "run",
+            "trigger": {"kind": "interval", "interval_secs": 3600},
+        })),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create response: {body}");
+    assert_eq!(body["trigger"]["kind"], "interval");
+    assert_eq!(body["trigger"]["interval_secs"], 3600);
+    assert_eq!(body["enabled"], true);
+    let created_at = body["created_at_ms"].as_i64().expect("created_at");
+    let next_run_at = body["next_run_at_ms"].as_i64().expect("next_run_at");
+    assert!(created_at >= before);
+    assert_eq!(
+        next_run_at,
+        created_at + 3_600_000,
+        "the first run is one interval after the same now used for created_at"
+    );
+    state.scheduler.stop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn disabled_interval_create_has_no_next_run() {
+    let (state, _scratch) = state("interval-disabled-create").await;
+    let (status, body) = send_json(
+        &state,
+        "POST",
+        "/v1/jobs",
+        Some(json!({
+            "module_id": "missing-module",
+            "version": "1.0.0",
+            "function": "run",
+            "trigger": {"kind": "interval", "interval_secs": 3600},
+            "enabled": false,
+        })),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create response: {body}");
+    assert_eq!(body["trigger"]["kind"], "interval");
+    assert!(
+        body["next_run_at_ms"].is_null(),
+        "a disabled interval job must not schedule a run: {body}"
+    );
+    state.scheduler.stop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn interval_bounds_reject_zero_and_over_the_maximum() {
+    let (state, _scratch) = state("interval-bounds").await;
+    for interval_secs in [0, MAX_INTERVAL_SECS + 1] {
         let (status, body) = send_json(
             &state,
             "POST",
@@ -513,14 +574,150 @@ async fn interval_and_cron_are_rejected() {
                 "module_id": "missing-module",
                 "version": "1.0.0",
                 "function": "run",
-                "trigger": trigger,
+                "trigger": {"kind": "interval", "interval_secs": interval_secs},
             })),
             Some(TOKEN),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "interval_secs={interval_secs} response: {body}"
+        );
         assert_eq!(body["code"], "invalid_trigger");
     }
+    state.scheduler.stop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn cron_trigger_is_still_rejected() {
+    let (state, _scratch) = state("cron").await;
+    let (status, body) = send_json(
+        &state,
+        "POST",
+        "/v1/jobs",
+        Some(json!({
+            "module_id": "missing-module",
+            "version": "1.0.0",
+            "function": "run",
+            "trigger": {"kind": "cron", "expression": "*/5 * * * *"},
+        })),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_trigger");
+    state.scheduler.stop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn disable_clears_and_enable_recomputes_an_interval_next_run() {
+    let (state, _scratch) = state("interval-toggle").await;
+    let (status, body) = send_json(
+        &state,
+        "POST",
+        "/v1/jobs",
+        Some(json!({
+            "module_id": "missing-module",
+            "version": "1.0.0",
+            "function": "run",
+            "trigger": {"kind": "interval", "interval_secs": 3600},
+        })),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create response: {body}");
+    let job_id = body["job_id"].as_str().expect("job id").to_owned();
+    let next_before = body["next_run_at_ms"]
+        .as_i64()
+        .expect("initial next_run_at");
+
+    let (status, body) = send_json(
+        &state,
+        "POST",
+        &format!("/v1/jobs/{job_id}/disable"),
+        None,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "disable response: {body}");
+    assert_eq!(body["enabled"], false);
+    assert!(
+        body["next_run_at_ms"].is_null(),
+        "disable must clear the boundary: {body}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let (status, body) = send_json(
+        &state,
+        "POST",
+        &format!("/v1/jobs/{job_id}/enable"),
+        None,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "enable response: {body}");
+    assert_eq!(body["enabled"], true);
+    let next_after = body["next_run_at_ms"]
+        .as_i64()
+        .expect("recomputed next_run_at");
+    assert!(
+        next_after > next_before,
+        "enable must recompute now+interval (before={next_before}, after={next_after})"
+    );
+    state.scheduler.stop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn manual_trigger_on_an_interval_job_keeps_the_interval_boundary() {
+    let (state, _scratch) = state("interval-manual").await;
+    let (status, body) = send_json(
+        &state,
+        "POST",
+        "/v1/jobs",
+        Some(json!({
+            "module_id": "missing-module",
+            "version": "1.0.0",
+            "function": "run",
+            "trigger": {"kind": "interval", "interval_secs": 3600},
+        })),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create response: {body}");
+    let job_id = body["job_id"].as_str().expect("job id").to_owned();
+    let next_before = body["next_run_at_ms"]
+        .as_i64()
+        .expect("initial next_run_at");
+
+    let (status, body) = send_json(
+        &state,
+        "POST",
+        &format!("/v1/jobs/{job_id}/trigger"),
+        None,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "trigger response: {body}");
+    let run = wait_for_terminal(&state, &job_id).await;
+    assert_eq!(run["trigger"], "manual");
+
+    let (status, body) = send_json(&state, "GET", "/v1/jobs", None, Some(TOKEN)).await;
+    assert_eq!(status, StatusCode::OK);
+    let job = body["jobs"]
+        .as_array()
+        .expect("jobs")
+        .iter()
+        .find(|job| job["job_id"] == job_id)
+        .expect("created job");
+    assert_eq!(
+        job["next_run_at_ms"].as_i64(),
+        Some(next_before),
+        "a manual run must not move the interval boundary"
+    );
     state.scheduler.stop().await;
 }
 

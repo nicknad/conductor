@@ -23,7 +23,7 @@ use super::job::{
     classify_execution_error, ClaimedRun, JobDefinition, JobRun, NewJob, RunCompletion,
     DEFAULT_JOB_DEADLINE_SECS,
 };
-use super::store::{EnableResult, JobStore, JobStoreError, JobStoreLimits};
+use super::store::{DueEnqueueReport, EnableResult, JobStore, JobStoreError, JobStoreLimits};
 
 /// Scheduler tuning.
 #[derive(Clone, Debug)]
@@ -271,10 +271,11 @@ impl SchedulerService {
         tracing::info!("scheduler loop stopped");
     }
 
-    /// Deterministic one-shot tick used by tests. It claims and awaits
-    /// dispatch of every run up to capacity.
+    /// Deterministic one-shot tick used by tests. It enqueues due interval
+    /// runs, then claims and awaits dispatch of every run up to capacity.
     #[doc(hidden)]
     pub async fn tick_once(&self, now: SystemTime) -> Result<usize, SchedulerError> {
+        self.enqueue_due(now).await?;
         let mut dispatched = 0;
         while self.active.load(Ordering::Relaxed) < self.config.max_concurrent_runs {
             let Some(claimed) = self.claim_next(now).await? else {
@@ -383,6 +384,24 @@ impl SchedulerService {
             .map_err(SchedulerError::from)
     }
 
+    async fn enqueue_due(&self, now: SystemTime) -> Result<DueEnqueueReport, SchedulerError> {
+        let store = Arc::clone(&self.store);
+        let report = tokio::task::spawn_blocking(move || store.enqueue_due_runs(now))
+            .await
+            .map_err(task_error)?
+            .map_err(SchedulerError::from)?;
+        for _ in 0..report.enqueued {
+            self.metrics.job_enqueued();
+        }
+        tracing::debug!(
+            enqueued = report.enqueued,
+            deduped = report.deduped,
+            skipped_full = report.skipped_full,
+            "scheduler enqueued due interval runs"
+        );
+        Ok(report)
+    }
+
     async fn claim_next(&self, now: SystemTime) -> Result<Option<ClaimedRun>, SchedulerError> {
         let store = Arc::clone(&self.store);
         let owner = self.owner_id.clone();
@@ -486,6 +505,7 @@ impl SchedulerService {
         self: &Arc<Self>,
         join_set: &mut JoinSet<()>,
     ) -> Result<(), SchedulerError> {
+        self.enqueue_due(SystemTime::now()).await?;
         while self.active.load(Ordering::Relaxed) < self.config.max_concurrent_runs {
             let now = SystemTime::now();
             let Some(claimed) = self.claim_next(now).await? else {

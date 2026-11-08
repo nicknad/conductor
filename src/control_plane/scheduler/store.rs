@@ -14,9 +14,10 @@ use crate::modules::identity::MAX_IDENTITY_BYTES;
 use crate::storage::database::{from_millis, to_millis, Database, DatabaseError};
 
 use super::job::{
-    next_run_id, validate_completion, validate_new_job, validate_payload, validate_run_semantics,
-    ClaimedRun, JobDefinition, JobFailureCode, JobRun, JobRunState, JobValidationError, NewJob,
-    RunCompletion, Trigger, TriggerKind, MAX_JOB_ID_BYTES, MAX_JOB_PAYLOAD_BYTES, MAX_RUN_ID_BYTES,
+    advance_interval_due, next_run_id, validate_completion, validate_new_job, validate_payload,
+    validate_run_semantics, ClaimedRun, JobDefinition, JobFailureCode, JobRun, JobRunState,
+    JobValidationError, NewJob, RunCompletion, Trigger, TriggerKind, MAX_INTERVAL_SECS,
+    MAX_JOB_ID_BYTES, MAX_JOB_PAYLOAD_BYTES, MAX_RUN_ID_BYTES, MIN_INTERVAL_SECS,
 };
 
 /// Bounds enforced in the same transaction as each write.
@@ -79,6 +80,14 @@ pub struct EnableResult {
 pub struct RecoveryReport {
     pub interrupted: usize,
     pub disabled_queued: usize,
+}
+
+/// Outcome of one due-interval enqueue pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DueEnqueueReport {
+    pub enqueued: usize,
+    pub deduped: usize,
+    pub skipped_full: usize,
 }
 
 /// Durable job/run repository over the shared database.
@@ -301,6 +310,73 @@ impl JobStore {
         })
     }
 
+    /// Enqueues one queued run for each enabled interval job whose
+    /// `next_run_at` is due, then advances every attempted job to the first
+    /// boundary after `now`. A full queue leaves `next_run_at` untouched so a
+    /// later tick retries instead of dropping the due time.
+    pub fn enqueue_due_runs(&self, now: SystemTime) -> Result<DueEnqueueReport, JobStoreError> {
+        let now_ms = to_millis(now);
+        self.database.with_write_tx(|tx| {
+            let due: Vec<(String, i64, i64)> = {
+                let mut statement = tx.prepare(
+                    "SELECT job_id, interval_secs, next_run_at FROM jobs \
+                     WHERE enabled = 1 AND trigger_kind = 'interval' \
+                     AND interval_secs IS NOT NULL AND next_run_at IS NOT NULL \
+                     AND interval_secs BETWEEN ?2 AND ?3 \
+                     AND next_run_at <= ?1 ORDER BY next_run_at, job_id",
+                )?;
+                let rows = statement.query_map(
+                    params![now_ms, MIN_INTERVAL_SECS as i64, MAX_INTERVAL_SECS as i64],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                let mut due = Vec::new();
+                for row in rows {
+                    due.push(row?);
+                }
+                due
+            };
+            let queued: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM job_runs WHERE state = 'queued'",
+                [],
+                |row| row.get(0),
+            )?;
+            let mut queued = usize::try_from(queued).unwrap_or(usize::MAX);
+            let mut report = DueEnqueueReport::default();
+            for (job_id, interval_secs, scheduled_for) in due {
+                if queued >= self.limits.max_queued_runs {
+                    report.skipped_full += 1;
+                    continue;
+                }
+                let interval_secs = interval_secs as u64;
+                let run_id = next_run_id();
+                let inserted = tx.execute(
+                    "INSERT OR IGNORE INTO job_runs (
+                        run_id, job_id, attempt_no, trigger_kind, scheduled_for, state, created_at
+                     ) VALUES (?1, ?2, 1, 'interval', ?3, 'queued', ?4)",
+                    params![run_id, job_id, scheduled_for, now_ms],
+                )?;
+                if inserted > 0 {
+                    report.enqueued += 1;
+                    queued += 1;
+                } else {
+                    report.deduped += 1;
+                }
+                let next_run_at =
+                    advance_interval_due(from_millis(scheduled_for), interval_secs, now)
+                        .ok_or_else(|| {
+                            JobStoreError::InvalidJob(format!(
+                                "job {job_id} has no representable next interval boundary"
+                            ))
+                        })?;
+                tx.execute(
+                    "UPDATE jobs SET next_run_at = ?1, updated_at = ?2 WHERE job_id = ?3",
+                    params![to_millis(next_run_at), now_ms, job_id],
+                )?;
+            }
+            Ok(report)
+        })
+    }
+
     /// Newest-first page of runs for one job.
     pub fn list_runs(
         &self,
@@ -479,8 +555,8 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobDefinition> {
             let secs = interval_secs.ok_or_else(|| invalid_row("interval job has no interval"))?;
             let secs = u64::try_from(secs)
                 .ok()
-                .filter(|value| *value > 0)
-                .ok_or_else(|| invalid_row("interval job has a non-positive interval"))?;
+                .filter(|value| (MIN_INTERVAL_SECS..=MAX_INTERVAL_SECS).contains(value))
+                .ok_or_else(|| invalid_row("interval job has an out-of-range interval"))?;
             if cron_expr.is_some() {
                 return Err(invalid_row("interval job carries a cron expression"));
             }
@@ -659,6 +735,20 @@ mod tests {
             payload: serde_json::json!({"account": "example"}),
             enabled,
             next_run_at: None,
+            created_at: at(1_000),
+        }
+    }
+
+    fn interval_job(job_id: &str, interval_secs: u64, next_run_at: SystemTime) -> NewJob {
+        NewJob {
+            job_id: job_id.to_owned(),
+            module_id: "reporting-service".to_owned(),
+            version: "1.2.0".to_owned(),
+            function: "run".to_owned(),
+            trigger: Trigger::Interval { interval_secs },
+            payload: serde_json::json!({}),
+            enabled: true,
+            next_run_at: Some(next_run_at),
             created_at: at(1_000),
         }
     }
@@ -895,5 +985,178 @@ mod tests {
             })
             .expect("tamper");
         assert!(store.list_runs("job-1", 10, 0).is_err());
+    }
+
+    #[test]
+    fn out_of_range_interval_rows_are_skipped_not_enqueued() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        store
+            .create_job(interval_job("job-int", 60, at(60_000)))
+            .expect("create");
+        store
+            .database
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE jobs SET interval_secs = ?1 WHERE job_id = ?2",
+                    params![MAX_INTERVAL_SECS as i64 + 1, "job-int"],
+                )
+                .map_err(DatabaseError::from)
+            })
+            .expect("tamper interval");
+
+        let report = store.enqueue_due_runs(at(65_000)).expect("enqueue");
+        assert_eq!(report, DueEnqueueReport::default());
+        assert!(
+            store.list_runs("job-int", 10, 0).expect("runs").is_empty(),
+            "an out-of-range interval must not enqueue a run"
+        );
+    }
+
+    #[test]
+    fn due_interval_job_enqueues_one_run_and_advances_the_boundary() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        store
+            .create_job(interval_job("job-int", 60, at(60_000)))
+            .expect("create");
+
+        let report = store.enqueue_due_runs(at(65_000)).expect("enqueue");
+        assert_eq!(
+            report,
+            DueEnqueueReport {
+                enqueued: 1,
+                deduped: 0,
+                skipped_full: 0,
+            }
+        );
+        let runs = store.list_runs("job-int", 10, 0).expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].trigger, TriggerKind::Interval);
+        assert_eq!(runs[0].scheduled_for, at(60_000));
+        assert_eq!(runs[0].state, JobRunState::Queued);
+        assert_eq!(runs[0].attempt_no, 1);
+        let job = store.get_job("job-int").expect("get").expect("exists");
+        assert_eq!(job.next_run_at, Some(at(120_000)));
+        assert_eq!(job.updated_at, at(65_000));
+    }
+
+    #[test]
+    fn an_ignored_duplicate_tick_advances_without_a_second_run() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        store
+            .create_job(interval_job("job-int", 60, at(60_000)))
+            .expect("create");
+        store.enqueue_due_runs(at(60_000)).expect("first tick");
+
+        // Model a competing tick that still sees the original boundary.
+        store
+            .database
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE jobs SET next_run_at = 60_000 WHERE job_id = 'job-int'",
+                    [],
+                )
+                .map_err(DatabaseError::from)
+            })
+            .expect("rewind boundary");
+
+        let report = store.enqueue_due_runs(at(60_000)).expect("second tick");
+        assert_eq!(report.enqueued, 0);
+        assert_eq!(report.deduped, 1);
+        assert_eq!(store.list_runs("job-int", 10, 0).expect("runs").len(), 1);
+        let job = store.get_job("job-int").expect("get").expect("exists");
+        assert_eq!(job.next_run_at, Some(at(120_000)));
+    }
+
+    #[test]
+    fn a_full_queue_leaves_the_due_boundary_for_a_later_tick() {
+        let store = JobStore::open_in_memory(JobStoreLimits {
+            max_jobs: 4,
+            max_queued_runs: 1,
+        })
+        .expect("store");
+        store
+            .create_job(interval_job("job-int", 60, at(60_000)))
+            .expect("create");
+        store
+            .enqueue_manual_run("job-int", at(50_000))
+            .expect("fill queue");
+
+        let report = store.enqueue_due_runs(at(65_000)).expect("full tick");
+        assert_eq!(report.skipped_full, 1);
+        assert_eq!(report.enqueued, 0);
+        assert_eq!(store.list_runs("job-int", 10, 0).expect("runs").len(), 1);
+        let job = store.get_job("job-int").expect("get").expect("exists");
+        assert_eq!(job.next_run_at, Some(at(60_000)));
+
+        let claimed = store
+            .claim_next_run("owner-1", at(66_000), Duration::from_secs(30))
+            .expect("claim")
+            .expect("manual run");
+        store
+            .finish_run(
+                &claimed.run.run_id,
+                &RunCompletion::succeeded("exec-1".to_owned()),
+                at(67_000),
+            )
+            .expect("finish");
+
+        let report = store.enqueue_due_runs(at(68_000)).expect("retry tick");
+        assert_eq!(report.enqueued, 1);
+
+        let runs = store.list_runs("job-int", 10, 0).expect("runs");
+        assert_eq!(runs.len(), 2);
+        let interval = runs
+            .iter()
+            .find(|run| run.trigger == TriggerKind::Interval)
+            .expect("interval run");
+        assert_eq!(interval.scheduled_for, at(60_000));
+        let job = store.get_job("job-int").expect("get").expect("exists");
+        assert_eq!(job.next_run_at, Some(at(120_000)));
+    }
+
+    #[test]
+    fn queued_counter_bounds_multiple_due_jobs_in_one_tick() {
+        let store = JobStore::open_in_memory(JobStoreLimits {
+            max_jobs: 4,
+            max_queued_runs: 1,
+        })
+        .expect("store");
+        store
+            .create_job(interval_job("job-a", 60, at(60_000)))
+            .expect("create job-a");
+        store
+            .create_job(interval_job("job-b", 60, at(60_000)))
+            .expect("create job-b");
+
+        let report = store.enqueue_due_runs(at(65_000)).expect("enqueue");
+        assert_eq!(report.enqueued, 1);
+        assert_eq!(report.skipped_full, 1);
+        assert_eq!(report.deduped, 0);
+        assert_eq!(store.count_queued().expect("queued count"), 1);
+
+        let first = store.get_job("job-a").expect("get").expect("exists");
+        assert_eq!(first.next_run_at, Some(at(120_000)));
+        let second = store.get_job("job-b").expect("get").expect("exists");
+        assert_eq!(second.next_run_at, Some(at(60_000)));
+    }
+
+    #[test]
+    fn restart_catch_up_enqueues_one_original_boundary_not_a_burst() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        let interval_ms = 60_000;
+        store
+            .create_job(interval_job("job-int", 60, at(10_000)))
+            .expect("create");
+
+        let report = store
+            .enqueue_due_runs(at(10_000 + 5 * interval_ms + 3_000))
+            .expect("catch-up tick");
+
+        assert_eq!(report.enqueued, 1);
+        let runs = store.list_runs("job-int", 10, 0).expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].scheduled_for, at(10_000));
+        let job = store.get_job("job-int").expect("get").expect("exists");
+        assert_eq!(job.next_run_at, Some(at(10_000 + 6 * interval_ms)));
     }
 }
