@@ -292,7 +292,152 @@ paths:
           description: No execution with that id (stable `execution_not_found` code).
         "500":
           description: History read failure; generic body only.
+  /v1/jobs:
+    get:
+      operationId: listJobs
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            format: int64
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: Newest-first job page; payload is never returned.
+        "400":
+          description: Invalid pagination (stable `invalid_pagination` code).
+        "401":
+          description: Missing or invalid bearer token.
+        "500":
+          description: Job read failure; generic body only.
+    post:
+      operationId: createJob
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [module_id, version, function, trigger]
+              properties:
+                module_id:
+                  type: string
+                version:
+                  type: string
+                function:
+                  type: string
+                trigger:
+                  type: object
+                payload:
+                  type: object
+                  nullable: true
+                enabled:
+                  type: boolean
+      responses:
+        "201":
+          description: Durable manual job created; payload is not echoed.
+        "400":
+          description: Invalid identity, trigger, payload, or body.
+        "401":
+          description: Missing or invalid bearer token.
+        "413":
+          description: Body exceeds the route limit.
+        "503":
+          description: Job count bound reached (`server_busy`).
+  /v1/jobs/{job_id}/enable:
+    post:
+      operationId: enableJob
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: Job view with enabled=true.
+        "401":
+          description: Missing or invalid bearer token.
+        "404":
+          description: Job not found (`job_not_found`).
+  /v1/jobs/{job_id}/disable:
+    post:
+      operationId: disableJob
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: Job view with enabled=false; queued runs are refused.
+        "401":
+          description: Missing or invalid bearer token.
+        "404":
+          description: Job not found (`job_not_found`).
+  /v1/jobs/{job_id}/trigger:
+    post:
+      operationId: triggerJob
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "202":
+          description: Run enqueued (`job_id`, `run_id`, `state=queued`).
+        "401":
+          description: Missing or invalid bearer token.
+        "404":
+          description: Job not found (`job_not_found`).
+        "409":
+          description: Job is disabled (`job_disabled`).
+        "503":
+          description: Scheduler unavailable or queue full.
+  /v1/jobs/{job_id}/runs:
+    get:
+      operationId: listJobRuns
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            format: int64
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: Newest-first run page; no payload/stdout/stderr.
+        "400":
+          description: Invalid pagination.
+        "401":
+          description: Missing or invalid bearer token.
+        "404":
+          description: Job not found (`job_not_found`).
+        "500":
+          description: Run read failure; generic body only.
 components:
+  parameters:
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: "^[A-Za-z0-9._+-]+$"
   schemas:
     ExecutionRecord:
       type: object

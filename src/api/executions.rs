@@ -37,8 +37,8 @@ use crate::control_plane::activate_module::{ActivatedModule, ActivationError};
 use crate::control_plane::execute_module::{ExecutionError, ExecutionReceipt};
 use crate::executions::executor::{ExecutionError as ExecutorError, ExecutionOutcome, TargetError};
 use crate::executions::history::{ExecutionRecord, MAX_EXECUTION_ID_BYTES, MAX_LIST_LIMIT};
-use crate::executions::protocol::MAX_FIELD_BYTES;
 use crate::modules::activation::ActiveError;
+use crate::modules::identity::{is_safe_identity, validate_identity as validate_identity_value};
 use crate::storage::database::to_millis;
 use crate::storage::staging::StagingError;
 
@@ -485,43 +485,10 @@ impl From<ExecutionRecord> for ExecutionResponse {
     }
 }
 
-/// Rejects empty, over-bound, or unsafe identity fields before any registry
-/// or filesystem work. Allowed characters are the portable path-safe set
-/// used for registered module identities: `[A-Za-z0-9._+-]`, with no
-/// leading/trailing dot. This excludes path separators, whitespace, control
-/// characters, and ANSI escape bytes.
+/// Rejects unsafe identity fields before any registry or filesystem work.
 fn validate_identity(field: &'static str, value: &str) -> Result<(), ApiError> {
-    if value.is_empty() {
-        return Err(ApiError::BadRequest(
-            "invalid_identity",
-            format!("{field} must not be empty"),
-        ));
-    }
-    if value.len() > MAX_FIELD_BYTES {
-        return Err(ApiError::BadRequest(
-            "invalid_identity",
-            format!("{field} must be at most {MAX_FIELD_BYTES} bytes"),
-        ));
-    }
-    if !is_safe_identity(value) {
-        return Err(ApiError::BadRequest(
-            "invalid_identity",
-            format!("{field} must be a path-safe identity component"),
-        ));
-    }
-    Ok(())
-}
-
-/// True for the same portable identity shape the manifest layer requires of
-/// `module_id`/`version`, applied to API path/body identities before use.
-fn is_safe_identity(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_FIELD_BYTES
-        && !value.starts_with('.')
-        && !value.ends_with('.')
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+'))
+    validate_identity_value(value)
+        .map_err(|error| ApiError::BadRequest("invalid_identity", format!("{field} {error}")))
 }
 
 /// Attribution is persisted only for identities that passed the safe-charset

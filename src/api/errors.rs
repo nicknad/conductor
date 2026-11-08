@@ -51,6 +51,8 @@ pub enum ApiError {
     PayloadTooLarge(String),
     /// Server is at its concurrent-upload bound.
     Overloaded(String),
+    /// A required subsystem (for example the scheduler loop) is unavailable.
+    Unavailable(&'static str, String),
     /// Validation timed out.
     Timeout,
     /// Unexpected server failure (I/O around quarantine, task join).
@@ -67,7 +69,9 @@ impl ApiError {
             Self::NotFound(..) => StatusCode::NOT_FOUND,
             Self::Conflict(..) => StatusCode::CONFLICT,
             Self::PayloadTooLarge(..) => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::Overloaded(..) | Self::Timeout => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Overloaded(..) | Self::Unavailable(..) | Self::Timeout => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::Internal(..) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -80,7 +84,8 @@ impl ApiError {
             | Self::Unauthorized { code, .. }
             | Self::Unprocessable(code, _)
             | Self::NotFound(code, _)
-            | Self::Conflict(code, _) => code,
+            | Self::Conflict(code, _)
+            | Self::Unavailable(code, _) => code,
             Self::PayloadTooLarge(..) => "payload_too_large",
             Self::Overloaded(..) => "server_busy",
             Self::Timeout => "validation_timeout",
@@ -95,6 +100,7 @@ impl ApiError {
             | Self::Unprocessable(_, message)
             | Self::NotFound(_, message)
             | Self::Conflict(_, message)
+            | Self::Unavailable(_, message)
             | Self::PayloadTooLarge(message)
             | Self::Overloaded(message)
             | Self::Internal(message) => message,

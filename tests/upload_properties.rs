@@ -20,6 +20,7 @@ use conductor::api::uploads::{ApiToken, AppState};
 use conductor::audit::recorder::RejectionRecorder;
 use conductor::control_plane::activate_module::ActivationPolicy;
 use conductor::control_plane::execute_module::ExecutionService;
+use conductor::control_plane::scheduler::SchedulerService;
 use conductor::control_plane::validate_package::PackageValidationBuilder;
 use conductor::executions::executor::ExecutionLimits;
 use conductor::executions::history::ExecutionHistoryStore;
@@ -110,6 +111,15 @@ fn test_state(tag: &str) -> (AppState, PathBuf) {
     let database = Arc::new(Database::open_in_memory().expect("database must open"));
     database.migrate().expect("database must migrate");
     let readiness = Arc::new(Readiness::new(database.check_ready().is_ok()));
+    let scheduler = Arc::new(
+        SchedulerService::in_memory_for_test(
+            Arc::clone(&execution_service),
+            Arc::clone(&metrics),
+            Arc::clone(&readiness),
+            UPLOAD_SLOTS,
+        )
+        .expect("test scheduler must build"),
+    );
     let state = AppState {
         validator: Arc::new(validator),
         quarantine_dir,
@@ -120,6 +130,7 @@ fn test_state(tag: &str) -> (AppState, PathBuf) {
         api_token: ApiToken::new(TOKEN),
         upload_slots: Arc::new(Semaphore::new(UPLOAD_SLOTS)),
         execution_service,
+        scheduler,
         metrics,
         database,
         readiness,

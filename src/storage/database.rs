@@ -20,7 +20,7 @@ use thiserror::Error;
 
 /// Schema version this build produces. Bump alongside a new entry in
 /// `MIGRATIONS`; never edit an entry that has shipped.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Forward-only migrations; index `n` applies version `n + 1`, each string
 /// one statement. The v1 schema backs the module registry, activation, and
@@ -99,6 +99,93 @@ const MIGRATIONS: &[&[&str]] = &[
          )",
         "CREATE INDEX idx_executions_started_at ON executions(started_at)",
         "CREATE INDEX idx_executions_module_version ON executions(module_id, version)",
+    ],
+    &[
+        // Durable job definitions and the run queue. `job_runs.state` is the
+        // queue: a queued row is pending dispatch, a running row is claimed,
+        // and terminal rows are history. Trigger fields are closed and
+        // cross-checked so a row cannot describe two trigger kinds.
+        "CREATE TABLE jobs (
+            job_id        TEXT PRIMARY KEY
+                          CHECK (length(CAST(job_id AS BLOB)) BETWEEN 1 AND 128),
+            module_id     TEXT NOT NULL
+                          CHECK (length(CAST(module_id AS BLOB)) BETWEEN 1 AND 256),
+            version       TEXT NOT NULL
+                          CHECK (length(CAST(version AS BLOB)) BETWEEN 1 AND 256),
+            function      TEXT NOT NULL
+                          CHECK (length(CAST(function AS BLOB)) BETWEEN 1 AND 256),
+            trigger_kind  TEXT NOT NULL
+                          CHECK (trigger_kind IN ('manual','interval','cron')),
+            interval_secs INTEGER
+                          CHECK (interval_secs IS NULL OR interval_secs > 0),
+            cron_expr     TEXT
+                          CHECK (cron_expr IS NULL
+                                 OR length(CAST(cron_expr AS BLOB)) BETWEEN 1 AND 256),
+            timezone      TEXT NOT NULL DEFAULT 'UTC'
+                          CHECK (timezone = 'UTC'),
+            payload_json  TEXT NOT NULL DEFAULT '{}'
+                          CHECK (length(CAST(payload_json AS BLOB)) <= 65536),
+            enabled       INTEGER NOT NULL CHECK (enabled IN (0,1)),
+            next_run_at   INTEGER
+                          CHECK (next_run_at IS NULL OR next_run_at >= 0),
+            created_at    INTEGER NOT NULL CHECK (created_at >= 0),
+            updated_at    INTEGER NOT NULL CHECK (updated_at >= 0),
+            CHECK (
+                (trigger_kind = 'manual'   AND interval_secs IS NULL AND cron_expr IS NULL) OR
+                (trigger_kind = 'interval' AND interval_secs IS NOT NULL AND cron_expr IS NULL) OR
+                (trigger_kind = 'cron'     AND cron_expr IS NOT NULL AND interval_secs IS NULL)
+            ),
+            CHECK (
+                (next_run_at IS NULL AND (trigger_kind = 'manual' OR enabled = 0)) OR
+                (next_run_at IS NOT NULL AND trigger_kind IN ('interval','cron') AND enabled = 1)
+            )
+         )",
+        "CREATE TABLE job_runs (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id           TEXT NOT NULL UNIQUE
+                             CHECK (length(CAST(run_id AS BLOB)) BETWEEN 1 AND 128),
+            job_id           TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE RESTRICT,
+            attempt_no       INTEGER NOT NULL DEFAULT 1 CHECK (attempt_no >= 1),
+            trigger_kind     TEXT NOT NULL
+                             CHECK (trigger_kind IN ('manual','interval','cron')),
+            scheduled_for    INTEGER NOT NULL CHECK (scheduled_for >= 0),
+            state            TEXT NOT NULL
+                             CHECK (state IN (
+                                 'queued','running','succeeded','failed','refused','interrupted'
+                             )),
+            claimed_by       TEXT
+                             CHECK (claimed_by IS NULL
+                                    OR length(CAST(claimed_by AS BLOB)) BETWEEN 1 AND 128),
+            lease_expires_at INTEGER
+                             CHECK (lease_expires_at IS NULL OR lease_expires_at >= 0),
+            execution_id     TEXT
+                             CHECK (execution_id IS NULL
+                                    OR length(CAST(execution_id AS BLOB)) BETWEEN 1 AND 128),
+            outcome          TEXT
+                             CHECK (outcome IS NULL OR outcome IN (
+                                 'succeeded','failed','timed_out','cancelled',
+                                 'worker_error','protocol_violation'
+                             )),
+            failure_code     TEXT
+                             CHECK (failure_code IS NULL OR failure_code IN (
+                                 'module_not_found','module_not_active','artifact_not_intact',
+                                 'runtime_not_allowed','execution_not_permitted',
+                                 'deadline_exceeded','server_busy','artifact_integrity_failed',
+                                 'legacy_manifest','manifest_invalid','archive_invalid',
+                                 'package_invalid','history_write_failed','job_disabled',
+                                 'invalid_job_definition','internal','interrupted'
+                             )),
+            created_at       INTEGER NOT NULL CHECK (created_at >= 0),
+            started_at       INTEGER CHECK (started_at IS NULL OR started_at >= 0),
+            finished_at      INTEGER CHECK (finished_at IS NULL OR finished_at >= 0)
+         )",
+        "CREATE INDEX idx_job_runs_state ON job_runs(state, scheduled_for)",
+        "CREATE INDEX idx_job_runs_job ON job_runs(job_id, created_at)",
+        "CREATE UNIQUE INDEX idx_job_runs_execution
+             ON job_runs(execution_id) WHERE execution_id IS NOT NULL",
+        "CREATE UNIQUE INDEX idx_job_runs_tick
+             ON job_runs(job_id, trigger_kind, scheduled_for, attempt_no)
+             WHERE trigger_kind IN ('interval','cron')",
     ],
 ];
 
@@ -326,6 +413,8 @@ mod tests {
             "active_versions",
             "package_rejections",
             "executions",
+            "jobs",
+            "job_runs",
         ] {
             let count: i64 = db
                 .with_connection(|conn| {
@@ -467,6 +556,51 @@ mod tests {
         assert_eq!(stored.1, "k1");
         assert_eq!(stored.2, "1.2.0");
         assert_eq!(stored.3, "kept");
+    }
+
+    #[test]
+    fn migrate_upgrades_a_v2_schema_without_touching_execution_history() {
+        use rusqlite::params;
+
+        let db = Database::open_in_memory().expect("in-memory database must open");
+        db.with_connection(|conn| {
+            for statement in MIGRATIONS[0] {
+                conn.execute_batch(statement)?;
+            }
+            for statement in MIGRATIONS[1] {
+                conn.execute_batch(statement)?;
+            }
+            conn.pragma_update(None, "user_version", 2)?;
+            conn.execute(
+                "INSERT INTO executions (
+                    execution_id, module_id, version, digest, function, outcome,
+                    started_at, finished_at, duration_ms
+                 ) VALUES ('exec-v2', 'module', '1.0.0', ?1, 'run', 'succeeded', 10, 20, 10)",
+                params!["ab".repeat(32)],
+            )?;
+            Ok::<(), DatabaseError>(())
+        })
+        .expect("v2 schema and row must be written");
+
+        db.migrate().expect("v2 database must upgrade to v3");
+
+        let (version, execution_count, job_count, run_count): (i64, i64, i64, i64) = db
+            .with_connection(|conn| {
+                let version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+                let execution_count =
+                    conn.query_row("SELECT COUNT(*) FROM executions", [], |row| row.get(0))?;
+                let job_count =
+                    conn.query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))?;
+                let run_count =
+                    conn.query_row("SELECT COUNT(*) FROM job_runs", [], |row| row.get(0))?;
+                Ok::<_, DatabaseError>((version, execution_count, job_count, run_count))
+            })
+            .expect("upgraded schema must read");
+
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(execution_count, 1, "v2 history must survive the upgrade");
+        assert_eq!(job_count, 0);
+        assert_eq!(run_count, 0);
     }
 
     #[test]

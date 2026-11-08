@@ -86,6 +86,9 @@ conversion decides the final names; use the names your backend exposes.
 | `conductor.db.lock.wait.duration` | histogram | `s` | none | Time spent waiting for the shared connection mutex |
 | `conductor.storage.free.bytes` | observable gauge | `By` | none | Free space under the configured storage root (Unix `statvfs`) |
 | `conductor.artifact.integrity.failures` | counter | `{failure}` | bounded kind | Activation/execution refused an artifact integrity check |
+| `conductor.job.wait.duration` | histogram | `s` | none | A queued run waited from its due time to claim |
+| `conductor.job.queue.depth` | up-down counter | `{run}` | none | Durable queue depth at the last scheduler transition |
+| `conductor.job.active` | up-down counter | `{run}` | none | Runs currently claimed by the dispatcher |
 
 Bounded integrity kinds include `path`, `missing`, `unreadable`, `size`,
 `digest`, `manifest`, `archive`, `legacy`, `staging`, `target`, and
@@ -93,8 +96,8 @@ Bounded integrity kinds include `path`, `missing`, `unreadable`, `size`,
 `integrity`, `runtime`, `signer`, `legacy_manifest`, `manifest`, `archive`,
 `staging`, `target`, `executor`, `deadline`, and `internal`.
 
-`conductor.job.wait.duration` is defined for the future scheduler but is not
-emitted today.
+Scheduler slice 1 emits `conductor.job.wait.duration` at claim time, plus
+`conductor.job.queue.depth` and `conductor.job.active`.
 
 After your backend normalizes OTLP names, useful queries are conceptually:
 
@@ -132,8 +135,10 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://host:port/readyz
 `/healthz` and `/readyz` are unauthenticated. `/readyz` reads two atomics; it
 never probes SQLite on the request path. A bounded background watcher
 re-probes the shared database every five seconds through a one-permit
-semaphore. The scheduler flag defaults to `true` because no scheduler exists
-yet.
+semaphore. The scheduler flag is set by the scheduler lifecycle: false before
+start, true only after the loop-ready handshake, and false again on stop,
+panic, or a failed tick. Job triggers return `503 scheduler_unavailable` while
+the scheduler is not running.
 
 Readiness is not proof that writes succeed, that the disk has room, or that
 every registered module is runnable. In particular, an all-`missing` registry
@@ -189,6 +194,7 @@ worker-provided failure text.
 | An upload was refused | 4xx/5xx + exactly one `package_rejections` row | API call, then SQL | Some transport paths bypass the handler mapper |
 | An execution succeeded | Response receipt + `conductor.execution.completed{outcome="succeeded"}` + `executions` row | Execute, then metric backend and SQL | Does not prove worker output correctness |
 | An execution was refused before spawn | `conductor.execution.refused{reason}` | Metric backend | No history row by design |
+| A manual job ran | `202` trigger + `job_runs.state=succeeded` + matching `executions` row + `conductor.job.wait.duration` | Trigger, poll `/v1/jobs/{id}/runs`, SQL, metric backend | Run rows store no payload/stdout/stderr; at-most-once |
 | An artifact is damaged | `conductor.artifact.integrity.failures{kind}` + activation/execution refusal | Activate/execute, then metric backend and SQL | `ok` means bytes match the row, not safe-to-execute |
 | Startup reconciliation ran | `artifact reconciliation complete scanned=...` log + `integrity_state` rows | Startup log and SQL | No reconciliation metric or readiness signal yet |
 | Execution capacity is saturated | `slots.in_use` vs `slots.capacity`, `overload` | Metric backend | No per-module labels |
@@ -275,8 +281,9 @@ Do **not** use `/readyz` as proof that reconciliation found healthy artifacts.
 | Reconciliation has no metric yet | Use logs + SQLite + activation refusal |
 | Counters are process-lifetime | Use `rate`/`increase`; restarts reset them |
 | Bounded metric labels | Module/version/execution diagnosis is via logs/SQL, not metrics |
-| No retention/GC for rejections or history | Both tables grow without bound |
-| No scheduler/job metrics | `conductor.job.wait.duration` is defined but not emitted |
+| No retention/GC for rejections, history, or job runs | All three grow without bound; queue/job counts are capped but terminal `job_runs` are not |
+| No interval/cron scheduler metrics | Slice 1 emits only manual-run wait/queue/active signals; due-tick and cron lag are later slices |
+| `Readiness::new` defaults the scheduler flag true for fixtures | A direct `Host::into_state()` embedder that never starts the scheduler can report `/readyz` 200; triggers still return `scheduler_unavailable` |
 | Metrics are ephemeral | No durable metrics store; SQLite is the durable authority |
 
 ## 8. References

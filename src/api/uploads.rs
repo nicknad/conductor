@@ -134,6 +134,9 @@ pub struct AppState {
     /// Registered-artifact execution service. Built once at startup around
     /// the shared registry, immutable policy, and artifact/staging roots.
     pub execution_service: Arc<ExecutionService>,
+    /// Durable job store and single-process dispatcher. The scheduler only
+    /// calls the pinned execution service; it never owns execution policy.
+    pub scheduler: Arc<crate::control_plane::scheduler::SchedulerService>,
     /// Process metrics handle. Instruments are cached; handlers only record.
     pub metrics: Arc<crate::metrics::Metrics>,
     /// Shared database handle used by the readiness watcher and tests.

@@ -450,11 +450,10 @@ Deferred: repair after restore or replacement (`Missing --> Ok`,
 `Mismatch --> Ok`), orphan scanning, artifact GC, and one
 `reconciliation_runs` row per pass.
 
-## 11. Scheduler / triggering (**planned**)
+## 11. Scheduler / triggering (**manual slice implemented; interval/cron/retry planned**)
 
-Source: [architecture.md](architecture.md#not-built-yet),
-`src/readiness.rs` (`scheduler_ready` hook),
-`src/metrics.rs` (`conductor.job.wait.duration`, not emitted).
+Source: `src/control_plane/scheduler/`, `src/readiness.rs`,
+`src/metrics.rs` (`conductor.job.wait.duration`, queue/active gauges).
 
 ```mermaid
 stateDiagram-v2
@@ -478,12 +477,15 @@ stateDiagram-v2
     Refused --> Idle
 
     note right of Queued
-        Durable job state, triggers, attempts,
-        retries, and idempotency do not exist yet.
+        Slice 1 implements the durable queued/running/
+        succeeded/failed/refused/interrupted path for
+        manual jobs. Interval/cron due ticks, retries,
+        cancellation, and idempotency keys are later.
     end note
     note right of Ready
-        The scheduler should own the scheduler_ready
-        flag used by /readyz.
+        The scheduler owns the scheduler_ready flag:
+        true only after the loop-ready handshake, false
+        on stop/panic/tick failure.
     end note
 ```
 
@@ -522,7 +524,7 @@ guarantee beyond the dependencies noted.
 
 | Priority | Work item | Current evidence | Blocks |
 | --- | --- | --- | --- |
-| 1 | **Scheduler / triggering**: durable job definitions, cron/interval triggers, queueing, dispatch, retry/attempt semantics, cancellation, scheduler readiness hook, job-wait histogram | No scheduler module; `scheduler_ready` defaults true; `conductor.job.wait.duration` is defined but not emitted | Produces the jobs the platform exists to run |
+| 1 | **Scheduler / triggering**: durable job definitions, cron/interval triggers, queueing, dispatch, retry/attempt semantics, cancellation, scheduler readiness hook, job-wait histogram | Slice 1 implements durable manual jobs, manual triggers, queue/dispatch, recovery, readiness, and job wait/queue/active metrics. Interval/cron triggers, retries, cancellation, and multi-process ownership remain | Produces the jobs the platform exists to run |
 | 2 | **Operator CLI**: upload, validate, activate, execute, history, lifecycle, reconcile commands | `tests/cli.rs` only drives startup failures; no CLI module | Operator usability; today everything is raw HTTP |
 | 3 | **Module lifecycle transitions**: deactivate, remove, rollback, drain running work, reference counting | `src/control_plane/lifecycle.rs` is a placeholder; `clear_active` / `remove_version` are registry primitives with no caller | Artifact GC and safe upgrades |
 | 4 | **Startup reconciliation**: scan registry vs artifact store, populate `Missing`/`Mismatch`, repair or quarantine, record `reconciliation_runs` | Classifier and startup wiring implemented in `Host::assemble`; repair, orphan detection, and `reconciliation_runs` deferred; design says PR4 | Trustworthy restart state |

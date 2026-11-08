@@ -26,6 +26,10 @@ use crate::config::{Config, ConfigError};
 use crate::control_plane::activate_module::{ActivationError, ActivationPolicy};
 use crate::control_plane::execute_module::{ExecutionError, ExecutionService};
 use crate::control_plane::reconcile::{reconcile_registry, ReconcileError};
+use crate::control_plane::scheduler::dispatch::ExecutionDispatcher;
+use crate::control_plane::scheduler::{
+    JobStore, JobStoreLimits, SchedulerConfig, SchedulerService,
+};
 use crate::control_plane::validate_package::{BuildError, PackageValidationBuilder};
 use crate::executions::executor::ExecutionLimits;
 use crate::executions::history::ExecutionHistoryStore;
@@ -158,6 +162,31 @@ impl Host {
             Arc::clone(&metrics),
         )?);
 
+        // The scheduler shares the one database and execution service. Its
+        // queue bound scales with execution capacity but stays finite, so an
+        // authenticated caller cannot grow unbounded queued work.
+        let max_queued_runs = config
+            .max_concurrent_executions
+            .saturating_mul(64)
+            .clamp(64, 4096);
+        let job_store = Arc::new(JobStore::new(
+            Arc::clone(&database),
+            JobStoreLimits {
+                max_jobs: 1024,
+                max_queued_runs,
+            },
+        ));
+        let scheduler = Arc::new(SchedulerService::new(
+            job_store,
+            Arc::new(ExecutionDispatcher::new(Arc::clone(&execution_service))),
+            Arc::clone(&metrics),
+            Arc::clone(&readiness),
+            SchedulerConfig {
+                max_concurrent_runs: config.max_concurrent_executions,
+                ..SchedulerConfig::default()
+            },
+        ));
+
         // `validate_for_startup` guarantees a token; do not panic if that
         // invariant is ever weakened — fail closed instead.
         let api_token = config
@@ -174,6 +203,7 @@ impl Host {
             api_token: ApiToken::new(api_token),
             upload_slots: Arc::new(Semaphore::new(config.max_concurrent_uploads)),
             execution_service,
+            scheduler,
             metrics,
             database,
             readiness,
@@ -215,6 +245,13 @@ impl Host {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let Self { config, state } = self;
         let metrics = Arc::clone(&state.metrics);
+        let scheduler = Arc::clone(&state.scheduler);
+        state.readiness.set_scheduler_ready(false);
+        // Scheduler startup is part of startup: a host that cannot dispatch
+        // must not bind a listener and report ready.
+        if let Err(error) = scheduler.start().await {
+            return Err(Box::new(error));
+        }
         // Readiness is refreshed off the request path. The watcher is bounded
         // to one in-flight probe and is aborted once serving ends, whether it
         // succeeded or failed during bind.
@@ -232,6 +269,7 @@ impl Host {
         )
         .await;
         readiness_watcher.abort();
+        scheduler.stop().await;
         // Flush on both success and failure. Run shutdown off the async worker:
         // the periodic reader's docs warn that current-thread runtimes can
         // deadlock if shutdown blocks the runtime thread.

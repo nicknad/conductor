@@ -18,6 +18,7 @@ use conductor::audit::recorder::RejectionRecorder;
 use conductor::config::{Config, TrustedKeyConfig};
 use conductor::control_plane::activate_module::ActivationPolicy;
 use conductor::control_plane::execute_module::ExecutionService;
+use conductor::control_plane::scheduler::SchedulerService;
 use conductor::control_plane::validate_package::PackageValidationBuilder;
 use conductor::executions::executor::ExecutionLimits;
 use conductor::executions::history::ExecutionHistoryStore;
@@ -203,6 +204,15 @@ fn build_state(metrics: Arc<Metrics>, database: Arc<Database>, tag: &str) -> (Ap
         .expect("execution service must build"),
     );
 
+    let scheduler = Arc::new(
+        SchedulerService::in_memory_for_test(
+            Arc::clone(&execution_service),
+            Arc::clone(&metrics),
+            Arc::clone(&readiness),
+            4,
+        )
+        .expect("test scheduler must build"),
+    );
     let state = AppState {
         validator: Arc::new(validator),
         quarantine_dir,
@@ -213,6 +223,7 @@ fn build_state(metrics: Arc<Metrics>, database: Arc<Database>, tag: &str) -> (Ap
         api_token: ApiToken::new(TOKEN),
         upload_slots: Arc::new(Semaphore::new(4)),
         execution_service,
+        scheduler,
         metrics,
         database,
         readiness,

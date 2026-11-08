@@ -1,15 +1,15 @@
 # Next session context
 
 Upload, validation, persistence, activation, execution, history, metrics,
-readiness, and classify-only startup reconciliation are implemented. The next
-milestone is scheduler/triggering, priority 1 in
-[statecharts.md](statecharts.md#remaining-work).
+readiness, classify-only startup reconciliation, and Scheduler slice 1
+(durable manual jobs, manual trigger, queue/dispatch, recovery, job metrics)
+are implemented.
 
-## Recommended: plan Scheduler slice 1
+## Recommended: Scheduler slice 2 (interval triggers)
 
-Slice 1 should cover durable job definitions, a loop that enqueues due work,
-job/attempt persistence, a CRUD/manual-trigger API, a real readiness hook, and
-the already-defined job-wait metric. Defer retries, cancellation, drain, and
+Add bounded interval triggers, durable `next_run_at` scheduling, due-tick
+enqueue with duplicate-tick protection, and restart catch-up. Then add UTC cron
+triggers. Defer retries, cancellation, drain, distributed scheduling, and
 artifact GC.
 
 Do a short housekeeping commit first: sync local `main` and delete the stale

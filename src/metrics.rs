@@ -55,8 +55,10 @@ pub const DB_BUSY_ERRORS: &str = "conductor.db.busy.errors";
 pub const DB_LOCK_WAIT_DURATION: &str = "conductor.db.lock.wait.duration";
 pub const STORAGE_FREE_BYTES: &str = "conductor.storage.free.bytes";
 pub const ARTIFACT_INTEGRITY_FAILURES: &str = "conductor.artifact.integrity.failures";
+pub const JOB_QUEUE_DEPTH: &str = "conductor.job.queue.depth";
+pub const JOB_ACTIVE: &str = "conductor.job.active";
 
-/// Future instrument (not emitted by this slice) viewed with job-wait buckets.
+/// Time from a run's scheduled/due time to the dispatcher claiming it.
 pub const JOB_WAIT_DURATION: &str = "conductor.job.wait.duration";
 
 const INSTRUMENTATION_SCOPE: &str = "conductor";
@@ -322,6 +324,18 @@ impl Drop for ExecutionSlotGuard {
     }
 }
 
+/// Guard that tracks [`JOB_ACTIVE`]. Dropping it releases the gauge exactly
+/// once, including when a dispatch task is cancelled.
+pub struct JobActiveGuard {
+    metrics: Arc<Metrics>,
+}
+
+impl Drop for JobActiveGuard {
+    fn drop(&mut self) {
+        self.metrics.instruments.job_active.add(-1, &[]);
+    }
+}
+
 #[derive(Clone)]
 struct Instruments {
     http_requests: opentelemetry::metrics::Counter<u64>,
@@ -337,6 +351,9 @@ struct Instruments {
     db_busy_errors: opentelemetry::metrics::Counter<u64>,
     db_lock_wait_duration: opentelemetry::metrics::Histogram<f64>,
     artifact_integrity_failures: opentelemetry::metrics::Counter<u64>,
+    job_wait_duration: opentelemetry::metrics::Histogram<f64>,
+    job_queue_depth: opentelemetry::metrics::UpDownCounter<i64>,
+    job_active: opentelemetry::metrics::UpDownCounter<i64>,
     // Observable handles are retained with the rest of the cached instruments.
     _execution_slots_capacity: opentelemetry::metrics::ObservableGauge<u64>,
     _storage_free_bytes: opentelemetry::metrics::ObservableGauge<u64>,
@@ -539,6 +556,46 @@ impl Metrics {
             .record(duration.as_secs_f64(), &[]);
     }
 
+    /// Records how long a run waited from its due time to claim.
+    pub fn record_job_wait(&self, duration: Duration) {
+        self.instruments
+            .job_wait_duration
+            .record(duration.as_secs_f64(), &[]);
+    }
+
+    /// Adds one durable queued run.
+    pub fn job_enqueued(&self) {
+        self.instruments.job_queue_depth.add(1, &[]);
+    }
+
+    /// Removes queued runs terminalized without dispatch (for example by a
+    /// disable).
+    pub fn job_terminalized_queued(&self, count: usize) {
+        let count = i64::try_from(count).unwrap_or(i64::MAX);
+        if count > 0 {
+            self.instruments.job_queue_depth.add(-count, &[]);
+        }
+    }
+
+    /// Seeds the queue gauge from durable state at startup.
+    pub fn initialize_job_queue_depth(&self, count: usize) {
+        let count = i64::try_from(count).unwrap_or(i64::MAX);
+        if count > 0 {
+            self.instruments.job_queue_depth.add(count, &[]);
+        }
+    }
+
+    /// Starts an active-run gauge guard and removes the claimed run from the
+    /// queue gauge.
+    #[must_use]
+    pub fn job_claimed(self: &Arc<Self>) -> JobActiveGuard {
+        self.instruments.job_queue_depth.add(-1, &[]);
+        self.instruments.job_active.add(1, &[]);
+        JobActiveGuard {
+            metrics: Arc::clone(self),
+        }
+    }
+
     /// Flushes all readers. Used by tests and optional operator hooks.
     pub fn force_flush(&self) -> Result<(), MetricsError> {
         self._provider
@@ -666,6 +723,18 @@ fn create_instruments(meter: &Meter, options: &MetricsOptions) -> Instruments {
         artifact_integrity_failures: meter
             .u64_counter(ARTIFACT_INTEGRITY_FAILURES)
             .with_unit("{failure}")
+            .build(),
+        job_wait_duration: meter
+            .f64_histogram(JOB_WAIT_DURATION)
+            .with_unit("s")
+            .build(),
+        job_queue_depth: meter
+            .i64_up_down_counter(JOB_QUEUE_DEPTH)
+            .with_unit("{run}")
+            .build(),
+        job_active: meter
+            .i64_up_down_counter(JOB_ACTIVE)
+            .with_unit("{run}")
             .build(),
         _execution_slots_capacity: capacity_gauge,
         _storage_free_bytes: storage_gauge,

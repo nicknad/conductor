@@ -28,7 +28,7 @@ src/
   config.rs             Host configuration (bind, storage root, timeouts, TLS paths, rate floor, slots)
   metrics.rs            Ephemeral OpenTelemetry metrics, OTLP/HTTP export, views, cached instruments
   api/                  HTTP interface: routes, uploads, bearer auth, transport guards, rejections
-  control_plane/        Upload workflow, validation, registration, activation, lifecycle transitions
+  control_plane/        Upload workflow, validation, registration, activation, lifecycle transitions, scheduler
   packages/             Untrusted-bytes rules: zip, manifest, signature, digest, inventory, policy, artifact identity
   modules/registry      Registered module versions (memory or SQLite); idempotent / conflict semantics
   storage/              Quarantine, artifact store, verified staging, SQLite connection + migrations
@@ -72,7 +72,10 @@ state behind:
    the registry exists and before readiness, execution services, or the
    router are built.
 8. The assembled `Host` builds the router (configured bearer token, upload
-   slots, request timeout) and serves TLS-only on the configured bind.
+   slots, request timeout) and starts the scheduler. Scheduler recovery and
+   the loop-ready handshake run before TLS bind; a scheduler start failure
+   aborts startup with no listener. The host then serves TLS-only on the
+   configured bind.
 
 Failures at any step abort startup without binding a listener.
 
@@ -203,6 +206,30 @@ is not atomic with `exec`, so a same-uid writer inside the 0700 staging
 directory can still race the final path resolution. HTTP exposure must not
 weaken these invariants.
 
+### Scheduler slice 1 (`control_plane::scheduler`)
+
+Durable job definitions live in `jobs`; `job_runs.state` is the durable queue.
+Scheduler slice 1 supports manual jobs and manual triggers only. A job pins
+`(module_id, version, function)` and a bounded JSON payload.
+
+One `SchedulerService` loop claims queued runs with an immediate SQLite
+transaction, records `started_at`/`claimed_by`/`lease_expires_at`, and hands
+the run to a narrow `ExecutionDispatcher`. That wrapper exposes only
+`ExecutionService::execute` with a mandatory pinned version and the host
+deadline; it has no activation, registry, artifact, staging, or worker-spawn
+surface. The scheduler cannot repoint `active_versions` and cannot bypass the
+execution checks described above.
+
+Terminal run states are `succeeded`, `failed`, `refused`, and `interrupted`,
+with a closed failure-code vocabulary. Disabling a job terminalizes its queued
+runs. Startup marks previously running rows `interrupted` and refuses queued
+rows for disabled jobs; Slice 1 is at-most-once and does not replay a worker.
+The loop owns scheduler readiness and emits job wait/queue/active metrics.
+A loop panic or tick failure flips readiness false; in-flight run rows remain
+`running` until restart recovery marks them `interrupted`. Interval/cron
+triggers, retries, cancellation, multi-process ownership, and retention are
+later slices.
+
 ### Execution history (`executions::history`)
 
 Every completed worker execution — including `failed`, `timed_out`,
@@ -300,8 +327,10 @@ cannot false-503 under probe flood. Readiness is not a write/disk-full proof.
 
 ## Not built yet
 
-Scheduler/triggering, CLI, artifact GC, and execution-history
-retention/GC. Startup reconciliation is classify-only: it sets
+Interval/cron triggering, retries, cancellation, distributed scheduling, CLI,
+artifact GC, and execution-history retention/GC. Scheduler slice 1 provides
+durable manual jobs, manual triggers, a single-process dispatcher, readiness,
+and job metrics. Startup reconciliation is classify-only: it sets
 `ok`/`missing`/`mismatch` but does not repair artifacts or detect orphans,
 and it does not yet record `reconciliation_runs`.
 `control_plane/lifecycle.rs` is currently a placeholder for

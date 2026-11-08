@@ -6,5 +6,6 @@ pub mod execute_module;
 pub mod lifecycle;
 pub mod reconcile;
 pub mod register_package;
+pub mod scheduler;
 pub mod upload_package;
 pub mod validate_package;

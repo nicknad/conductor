@@ -43,6 +43,7 @@ jobs:
           - upload_workflow
           - http_upload
           - http_execution
+          - http_jobs
     steps:
       - name: Checkout
         uses: actions/checkout@v7

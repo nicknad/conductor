@@ -167,7 +167,7 @@ impl fmt::Debug for ExecutionRequest {
             .field("version", &self.version)
             .field("digest_hex", &self.digest_hex)
             .field("function", &self.function)
-            .field("configuration", &self.configuration)
+            .field("configuration", &"[redacted]")
             .field("deadline_ms", &self.deadline_ms)
             .field(
                 "secrets",
@@ -306,7 +306,9 @@ mod tests {
             request().with_secrets(BTreeMap::from([("db".to_owned(), "hunter2".to_owned())]));
         let debug = format!("{request:?}");
         assert!(debug.contains("[1 redacted]"));
+        assert!(debug.contains("configuration: \"[redacted]\""));
         assert!(!debug.contains("hunter2"));
+        assert!(!debug.contains("batch"));
     }
 
     #[test]

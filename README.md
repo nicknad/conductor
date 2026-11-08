@@ -5,10 +5,11 @@
 
 > **Development is not finished:** this is an in-progress implementation, not a
 > complete job scheduler. Package ingestion, host startup wiring, the
-> worker execution library, the activation/execution HTTP endpoints, and
-> durable execution history exist, but scheduling and the operator CLI are
-> still outstanding. Do not treat it as a finished or production-ready
-> product.
+> worker execution library, the activation/execution HTTP endpoints,
+> durable execution history, and Scheduler slice 1 (durable manual jobs)
+> exist, but interval/cron scheduling, retries, lifecycle transitions, and
+> the operator CLI are still outstanding. Do not treat it as a finished or
+> production-ready product.
 
 A single-machine job execution platform supporting installing, validating, activating,
 updating, disabling, removing, and rolling back job plugin implementations **without
@@ -148,6 +149,41 @@ row. Invalid pagination and execution ids are `400` with stable codes;
 unknown ids are `404`; history read/write failures are generic `500`s. There is
 no retention or garbage collection yet, so history grows without bound.
 
+### Jobs API (unstable)
+
+Scheduler slice 1 adds durable manual jobs. Every route is
+bearer-authenticated. The job definition pins `module_id`, `version`, and
+`function`; dispatch always goes through the same pinned execution service as
+`POST /v1/modules/{module_id}/executions`, so activation, runtime, integrity,
+signer, manifest, artifact, staging, and target checks still apply.
+
+- `POST /v1/jobs` with `{module_id, version, function, trigger, payload?,
+  enabled?}` creates a durable job. Slice 1 accepts
+  `{"trigger":{"kind":"manual"}}`; interval and cron are rejected with
+  `invalid_trigger`. The payload is bounded to 64 KiB of canonical JSON and is
+  never returned by the API.
+- `GET /v1/jobs?limit=<1..=200>&offset=<0..=1000000>` lists jobs newest first.
+- `POST /v1/jobs/{job_id}/enable` and `POST /v1/jobs/{job_id}/disable` toggle
+  the job. Disable terminalizes queued runs as `refused`/`job_disabled`.
+- `POST /v1/jobs/{job_id}/trigger` enqueues one manual run and returns `202
+  {job_id, run_id, state:"queued"}`. Manual triggers are not idempotent in this
+  slice; two calls are two runs.
+- `GET /v1/jobs/{job_id}/runs?limit=...&offset=...` lists durable run rows
+  newest first. A run records its stable state, timestamps, linked
+  `execution_id`, worker outcome, or bounded scheduler failure code. No payload,
+  stdout, or stderr is stored on the run.
+
+A trigger while the scheduler loop is not running returns `503
+scheduler_unavailable`; a disabled job returns `409 job_disabled`; a full job
+or queue bound returns `503 server_busy`. Startup recovery marks previously
+running rows `interrupted` and refuses queued rows for disabled jobs. Slice 1
+is single-process and at-most-once: a crash after claim does not replay the
+worker. A loop panic or tick failure flips `/readyz` to `503`; in-flight run
+rows remain `running` until restart recovery marks them `interrupted`. There is
+no job/run retention yet, so terminal rows and job payloads grow until a later
+retention slice. Interval/cron triggers, retries, cancellation, and retention
+are later slices.
+
 ## Host configuration
 
 Configuration loading lives in `src/config.rs` and is consumed at startup by
@@ -261,6 +297,9 @@ error text):
 | `conductor.db.lock.wait.duration` | histogram | `s` | none |
 | `conductor.storage.free.bytes` | observable gauge | `By` | none (Unix `statvfs`) |
 | `conductor.artifact.integrity.failures` | counter | `{failure}` | bounded integrity kind |
+| `conductor.job.wait.duration` | histogram | `s` | none |
+| `conductor.job.queue.depth` | up-down counter | `{run}` | none |
+| `conductor.job.active` | up-down counter | `{run}` | none |
 
 `http.request.method` is normalized to the standard closed set (`GET`, `POST`,
 `PUT`, `DELETE`, `HEAD`, `OPTIONS`, `PATCH`, `CONNECT`, `TRACE`); any other
@@ -268,7 +307,7 @@ method becomes `_OTHER`, so custom method tokens cannot create unbounded
 labels or exhaust the stream cardinality limit.
 
 Histogram buckets are fixed in `src/metrics.rs` (HTTP, execution, DB lock
-wait, plus a future job-wait view). Resource attributes are
+wait, and job wait). Resource attributes are
 `service.name=conductor`, `service.version`, `deployment.environment.name`,
 `service.instance.id`, and `host.name`; the instrumentation scope is
 `conductor`.
@@ -281,11 +320,12 @@ when it lands.
 
 `/readyz` reads a cached readiness state: the host probes the shared database
 off the request path every few seconds through a bounded watcher (one probe at
-a time on the blocking pool), and the scheduler-ready flag defaults to true.
+a time on the blocking pool). The scheduler flag becomes true only after the
+scheduler loop starts and its ready handshake completes; a failed start keeps
+the listener unbound, and a later loop stop/panic makes the host `503`.
 Requests never run a database probe and cannot produce a false `503` under
 flood. Readiness is not proof that the disk has free space or that writes
-succeed; it covers database/migration availability plus the future scheduler
-hook.
+succeed; it covers database/migration availability plus scheduler lifecycle.
 
 See [docs/observability.md](docs/observability.md) for metric semantics, proof
 recipes, and the agent validation protocol.

@@ -7,8 +7,9 @@
 //!
 //! Both flags must be true. The database flag reflects the shared database
 //! being at the current schema version and answering a trivial query. The
-//! scheduler flag defaults to ready because no scheduler exists yet; the
-//! future scheduler can set it without changing the HTTP route.
+//! scheduler flag starts ready for router fixtures; the serving host sets it
+//! false before scheduler start and the scheduler sets it true only after its
+//! loop-ready handshake.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +23,8 @@ pub struct Readiness {
 
 impl Readiness {
     /// Builds readiness with the current database result. The scheduler flag
-    /// starts ready because this host has no scheduler component.
+    /// starts ready so router-only fixtures remain usable; the serving host
+    /// clears it before starting the scheduler.
     #[must_use]
     pub fn new(db_ready: bool) -> Self {
         Self {
