@@ -7,14 +7,11 @@ are implemented.
 
 ## Recommended: Scheduler slice 2 (interval triggers)
 
+Start with [handover-scheduler-slice-2.md](handover-scheduler-slice-2.md).
 Add bounded interval triggers, durable `next_run_at` scheduling, due-tick
 enqueue with duplicate-tick protection, and restart catch-up. Then add UTC cron
 triggers. Defer retries, cancellation, drain, distributed scheduling, and
 artifact GC.
-
-Do a short housekeeping commit first: sync local `main` and delete the stale
-`chore/land-observability-readiness` and
-`feat/startup-reconciliation-classifier` branches.
 
 ## Small wins if scheduler is too large
 
