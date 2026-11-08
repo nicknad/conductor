@@ -9,6 +9,10 @@ pub mod job;
 pub mod service;
 pub mod store;
 
+mod cron;
+
+pub(crate) use cron::validate_cron_expr;
+
 pub use job::{
     ClaimedRun, JobDefinition, JobFailureCode, JobRun, JobRunState, NewJob, RunCompletion, Trigger,
     TriggerKind,

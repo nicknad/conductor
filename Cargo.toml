@@ -20,6 +20,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 tower = { version = "0.5", features = ["util", "timeout"] }
 tower-http = { version = "0.7", features = ["trace", "limit", "timeout", "set-header", "catch-panic", "request-id"] }
 base64 = "0.23.1"
+croner = "4.0.3"
+chrono = { version = "0.4.42", default-features = false, features = ["std"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 subtle = "2.6.1"
 opentelemetry = { version = "0.33.1", default-features = false, features = ["metrics"] }

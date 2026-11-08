@@ -13,6 +13,7 @@ use thiserror::Error;
 use crate::modules::identity::MAX_IDENTITY_BYTES;
 use crate::storage::database::{from_millis, to_millis, Database, DatabaseError};
 
+use super::cron;
 use super::job::{
     advance_interval_due, next_run_id, validate_completion, validate_new_job, validate_payload,
     validate_run_semantics, ClaimedRun, JobDefinition, JobFailureCode, JobRun, JobRunState,
@@ -82,13 +83,16 @@ pub struct RecoveryReport {
     pub disabled_queued: usize,
 }
 
-/// Outcome of one due-interval enqueue pass.
+/// Outcome of one due interval/cron enqueue pass.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DueEnqueueReport {
     pub enqueued: usize,
     pub deduped: usize,
     pub skipped_full: usize,
+    pub skipped_invalid: usize,
 }
+
+type DueJobRow = (Vec<u8>, Vec<u8>, Option<i64>, Option<Vec<u8>>, i64);
 
 /// Durable job/run repository over the shared database.
 #[derive(Debug)]
@@ -310,24 +314,37 @@ impl JobStore {
         })
     }
 
-    /// Enqueues one queued run for each enabled interval job whose
+    /// Enqueues one queued run for each enabled interval/cron job whose
     /// `next_run_at` is due, then advances every attempted job to the first
     /// boundary after `now`. A full queue leaves `next_run_at` untouched so a
-    /// later tick retries instead of dropping the due time.
+    /// later tick retries instead of dropping the due time. An unparseable or
+    /// impossible expression is skipped without failing the pass.
     pub fn enqueue_due_runs(&self, now: SystemTime) -> Result<DueEnqueueReport, JobStoreError> {
         let now_ms = to_millis(now);
         self.database.with_write_tx(|tx| {
-            let due: Vec<(String, i64, i64)> = {
+            let due: Vec<DueJobRow> = {
                 let mut statement = tx.prepare(
-                    "SELECT job_id, interval_secs, next_run_at FROM jobs \
-                     WHERE enabled = 1 AND trigger_kind = 'interval' \
-                     AND interval_secs IS NOT NULL AND next_run_at IS NOT NULL \
-                     AND interval_secs BETWEEN ?2 AND ?3 \
-                     AND next_run_at <= ?1 ORDER BY next_run_at, job_id",
+                    "SELECT job_id, trigger_kind, interval_secs, cron_expr, next_run_at \
+                     FROM jobs WHERE enabled = 1 \
+                     AND trigger_kind IN ('interval', 'cron') \
+                     AND next_run_at IS NOT NULL AND next_run_at <= ?1 \
+                     AND ((trigger_kind = 'interval' \
+                           AND interval_secs BETWEEN ?2 AND ?3) \
+                          OR (trigger_kind = 'cron' AND cron_expr IS NOT NULL \
+                              AND interval_secs IS NULL)) \
+                     ORDER BY next_run_at, job_id",
                 )?;
                 let rows = statement.query_map(
                     params![now_ms, MIN_INTERVAL_SECS as i64, MAX_INTERVAL_SECS as i64],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| {
+                        Ok((
+                            bytes_column(row, 0)?,
+                            bytes_column(row, 1)?,
+                            row.get(2)?,
+                            optional_bytes_column(row, 3)?,
+                            row.get(4)?,
+                        ))
+                    },
                 )?;
                 let mut due = Vec::new();
                 for row in rows {
@@ -342,18 +359,49 @@ impl JobStore {
             )?;
             let mut queued = usize::try_from(queued).unwrap_or(usize::MAX);
             let mut report = DueEnqueueReport::default();
-            for (job_id, interval_secs, scheduled_for) in due {
+            for (
+                job_id_bytes,
+                trigger_kind_bytes,
+                interval_secs,
+                cron_expr_bytes,
+                scheduled_for_ms,
+            ) in due
+            {
+                let decoded = (
+                    String::from_utf8(job_id_bytes),
+                    String::from_utf8(trigger_kind_bytes),
+                    cron_expr_bytes.map(String::from_utf8).transpose(),
+                );
+                let (Ok(job_id), Ok(trigger_kind), Ok(cron_expr)) = decoded else {
+                    report.skipped_invalid += 1;
+                    continue;
+                };
+                let scheduled_for = from_millis(scheduled_for_ms);
+                let next_run_at = match trigger_kind.as_str() {
+                    "interval" => interval_secs
+                        .and_then(|value| u64::try_from(value).ok())
+                        .and_then(|interval_secs| {
+                            advance_interval_due(scheduled_for, interval_secs, now)
+                        }),
+                    "cron" => cron_expr.as_deref().and_then(|expression| {
+                        cron::advance_cron_due(scheduled_for, expression, now)
+                    }),
+                    _ => None,
+                };
+                let Some(next_run_at) = next_run_at else {
+                    report.skipped_invalid += 1;
+                    continue;
+                };
                 if queued >= self.limits.max_queued_runs {
                     report.skipped_full += 1;
                     continue;
                 }
-                let interval_secs = interval_secs as u64;
                 let run_id = next_run_id();
                 let inserted = tx.execute(
                     "INSERT OR IGNORE INTO job_runs (
                         run_id, job_id, attempt_no, trigger_kind, scheduled_for, state, created_at
-                     ) VALUES (?1, ?2, 1, 'interval', ?3, 'queued', ?4)",
-                    params![run_id, job_id, scheduled_for, now_ms],
+                     ) VALUES (?1, ?2, 1, ?3, ?4, 'queued', ?5)",
+                    params![run_id, job_id, trigger_kind, scheduled_for_ms, now_ms],
                 )?;
                 if inserted > 0 {
                     report.enqueued += 1;
@@ -361,13 +409,6 @@ impl JobStore {
                 } else {
                     report.deduped += 1;
                 }
-                let next_run_at =
-                    advance_interval_due(from_millis(scheduled_for), interval_secs, now)
-                        .ok_or_else(|| {
-                            JobStoreError::InvalidJob(format!(
-                                "job {job_id} has no representable next interval boundary"
-                            ))
-                        })?;
                 tx.execute(
                     "UPDATE jobs SET next_run_at = ?1, updated_at = ?2 WHERE job_id = ?3",
                     params![to_millis(next_run_at), now_ms, job_id],
@@ -514,6 +555,29 @@ impl JobStore {
     }
 }
 
+const INVALID_TEXT: &[u8] = &[0xff];
+
+/// Reads a text column as raw bytes. Any other storage class, including a
+/// BLOB, becomes an invalid UTF-8 byte so the caller skips the row instead of
+/// enqueuing a run that `row_to_job` would reject later.
+fn bytes_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Vec<u8>> {
+    Ok(match row.get_ref(index)? {
+        rusqlite::types::ValueRef::Text(bytes) => bytes.to_vec(),
+        _ => INVALID_TEXT.to_vec(),
+    })
+}
+
+fn optional_bytes_column(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<Vec<u8>>> {
+    Ok(match row.get_ref(index)? {
+        rusqlite::types::ValueRef::Null => None,
+        rusqlite::types::ValueRef::Text(bytes) => bytes.to_vec().into(),
+        _ => Some(INVALID_TEXT.to_vec()),
+    })
+}
+
 fn get_job_tx(
     tx: &rusqlite::Transaction<'_>,
     job_id: &str,
@@ -571,6 +635,8 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobDefinition> {
                     "cron expression is empty or over the byte bound",
                 ));
             }
+            cron::validate_cron_expr(&expression)
+                .map_err(|_| invalid_row("cron expression is not valid"))?;
             if interval_secs.is_some() {
                 return Err(invalid_row("cron job carries an interval"));
             }
@@ -718,6 +784,11 @@ mod tests {
         UNIX_EPOCH + Duration::from_millis(millis)
     }
 
+    const MINUTE_MS: u64 = 60_000;
+
+    /// 2024-01-01T00:00:00Z.
+    const CRON_START_MS: u64 = 1_704_067_200_000;
+
     fn limits() -> JobStoreLimits {
         JobStoreLimits {
             max_jobs: 4,
@@ -746,6 +817,22 @@ mod tests {
             version: "1.2.0".to_owned(),
             function: "run".to_owned(),
             trigger: Trigger::Interval { interval_secs },
+            payload: serde_json::json!({}),
+            enabled: true,
+            next_run_at: Some(next_run_at),
+            created_at: at(1_000),
+        }
+    }
+
+    fn cron_job(job_id: &str, expression: &str, next_run_at: SystemTime) -> NewJob {
+        NewJob {
+            job_id: job_id.to_owned(),
+            module_id: "reporting-service".to_owned(),
+            version: "1.2.0".to_owned(),
+            function: "run".to_owned(),
+            trigger: Trigger::Cron {
+                expression: expression.to_owned(),
+            },
             payload: serde_json::json!({}),
             enabled: true,
             next_run_at: Some(next_run_at),
@@ -1026,6 +1113,7 @@ mod tests {
                 enqueued: 1,
                 deduped: 0,
                 skipped_full: 0,
+                skipped_invalid: 0,
             }
         );
         let runs = store.list_runs("job-int", 10, 0).expect("runs");
@@ -1158,5 +1246,421 @@ mod tests {
         assert_eq!(runs[0].scheduled_for, at(10_000));
         let job = store.get_job("job-int").expect("get").expect("exists");
         assert_eq!(job.next_run_at, Some(at(10_000 + 6 * interval_ms)));
+    }
+
+    #[test]
+    fn due_cron_job_enqueues_one_run_and_advances_the_boundary() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        let scheduled = at(CRON_START_MS);
+        store
+            .create_job(cron_job("job-cron", "* * * * *", scheduled))
+            .expect("create");
+        let now = at(CRON_START_MS + 5_000);
+
+        let report = store.enqueue_due_runs(now).expect("enqueue");
+        assert_eq!(
+            report,
+            DueEnqueueReport {
+                enqueued: 1,
+                deduped: 0,
+                skipped_full: 0,
+                skipped_invalid: 0,
+            }
+        );
+        let runs = store.list_runs("job-cron", 10, 0).expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].trigger, TriggerKind::Cron);
+        assert_eq!(runs[0].scheduled_for, scheduled);
+        assert_eq!(runs[0].state, JobRunState::Queued);
+        assert_eq!(runs[0].attempt_no, 1);
+        let job = store.get_job("job-cron").expect("get").expect("exists");
+        assert_eq!(job.next_run_at, Some(at(CRON_START_MS + MINUTE_MS)));
+        assert_eq!(job.updated_at, now);
+
+        let report = store.enqueue_due_runs(now).expect("second tick");
+        assert_eq!(report, DueEnqueueReport::default());
+        assert_eq!(
+            store.list_runs("job-cron", 10, 0).expect("runs").len(),
+            1,
+            "the advanced boundary must not enqueue again"
+        );
+    }
+
+    #[test]
+    fn an_ignored_cron_duplicate_tick_advances_without_a_second_run() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        let scheduled = at(CRON_START_MS);
+        store
+            .create_job(cron_job("job-cron", "* * * * *", scheduled))
+            .expect("create");
+        let now = at(CRON_START_MS + 5_000);
+        store.enqueue_due_runs(now).expect("first tick");
+        store
+            .database
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE jobs SET next_run_at = ?1 WHERE job_id = 'job-cron'",
+                    params![CRON_START_MS as i64],
+                )
+                .map_err(DatabaseError::from)
+            })
+            .expect("rewind boundary");
+
+        let report = store.enqueue_due_runs(now).expect("second tick");
+        assert_eq!(report.enqueued, 0);
+        assert_eq!(report.deduped, 1);
+        assert_eq!(store.list_runs("job-cron", 10, 0).expect("runs").len(), 1);
+        let job = store.get_job("job-cron").expect("get").expect("exists");
+        assert_eq!(job.next_run_at, Some(at(CRON_START_MS + MINUTE_MS)));
+    }
+
+    #[test]
+    fn cron_restart_catch_up_enqueues_one_original_boundary_not_a_burst() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        let scheduled = at(CRON_START_MS);
+        store
+            .create_job(cron_job("job-cron", "* * * * *", scheduled))
+            .expect("create");
+
+        let report = store
+            .enqueue_due_runs(at(CRON_START_MS + 5 * MINUTE_MS + 3_000))
+            .expect("catch-up tick");
+
+        assert_eq!(report.enqueued, 1);
+        let runs = store.list_runs("job-cron", 10, 0).expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].scheduled_for, scheduled);
+        let job = store.get_job("job-cron").expect("get").expect("exists");
+        assert_eq!(job.next_run_at, Some(at(CRON_START_MS + 6 * MINUTE_MS)));
+    }
+
+    #[test]
+    fn a_disabled_cron_job_is_not_selected() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        let scheduled = at(CRON_START_MS);
+        store
+            .create_job(cron_job("job-cron", "* * * * *", scheduled))
+            .expect("create");
+        store
+            .set_enabled("job-cron", false, None, at(CRON_START_MS - 1_000))
+            .expect("disable")
+            .expect("exists");
+
+        let report = store
+            .enqueue_due_runs(at(CRON_START_MS + 5_000))
+            .expect("enqueue");
+        assert_eq!(report, DueEnqueueReport::default());
+        assert!(
+            store.list_runs("job-cron", 10, 0).expect("runs").is_empty(),
+            "a disabled cron job must not enqueue"
+        );
+        let job = store.get_job("job-cron").expect("get").expect("exists");
+        assert_eq!(job.next_run_at, None);
+    }
+
+    #[test]
+    fn a_full_queue_leaves_the_due_cron_boundary_for_a_later_tick() {
+        let store = JobStore::open_in_memory(JobStoreLimits {
+            max_jobs: 4,
+            max_queued_runs: 1,
+        })
+        .expect("store");
+        let scheduled = at(CRON_START_MS);
+        store
+            .create_job(cron_job("job-cron", "* * * * *", scheduled))
+            .expect("create");
+        let now = at(CRON_START_MS + 5_000);
+        store
+            .enqueue_manual_run("job-cron", at(CRON_START_MS - 10_000))
+            .expect("fill queue");
+
+        let report = store.enqueue_due_runs(now).expect("full tick");
+        assert_eq!(report.skipped_full, 1);
+        assert_eq!(report.enqueued, 0);
+        assert_eq!(
+            store
+                .list_runs("job-cron", 10, 0)
+                .expect("runs")
+                .iter()
+                .filter(|run| run.trigger == TriggerKind::Cron)
+                .count(),
+            0
+        );
+        let job = store.get_job("job-cron").expect("get").expect("exists");
+        assert_eq!(job.next_run_at, Some(scheduled));
+
+        let claimed = store
+            .claim_next_run(
+                "owner-1",
+                at(CRON_START_MS + 6_000),
+                Duration::from_secs(30),
+            )
+            .expect("claim")
+            .expect("manual run");
+        store
+            .finish_run(
+                &claimed.run.run_id,
+                &RunCompletion::succeeded("exec-1".to_owned()),
+                at(CRON_START_MS + 7_000),
+            )
+            .expect("finish");
+
+        let report = store.enqueue_due_runs(now).expect("retry tick");
+        assert_eq!(report.enqueued, 1);
+        let runs = store.list_runs("job-cron", 10, 0).expect("runs");
+        let cron = runs
+            .iter()
+            .find(|run| run.trigger == TriggerKind::Cron)
+            .expect("cron run");
+        assert_eq!(cron.scheduled_for, scheduled);
+        let job = store.get_job("job-cron").expect("get").expect("exists");
+        assert_eq!(job.next_run_at, Some(at(CRON_START_MS + MINUTE_MS)));
+    }
+
+    #[test]
+    fn tampered_cron_rows_are_skipped_and_fail_closed_on_read() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        let scheduled = at(CRON_START_MS);
+        store
+            .create_job(cron_job("job-cron", "* * * * *", scheduled))
+            .expect("create");
+        store
+            .database
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE jobs SET cron_expr = 'not a cron' WHERE job_id = 'job-cron'",
+                    [],
+                )
+                .map_err(DatabaseError::from)
+            })
+            .expect("tamper cron");
+
+        let report = store
+            .enqueue_due_runs(at(CRON_START_MS + 5_000))
+            .expect("the pass must not fail");
+        assert_eq!(report.skipped_invalid, 1);
+        assert_eq!(report.enqueued, 0);
+        assert!(store.list_runs("job-cron", 10, 0).expect("runs").is_empty());
+        assert!(
+            store.get_job("job-cron").is_err(),
+            "a tampered cron row must fail closed on read"
+        );
+        let boundary: Option<i64> = store
+            .database
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT next_run_at FROM jobs WHERE job_id = 'job-cron'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(DatabaseError::from)
+            })
+            .expect("boundary");
+        assert_eq!(boundary, Some(CRON_START_MS as i64));
+    }
+
+    #[test]
+    fn invalid_utf8_and_blob_cron_rows_are_skipped_not_failed() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        let scheduled = at(CRON_START_MS);
+        for job_id in ["job-invalid-utf8", "job-blob-cron", "job-blob-id"] {
+            store
+                .create_job(cron_job(job_id, "* * * * *", scheduled))
+                .expect("create");
+        }
+        store
+            .database
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE jobs SET cron_expr = CAST(?1 AS BLOB) WHERE job_id = 'job-invalid-utf8'",
+                    params![&[0xffu8][..]],
+                )?;
+                conn.execute(
+                    "UPDATE jobs SET cron_expr = CAST(?1 AS BLOB) WHERE job_id = 'job-blob-cron'",
+                    params![&b"* * * * *"[..]],
+                )?;
+                conn.execute(
+                    "UPDATE jobs SET job_id = CAST(?1 AS BLOB) WHERE job_id = 'job-blob-id'",
+                    params![&b"job-blob-id"[..]],
+                )?;
+                Ok::<(), DatabaseError>(())
+            })
+            .expect("tamper rows");
+
+        let report = store
+            .enqueue_due_runs(at(CRON_START_MS + 5_000))
+            .expect("the pass must not fail");
+        assert_eq!(report.skipped_invalid, 3);
+        assert_eq!(report.enqueued, 0);
+        assert_eq!(store.count_queued().expect("queued count"), 0);
+        assert!(store
+            .list_runs("job-invalid-utf8", 10, 0)
+            .expect("runs")
+            .is_empty());
+        assert!(store
+            .list_runs("job-blob-cron", 10, 0)
+            .expect("runs")
+            .is_empty());
+        assert!(
+            store.get_job("job-invalid-utf8").is_err(),
+            "invalid UTF-8 must fail closed on read"
+        );
+        assert!(
+            store.get_job("job-blob-cron").is_err(),
+            "a BLOB cron expression must fail closed on read"
+        );
+        let boundaries: Vec<i64> = store
+            .database
+            .with_connection(|conn| {
+                let mut statement = conn.prepare("SELECT next_run_at FROM jobs ORDER BY rowid")?;
+                let rows = statement.query_map([], |row| row.get(0))?;
+                let mut values = Vec::new();
+                for row in rows {
+                    values.push(row?);
+                }
+                Ok::<_, DatabaseError>(values)
+            })
+            .expect("boundaries");
+        assert_eq!(boundaries, vec![CRON_START_MS as i64; 3]);
+    }
+
+    #[test]
+    fn impossible_cron_rows_are_skipped_and_keep_the_boundary() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        let scheduled = at(CRON_START_MS);
+        store
+            .create_job(cron_job("job-cron", "0 0 31 2 *", scheduled))
+            .expect("create");
+
+        let report = store
+            .enqueue_due_runs(at(CRON_START_MS + 5_000))
+            .expect("the pass must not fail");
+        assert_eq!(report.skipped_invalid, 1);
+        assert_eq!(report.enqueued, 0);
+        assert!(store.list_runs("job-cron", 10, 0).expect("runs").is_empty());
+        let job = store.get_job("job-cron").expect("get").expect("exists");
+        assert_eq!(
+            job.next_run_at,
+            Some(scheduled),
+            "an impossible expression must not advance the boundary"
+        );
+    }
+
+    #[test]
+    fn a_tampered_cron_row_carrying_an_interval_is_not_selected() {
+        let store = JobStore::open_in_memory(limits()).expect("store");
+        let scheduled = at(CRON_START_MS);
+        store
+            .create_job(cron_job("job-cron", "* * * * *", scheduled))
+            .expect("create");
+        store
+            .database
+            .with_connection(|conn| {
+                conn.execute_batch("PRAGMA ignore_check_constraints = ON")?;
+                conn.execute(
+                    "UPDATE jobs SET interval_secs = 60 WHERE job_id = 'job-cron'",
+                    [],
+                )?;
+                conn.execute_batch("PRAGMA ignore_check_constraints = OFF")?;
+                Ok::<(), DatabaseError>(())
+            })
+            .expect("tamper interval");
+
+        let report = store
+            .enqueue_due_runs(at(CRON_START_MS + 5_000))
+            .expect("the pass must not fail");
+        assert_eq!(report, DueEnqueueReport::default());
+        assert!(store.list_runs("job-cron", 10, 0).expect("runs").is_empty());
+        assert!(
+            store.get_job("job-cron").is_err(),
+            "the malformed row stays fail-closed on read"
+        );
+        let boundary: Option<i64> = store
+            .database
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT next_run_at FROM jobs WHERE job_id = 'job-cron'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(DatabaseError::from)
+            })
+            .expect("boundary");
+        assert_eq!(boundary, Some(CRON_START_MS as i64));
+    }
+
+    #[test]
+    fn equal_boundaries_enqueue_the_lower_job_id_first() {
+        let store = JobStore::open_in_memory(JobStoreLimits {
+            max_jobs: 4,
+            max_queued_runs: 1,
+        })
+        .expect("store");
+        let scheduled = at(CRON_START_MS);
+        store
+            .create_job(cron_job("job-b", "* * * * *", scheduled))
+            .expect("create b");
+        store
+            .create_job(cron_job("job-a", "* * * * *", scheduled))
+            .expect("create a");
+
+        let report = store
+            .enqueue_due_runs(at(CRON_START_MS + 5_000))
+            .expect("enqueue");
+        assert_eq!(report.enqueued, 1);
+        assert_eq!(report.skipped_full, 1);
+        assert_eq!(
+            store.list_runs("job-a", 10, 0).expect("runs a").len(),
+            1,
+            "the lower job id wins a tied boundary"
+        );
+        assert!(store.list_runs("job-b", 10, 0).expect("runs b").is_empty());
+        let first = store.get_job("job-a").expect("get a").expect("exists");
+        assert_eq!(first.next_run_at, Some(at(CRON_START_MS + MINUTE_MS)));
+        let second = store.get_job("job-b").expect("get b").expect("exists");
+        assert_eq!(second.next_run_at, Some(scheduled));
+    }
+
+    #[test]
+    fn mixed_interval_and_cron_due_jobs_share_one_queue_bound() {
+        let store = JobStore::open_in_memory(JobStoreLimits {
+            max_jobs: 4,
+            max_queued_runs: 1,
+        })
+        .expect("store");
+        store
+            .create_job(interval_job("job-int", 60, at(CRON_START_MS)))
+            .expect("create interval");
+        store
+            .create_job(cron_job(
+                "job-cron",
+                "* * * * *",
+                at(CRON_START_MS + 30_000),
+            ))
+            .expect("create cron");
+        let now = at(CRON_START_MS + 5 * MINUTE_MS);
+
+        let report = store.enqueue_due_runs(now).expect("enqueue");
+        assert_eq!(report.enqueued, 1);
+        assert_eq!(report.skipped_full, 1);
+        assert_eq!(store.count_queued().expect("queued count"), 1);
+
+        let runs = store.list_runs("job-int", 10, 0).expect("interval runs");
+        assert_eq!(runs.len(), 1, "the earlier boundary wins the one slot");
+        assert_eq!(runs[0].trigger, TriggerKind::Interval);
+        assert!(
+            store
+                .list_runs("job-cron", 10, 0)
+                .expect("cron runs")
+                .is_empty(),
+            "the later cron boundary must not get a run"
+        );
+        let interval = store.get_job("job-int").expect("get").expect("exists");
+        assert_eq!(
+            interval.next_run_at,
+            Some(at(CRON_START_MS + 6 * MINUTE_MS))
+        );
+        let cron = store.get_job("job-cron").expect("get").expect("exists");
+        assert_eq!(cron.next_run_at, Some(at(CRON_START_MS + 30_000)));
     }
 }

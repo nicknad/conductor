@@ -450,7 +450,7 @@ Deferred: repair after restore or replacement (`Missing --> Ok`,
 `Mismatch --> Ok`), orphan scanning, artifact GC, and one
 `reconciliation_runs` row per pass.
 
-## 11. Scheduler / triggering (**manual and interval implemented; cron/retry planned**)
+## 11. Scheduler / triggering (**manual, interval, and UTC cron implemented; retry planned**)
 
 Source: `src/control_plane/scheduler/`, `src/readiness.rs`,
 `src/metrics.rs` (`conductor.job.wait.duration`, queue/active gauges).
@@ -458,7 +458,7 @@ Source: `src/control_plane/scheduler/`, `src/readiness.rs`,
 ```mermaid
 stateDiagram-v2
     [*] --> Idle
-    Idle --> Waiting: interval trigger or manual request
+    Idle --> Waiting: interval/cron trigger or manual request
     Waiting --> Ready: job is due
     Waiting --> Cancelled: trigger removed / disabled
     Ready --> Dispatching: execution capacity available
@@ -477,13 +477,18 @@ stateDiagram-v2
     Refused --> Idle
 
     note right of Queued
-        Slice 2 implements the durable queued/running/
+        Slice 3 implements the durable queued/running/
         succeeded/failed/refused/interrupted path for
-        manual and interval jobs. A due interval tick
-        enqueues one run per boundary, advances
-        next_run_at past now, and leaves a full queue's
-        due time for a later tick. A restart enqueues at
-        most one missed run. Cron, retries, cancellation,
+        manual, interval, and UTC five-field cron jobs.
+        A due interval or cron tick enqueues one run per
+        boundary, advances next_run_at past now, and
+        leaves a full queue's due time for a later tick.
+        A restart enqueues at most one missed run. An
+        unparseable cron row is skipped and counted, and
+        reads of it fail closed; a valid but impossible
+        expression is skipped and counted but still reads
+        back, so the job does not run until repaired. Cron
+        stays UTC only; timezone/DST, retries, cancellation,
         and idempotency keys are later.
     end note
     note right of Ready
@@ -528,7 +533,7 @@ guarantee beyond the dependencies noted.
 
 | Priority | Work item | Current evidence | Blocks |
 | --- | --- | --- | --- |
-| 1 | **Scheduler / triggering**: durable job definitions, cron/interval triggers, queueing, dispatch, retry/attempt semantics, cancellation, scheduler readiness hook, job-wait histogram | Slice 2 implements durable manual and interval jobs, interval due enqueue, queue/dispatch, recovery, readiness, and job wait/queue/active metrics. Cron triggers, retries, cancellation, and multi-process ownership remain | Produces the jobs the platform exists to run |
+| 1 | **Scheduler / triggering**: durable job definitions, cron/interval triggers, queueing, dispatch, retry/attempt semantics, cancellation, scheduler readiness hook, job-wait histogram | Slice 3 implements durable manual, interval, and UTC five-field cron jobs, due enqueue for both scheduled kinds, queue/dispatch, recovery, readiness, and job wait/queue/active metrics. Retries, cancellation, timezone/DST cron, and multi-process ownership remain | Produces the jobs the platform exists to run |
 | 2 | **Operator CLI**: upload, validate, activate, execute, history, lifecycle, reconcile commands | `tests/cli.rs` only drives startup failures; no CLI module | Operator usability; today everything is raw HTTP |
 | 3 | **Module lifecycle transitions**: deactivate, remove, rollback, drain running work, reference counting | `src/control_plane/lifecycle.rs` is a placeholder; `clear_active` / `remove_version` are registry primitives with no caller | Artifact GC and safe upgrades |
 | 4 | **Startup reconciliation**: scan registry vs artifact store, populate `Missing`/`Mismatch`, repair or quarantine, record `reconciliation_runs` | Classifier and startup wiring implemented in `Host::assemble`; repair, orphan detection, and `reconciliation_runs` deferred; design says PR4 | Trustworthy restart state |

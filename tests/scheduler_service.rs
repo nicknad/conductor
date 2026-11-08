@@ -198,6 +198,22 @@ fn interval_job(job_id: &str, interval_secs: u64, next_run_at: SystemTime) -> Ne
     }
 }
 
+fn cron_job(job_id: &str, expression: &str, next_run_at: SystemTime) -> NewJob {
+    NewJob {
+        job_id: job_id.to_owned(),
+        module_id: "missing-module".to_owned(),
+        version: "1.0.0".to_owned(),
+        function: "run".to_owned(),
+        trigger: Trigger::Cron {
+            expression: expression.to_owned(),
+        },
+        payload: serde_json::json!({}),
+        enabled: true,
+        next_run_at: Some(next_run_at),
+        created_at: UNIX_EPOCH,
+    }
+}
+
 #[test]
 fn scheduler_sources_do_not_reference_execution_internals() {
     let sources = [
@@ -216,6 +232,10 @@ fn scheduler_sources_do_not_reference_execution_internals() {
         (
             "service.rs",
             include_str!("../src/control_plane/scheduler/service.rs"),
+        ),
+        (
+            "cron.rs",
+            include_str!("../src/control_plane/scheduler/cron.rs"),
         ),
         ("jobs.rs", include_str!("../src/api/jobs.rs")),
     ];
@@ -579,4 +599,155 @@ async fn a_disabled_interval_job_is_not_enqueued() {
         .expect("get")
         .expect("exists");
     assert_eq!(job.next_run_at, None);
+}
+
+#[tokio::test]
+async fn tick_enqueues_a_due_cron_run_and_dispatches_it() {
+    let (metrics, _exporter) = capture(MetricsOptions::default());
+    let readiness = Arc::new(Readiness::new(true));
+    let (scheduler, _scratch) =
+        build_scheduler(Arc::clone(&metrics), Arc::clone(&readiness), "cron-due");
+    let scheduled = at(1_704_067_200);
+    scheduler
+        .create_job(cron_job("job-cron", "* * * * *", scheduled))
+        .await
+        .expect("create job");
+
+    let dispatched = scheduler
+        .tick_once(scheduled + Duration::from_secs(5))
+        .await
+        .expect("tick");
+    assert_eq!(
+        dispatched, 1,
+        "the due cron run must dispatch through the loop"
+    );
+
+    let runs = scheduler.list_runs("job-cron", 10, 0).await.expect("runs");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].trigger, TriggerKind::Cron);
+    assert_eq!(runs[0].scheduled_for, scheduled);
+    assert_eq!(runs[0].state, JobRunState::Refused);
+    assert_eq!(runs[0].failure_code, Some(JobFailureCode::ModuleNotFound));
+
+    let job = scheduler
+        .get_job("job-cron")
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(job.next_run_at, Some(scheduled + Duration::from_secs(60)));
+}
+
+#[tokio::test]
+async fn cron_queue_depth_tracks_due_enqueues_when_capacity_is_zero() {
+    let (metrics, exporter) = capture(MetricsOptions::default());
+    let readiness = Arc::new(Readiness::new(true));
+    let (scheduler, _scratch) = build_scheduler_with_capacity(
+        Arc::clone(&metrics),
+        Arc::clone(&readiness),
+        "cron-queue-depth",
+        0,
+    );
+    let scheduled = at(1_704_067_200);
+    scheduler
+        .create_job(cron_job("job-cron", "* * * * *", scheduled))
+        .await
+        .expect("create job");
+
+    let before = exported(&metrics, &exporter);
+    assert_eq!(i64_sum(&before, conductor::metrics::JOB_QUEUE_DEPTH), 0);
+    exporter.reset();
+
+    let now = scheduled + Duration::from_secs(5);
+    assert_eq!(
+        scheduler.tick_once(now).await.expect("tick"),
+        0,
+        "capacity zero enqueues but cannot claim"
+    );
+
+    let after = exported(&metrics, &exporter);
+    assert_eq!(
+        i64_sum(&after, conductor::metrics::JOB_QUEUE_DEPTH),
+        1,
+        "the due cron enqueue must move the queue gauge"
+    );
+    let runs = scheduler.list_runs("job-cron", 10, 0).await.expect("runs");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].trigger, TriggerKind::Cron);
+    assert_eq!(runs[0].state, JobRunState::Queued);
+    let job = scheduler
+        .get_job("job-cron")
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(job.next_run_at, Some(scheduled + Duration::from_secs(60)));
+}
+
+#[tokio::test]
+async fn a_disabled_cron_job_is_not_enqueued() {
+    let (metrics, _exporter) = capture(MetricsOptions::default());
+    let readiness = Arc::new(Readiness::new(true));
+    let (scheduler, _scratch) = build_scheduler(
+        Arc::clone(&metrics),
+        Arc::clone(&readiness),
+        "cron-disabled",
+    );
+    let now = at(1_704_067_200);
+    scheduler
+        .create_job(cron_job("job-cron", "* * * * *", now))
+        .await
+        .expect("create job");
+    scheduler
+        .set_enabled("job-cron", false, None)
+        .await
+        .expect("disable")
+        .expect("exists");
+
+    assert_eq!(scheduler.tick_once(now).await.expect("tick"), 0);
+    assert!(
+        scheduler
+            .list_runs("job-cron", 10, 0)
+            .await
+            .expect("runs")
+            .is_empty(),
+        "a disabled cron job must not enqueue"
+    );
+    let job = scheduler
+        .get_job("job-cron")
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(job.next_run_at, None);
+}
+
+#[tokio::test]
+async fn manual_trigger_on_an_enabled_cron_job_keeps_the_cron_boundary() {
+    let (metrics, _exporter) = capture(MetricsOptions::default());
+    let readiness = Arc::new(Readiness::new(true));
+    let (scheduler, _scratch) =
+        build_scheduler(Arc::clone(&metrics), Arc::clone(&readiness), "cron-manual");
+    let scheduled = at(1_704_067_200);
+    scheduler
+        .create_job(cron_job("job-cron", "* * * * *", scheduled))
+        .await
+        .expect("create job");
+
+    let run = scheduler
+        .enqueue_manual("job-cron")
+        .await
+        .expect("enqueue manual");
+    assert_eq!(run.trigger, TriggerKind::Manual);
+
+    let runs = scheduler.list_runs("job-cron", 10, 0).await.expect("runs");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].trigger, TriggerKind::Manual);
+    let job = scheduler
+        .get_job("job-cron")
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(
+        job.next_run_at,
+        Some(scheduled),
+        "a manual run must not move the cron boundary"
+    );
 }

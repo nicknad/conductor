@@ -14,8 +14,8 @@ use base64::prelude::*;
 use conductor::api::routes::router;
 use conductor::api::uploads::AppState;
 use conductor::config::{Config, TrustedKeyConfig};
-use conductor::control_plane::scheduler::job::MAX_INTERVAL_SECS;
-use conductor::control_plane::scheduler::JobFailureCode;
+use conductor::control_plane::scheduler::job::{next_run_at, MAX_INTERVAL_SECS};
+use conductor::control_plane::scheduler::{JobFailureCode, Trigger};
 use conductor::modules::registry::{IntegrityState, ModuleRecord};
 use conductor::packages::artifact::ArtifactDigest;
 use conductor::packages::digest::Sha256DigestProvider;
@@ -591,8 +591,90 @@ async fn interval_bounds_reject_zero_and_over_the_maximum() {
 
 #[tokio::test]
 #[serial]
-async fn cron_trigger_is_still_rejected() {
-    let (state, _scratch) = state("cron").await;
+async fn cron_create_schedules_the_next_utc_occurrence() {
+    let (state, _scratch) = state("cron-create").await;
+    let before = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as i64;
+    let (status, body) = send_json(
+        &state,
+        "POST",
+        "/v1/jobs",
+        Some(json!({
+            "module_id": "missing-module",
+            "version": "1.0.0",
+            "function": "run",
+            "trigger": {"kind": "cron", "expression": "* * * * *"},
+        })),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create response: {body}");
+    assert_eq!(body["trigger"]["kind"], "cron");
+    assert_eq!(body["trigger"]["expression"], "* * * * *");
+    assert_eq!(body["enabled"], true);
+    let created_at = body["created_at_ms"].as_i64().expect("created_at");
+    let next_run_at = body["next_run_at_ms"].as_i64().expect("next_run_at");
+    assert!(
+        next_run_at > created_at,
+        "the first run must be strictly after now (created={created_at}, next={next_run_at})"
+    );
+    assert!(
+        next_run_at - created_at <= 60_000,
+        "a wildcard minute expression must schedule within one minute"
+    );
+    assert_eq!(
+        next_run_at % 60_000,
+        0,
+        "the boundary must be a whole UTC minute"
+    );
+    assert!(next_run_at > before);
+    state.scheduler.stop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn cron_create_rejects_invalid_and_impossible_expressions() {
+    let (state, _scratch) = state("cron-invalid").await;
+    for expression in [
+        "60 * * * *",
+        "0 0 31 2 *",
+        "0 0 * * * *",
+        "@daily",
+        "0 0 * * MON",
+    ] {
+        let (status, body) = send_json(
+            &state,
+            "POST",
+            "/v1/jobs",
+            Some(json!({
+                "module_id": "missing-module",
+                "version": "1.0.0",
+                "function": "run",
+                "trigger": {"kind": "cron", "expression": expression},
+            })),
+            Some(TOKEN),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{expression:?} response: {body}"
+        );
+        assert_eq!(body["code"], "invalid_trigger");
+        assert!(
+            !body.to_string().contains(expression),
+            "the raw expression must not be echoed: {body}"
+        );
+    }
+    state.scheduler.stop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn disabled_cron_create_has_no_next_run() {
+    let (state, _scratch) = state("cron-disabled-create").await;
     let (status, body) = send_json(
         &state,
         "POST",
@@ -602,12 +684,223 @@ async fn cron_trigger_is_still_rejected() {
             "version": "1.0.0",
             "function": "run",
             "trigger": {"kind": "cron", "expression": "*/5 * * * *"},
+            "enabled": false,
         })),
         Some(TOKEN),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::CREATED, "create response: {body}");
+    assert_eq!(body["trigger"]["kind"], "cron");
+    assert!(
+        body["next_run_at_ms"].is_null(),
+        "a disabled cron job must not schedule a run: {body}"
+    );
+    state.scheduler.stop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn enable_rejects_an_impossible_cron_job_and_leaves_it_disabled() {
+    let (state, _scratch) = state("cron-enable-impossible").await;
+    let (status, body) = send_json(
+        &state,
+        "POST",
+        "/v1/jobs",
+        Some(json!({
+            "module_id": "missing-module",
+            "version": "1.0.0",
+            "function": "run",
+            "trigger": {"kind": "cron", "expression": "0 0 31 2 *"},
+            "enabled": false,
+        })),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create response: {body}");
+    assert_eq!(body["enabled"], false);
+    assert!(body["next_run_at_ms"].is_null());
+    let job_id = body["job_id"].as_str().expect("job id").to_owned();
+
+    let (status, body) = send_json(
+        &state,
+        "POST",
+        &format!("/v1/jobs/{job_id}/enable"),
+        None,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "enable response: {body}");
     assert_eq!(body["code"], "invalid_trigger");
+
+    let (status, body) = send_json(&state, "GET", "/v1/jobs", None, Some(TOKEN)).await;
+    assert_eq!(status, StatusCode::OK);
+    let job = body["jobs"]
+        .as_array()
+        .expect("jobs")
+        .iter()
+        .find(|job| job["job_id"] == job_id)
+        .expect("created job");
+    assert_eq!(job["enabled"], false, "enable must not flip the job");
+    assert!(job["next_run_at_ms"].is_null());
+    state.scheduler.stop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn enabling_a_disabled_manual_job_succeeds_without_a_next_run() {
+    let (state, _scratch) = state("manual-enable").await;
+    let (status, body) = send_json(
+        &state,
+        "POST",
+        "/v1/jobs",
+        Some(json!({
+            "module_id": "missing-module",
+            "version": "1.0.0",
+            "function": "run",
+            "trigger": {"kind": "manual"},
+            "enabled": false,
+        })),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create response: {body}");
+    assert_eq!(body["enabled"], false);
+    let job_id = body["job_id"].as_str().expect("job id").to_owned();
+
+    let (status, body) = send_json(
+        &state,
+        "POST",
+        &format!("/v1/jobs/{job_id}/enable"),
+        None,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "enable response: {body}");
+    assert_eq!(body["enabled"], true);
+    assert!(
+        body["next_run_at_ms"].is_null(),
+        "a manual job has no scheduled boundary: {body}"
+    );
+    state.scheduler.stop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn disable_clears_and_enable_recomputes_a_cron_next_run() {
+    let (state, _scratch) = state("cron-toggle").await;
+    let expression = "*/5 * * * *";
+    let (status, body) = send_json(
+        &state,
+        "POST",
+        "/v1/jobs",
+        Some(json!({
+            "module_id": "missing-module",
+            "version": "1.0.0",
+            "function": "run",
+            "trigger": {"kind": "cron", "expression": expression},
+        })),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create response: {body}");
+    let job_id = body["job_id"].as_str().expect("job id").to_owned();
+    assert!(body["next_run_at_ms"].as_i64().is_some());
+
+    let (status, body) = send_json(
+        &state,
+        "POST",
+        &format!("/v1/jobs/{job_id}/disable"),
+        None,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "disable response: {body}");
+    assert!(
+        body["next_run_at_ms"].is_null(),
+        "disable must clear the boundary: {body}"
+    );
+
+    let before = SystemTime::now();
+    let (status, body) = send_json(
+        &state,
+        "POST",
+        &format!("/v1/jobs/{job_id}/enable"),
+        None,
+        Some(TOKEN),
+    )
+    .await;
+    let after = SystemTime::now();
+    assert_eq!(status, StatusCode::OK, "enable response: {body}");
+    let next_after = body["next_run_at_ms"]
+        .as_i64()
+        .expect("recomputed next_run_at");
+    let trigger = Trigger::Cron {
+        expression: expression.to_owned(),
+    };
+    let lower = next_run_at(&trigger, before).expect("lower cron boundary");
+    let upper = next_run_at(&trigger, after).expect("upper cron boundary");
+    let next_time =
+        UNIX_EPOCH + Duration::from_millis(u64::try_from(next_after).expect("positive"));
+    assert!(
+        next_time >= lower && next_time <= upper,
+        "enable must recompute a cron boundary inside the captured window"
+    );
+    assert_eq!(
+        next_after % 300_000,
+        0,
+        "the recomputed boundary must be a whole five-minute UTC boundary"
+    );
+    state.scheduler.stop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn manual_trigger_on_an_enabled_cron_job_keeps_the_cron_boundary() {
+    let (state, _scratch) = state("cron-manual").await;
+    let (status, body) = send_json(
+        &state,
+        "POST",
+        "/v1/jobs",
+        Some(json!({
+            "module_id": "missing-module",
+            "version": "1.0.0",
+            "function": "run",
+            "trigger": {"kind": "cron", "expression": "0 0 29 2 *"},
+        })),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create response: {body}");
+    let job_id = body["job_id"].as_str().expect("job id").to_owned();
+    let next_before = body["next_run_at_ms"]
+        .as_i64()
+        .expect("initial next_run_at");
+
+    let (status, body) = send_json(
+        &state,
+        "POST",
+        &format!("/v1/jobs/{job_id}/trigger"),
+        None,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "trigger response: {body}");
+    let run = wait_for_terminal(&state, &job_id).await;
+    assert_eq!(run["trigger"], "manual");
+
+    let (status, body) = send_json(&state, "GET", "/v1/jobs", None, Some(TOKEN)).await;
+    assert_eq!(status, StatusCode::OK);
+    let job = body["jobs"]
+        .as_array()
+        .expect("jobs")
+        .iter()
+        .find(|job| job["job_id"] == job_id)
+        .expect("created job");
+    assert_eq!(
+        job["next_run_at_ms"].as_i64(),
+        Some(next_before),
+        "a manual run must not move the cron boundary"
+    );
     state.scheduler.stop().await;
 }
 

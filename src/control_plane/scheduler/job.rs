@@ -19,6 +19,8 @@ use crate::executions::executor::{ExecutionError as ExecutorError, TargetError};
 use crate::modules::identity::{is_safe_identity, MAX_IDENTITY_BYTES};
 use crate::storage::staging::StagingError;
 
+use super::cron;
+
 /// Maximum accepted job id length.
 pub const MAX_JOB_ID_BYTES: usize = 128;
 /// Maximum accepted run id length.
@@ -126,6 +128,16 @@ impl Trigger {
 #[must_use]
 pub fn next_interval_at(now: SystemTime, interval_secs: u64) -> Option<SystemTime> {
     now.checked_add(Duration::from_secs(interval_secs))
+}
+
+/// First run for a newly enabled trigger. Manual jobs have no schedule.
+#[must_use]
+pub fn next_run_at(trigger: &Trigger, now: SystemTime) -> Option<SystemTime> {
+    match trigger {
+        Trigger::Manual => None,
+        Trigger::Interval { interval_secs } => next_interval_at(now, *interval_secs),
+        Trigger::Cron { expression } => cron::next_cron_at(expression, now),
+    }
 }
 
 /// Boundary for the next interval tick. A still-future boundary is returned
@@ -532,6 +544,8 @@ pub(crate) fn validate_new_job(job: &NewJob) -> Result<(), JobValidationError> {
                     "cron expression must be bounded and non-empty".to_owned(),
                 ));
             }
+            cron::validate_cron_expr(expression)
+                .map_err(|error| JobValidationError::Trigger(error.to_string()))?;
             if job.enabled && job.next_run_at.is_none() {
                 return Err(JobValidationError::Trigger(
                     "enabled cron jobs require next_run_at".to_owned(),
@@ -738,6 +752,25 @@ mod tests {
     }
 
     #[test]
+    fn next_run_at_selects_manual_interval_and_cron_policy() {
+        assert_eq!(next_run_at(&Trigger::Manual, at(100)), None);
+        assert_eq!(
+            next_run_at(&Trigger::Interval { interval_secs: 60 }, at(100)),
+            Some(at(160))
+        );
+        assert_eq!(
+            next_run_at(
+                &Trigger::Cron {
+                    expression: "*/5 * * * *".to_owned(),
+                },
+                at(0)
+            ),
+            Some(at(300)),
+            "the first cron run is the next whole UTC boundary after now"
+        );
+    }
+
+    #[test]
     fn advance_interval_due_returns_a_future_boundary_unchanged() {
         let scheduled = at(1_000);
         assert_eq!(
@@ -797,5 +830,26 @@ mod tests {
                 "interval_secs {interval_secs} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn validate_new_job_rejects_an_invalid_cron_expression() {
+        let job = NewJob {
+            job_id: "job-cron".to_owned(),
+            module_id: "reporting-service".to_owned(),
+            version: "1.2.0".to_owned(),
+            function: "run".to_owned(),
+            trigger: Trigger::Cron {
+                expression: "0 0 * * MON".to_owned(),
+            },
+            payload: serde_json::json!({}),
+            enabled: false,
+            next_run_at: None,
+            created_at: at(0),
+        };
+        assert!(matches!(
+            validate_new_job(&job),
+            Err(JobValidationError::Trigger(_))
+        ));
     }
 }

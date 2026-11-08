@@ -96,9 +96,11 @@ Bounded integrity kinds include `path`, `missing`, `unreadable`, `size`,
 `integrity`, `runtime`, `signer`, `legacy_manifest`, `manifest`, `archive`,
 `staging`, `target`, `executor`, `deadline`, and `internal`.
 
-Scheduler slice 2 emits `conductor.job.wait.duration` at claim time. A due
-interval tick enqueues queue rows, so `conductor.job.queue.depth` moves on
-enqueue as well as claim; `conductor.job.active` is unchanged.
+Scheduler slice 3 emits `conductor.job.wait.duration` at claim time. A due
+interval or cron tick enqueues queue rows, so `conductor.job.queue.depth` moves
+on enqueue as well as claim; `conductor.job.active` is unchanged. Raising the
+`conductor` log level to debug adds bounded `enqueued`, `deduped`,
+`skipped_full`, and `skipped_invalid` counts from the due pass.
 
 After your backend normalizes OTLP names, useful queries are conceptually:
 
@@ -197,6 +199,7 @@ worker-provided failure text.
 | An execution was refused before spawn | `conductor.execution.refused{reason}` | Metric backend | No history row by design |
 | A manual job ran | `202` trigger + `job_runs.state=succeeded` + matching `executions` row + `conductor.job.wait.duration` | Trigger, poll `/v1/jobs/{id}/runs`, SQL, metric backend | Run rows store no payload/stdout/stderr; at-most-once |
 | An interval job ran | one `job_runs` row with `trigger_kind=interval` and `scheduled_for=next_run_at`, then a matching `executions` row, plus `conductor.job.queue.depth` movement | Create interval job, wait for the boundary, poll `/v1/jobs/{id}/runs`, SQL, metric backend | Restart catch-up enqueues at most one missed run, not a burst |
+| A cron job ran | one `job_runs` row with `trigger_kind=cron` and `scheduled_for=next_run_at`, then a matching `executions` row, plus `conductor.job.queue.depth` movement and the due-pass debug counts | Create cron job, wait for the UTC boundary, poll `/v1/jobs/{id}/runs`, SQL, debug log, metric backend | Catch-up enqueues at most one missed occurrence; tampered or impossible rows are skipped and counted |
 | An artifact is damaged | `conductor.artifact.integrity.failures{kind}` + activation/execution refusal | Activate/execute, then metric backend and SQL | `ok` means bytes match the row, not safe-to-execute |
 | Startup reconciliation ran | `artifact reconciliation complete scanned=...` log + `integrity_state` rows | Startup log and SQL | No reconciliation metric or readiness signal yet |
 | Execution capacity is saturated | `slots.in_use` vs `slots.capacity`, `overload` | Metric backend | No per-module labels |
@@ -284,7 +287,7 @@ Do **not** use `/readyz` as proof that reconciliation found healthy artifacts.
 | Counters are process-lifetime | Use `rate`/`increase`; restarts reset them |
 | Bounded metric labels | Module/version/execution diagnosis is via logs/SQL, not metrics |
 | No retention/GC for rejections, history, or job runs | All three grow without bound; queue/job counts are capped but terminal `job_runs` are not |
-| No cron or due-enqueue scheduler metrics | Slice 2 emits job wait/queue/active signals and a due-enqueue debug log, but no counter for cron lag, enqueued, deduped, or skipped-full runs |
+| No cron or due-enqueue scheduler metrics | Slice 3 emits job wait/queue/active signals and a due-enqueue debug log with enqueued, deduped, skipped-full, and skipped-invalid counts, but no counter for cron lag or skipped rows |
 | `Readiness::new` defaults the scheduler flag true for fixtures | A direct `Host::into_state()` embedder that never starts the scheduler can report `/readyz` 200; triggers still return `scheduler_unavailable` |
 | Metrics are ephemeral | No durable metrics store; SQLite is the durable authority |
 

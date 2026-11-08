@@ -336,7 +336,38 @@ paths:
                 function:
                   type: string
                 trigger:
-                  type: object
+                  description: Manual, interval, or UTC five-field cron trigger.
+                  oneOf:
+                    - type: object
+                      required: [kind]
+                      properties:
+                        kind:
+                          type: string
+                          enum: [manual]
+                      additionalProperties: false
+                    - type: object
+                      required: [kind, interval_secs]
+                      properties:
+                        kind:
+                          type: string
+                          enum: [interval]
+                        interval_secs:
+                          type: integer
+                          format: int64
+                          minimum: 1
+                          maximum: 31536000
+                      additionalProperties: false
+                    - type: object
+                      required: [kind, expression]
+                      properties:
+                        kind:
+                          type: string
+                          enum: [cron]
+                        expression:
+                          type: string
+                          minLength: 1
+                          maxLength: 256
+                      additionalProperties: false
                 payload:
                   type: object
                   nullable: true
@@ -344,7 +375,7 @@ paths:
                   type: boolean
       responses:
         "201":
-          description: Durable manual job created; payload is not echoed.
+          description: Durable job created; payload is not echoed.
         "400":
           description: Invalid identity, trigger, payload, or body.
         "401":

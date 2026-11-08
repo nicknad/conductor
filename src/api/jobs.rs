@@ -17,11 +17,12 @@ use serde::{Deserialize, Serialize};
 use crate::api::errors::ApiError;
 use crate::api::uploads::{request_id, AppState};
 use crate::control_plane::scheduler::job::{
-    next_interval_at, next_job_id, validate_payload, JobDefinition, JobFailureCode, JobRun, NewJob,
+    next_job_id, next_run_at, validate_payload, JobDefinition, JobFailureCode, JobRun, NewJob,
     Trigger, MAX_INTERVAL_SECS, MAX_JOB_ID_BYTES, MIN_INTERVAL_SECS,
 };
 use crate::control_plane::scheduler::service::SchedulerError;
 use crate::control_plane::scheduler::store::JobStoreError;
+use crate::control_plane::scheduler::validate_cron_expr;
 use crate::modules::identity::{is_safe_identity, validate_identity};
 use crate::storage::database::to_millis;
 
@@ -138,12 +139,14 @@ pub async fn post_job(
     }
     let trigger: Trigger = request.trigger.into();
     let now = SystemTime::now();
-    let next_run_at = match &trigger {
-        Trigger::Interval { interval_secs } if request.enabled => {
-            next_interval_at(now, *interval_secs)
-        }
-        Trigger::Manual | Trigger::Interval { .. } | Trigger::Cron { .. } => None,
+    let next_run_at = if request.enabled {
+        next_run_at(&trigger, now)
+    } else {
+        None
     };
+    if request.enabled && !matches!(&trigger, Trigger::Manual) && next_run_at.is_none() {
+        return refuse(&id, invalid_trigger_occurrence());
+    }
     let new = NewJob {
         job_id: next_job_id(),
         module_id: request.module_id,
@@ -199,10 +202,11 @@ pub async fn post_enable(
         Ok(None) => return refuse(&id, job_not_found()),
         Err(error) => return refuse(&id, scheduler_error(error)),
     };
-    let next_run_at = match &job.trigger {
-        Trigger::Interval { interval_secs } => next_interval_at(SystemTime::now(), *interval_secs),
-        Trigger::Manual | Trigger::Cron { .. } => None,
-    };
+    let now = SystemTime::now();
+    let next_run_at = next_run_at(&job.trigger, now);
+    if !matches!(&job.trigger, Trigger::Manual) && next_run_at.is_none() {
+        return refuse(&id, invalid_trigger_occurrence());
+    }
     match state
         .scheduler
         .set_enabled(&job_id, true, next_run_at)
@@ -311,11 +315,16 @@ fn validate_create(request: &CreateJobRequest) -> Result<(), ApiError> {
             }
             Ok(())
         }
-        TriggerRequest::Cron { .. } => Err(ApiError::BadRequest(
-            "invalid_trigger",
-            "interval triggers are supported; cron triggers are not".to_owned(),
-        )),
+        TriggerRequest::Cron { expression } => validate_cron_expr(expression)
+            .map_err(|error| ApiError::BadRequest("invalid_trigger", error.to_string())),
     }
+}
+
+fn invalid_trigger_occurrence() -> ApiError {
+    ApiError::BadRequest(
+        "invalid_trigger",
+        "trigger has no representable next occurrence".to_owned(),
+    )
 }
 
 fn validate_identity_field(field: &'static str, value: &str) -> Result<(), ApiError> {

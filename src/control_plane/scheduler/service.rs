@@ -272,7 +272,8 @@ impl SchedulerService {
     }
 
     /// Deterministic one-shot tick used by tests. It enqueues due interval
-    /// runs, then claims and awaits dispatch of every run up to capacity.
+    /// and cron runs, then claims and awaits dispatch of every run up to
+    /// capacity.
     #[doc(hidden)]
     pub async fn tick_once(&self, now: SystemTime) -> Result<usize, SchedulerError> {
         self.enqueue_due(now).await?;
@@ -397,7 +398,8 @@ impl SchedulerService {
             enqueued = report.enqueued,
             deduped = report.deduped,
             skipped_full = report.skipped_full,
-            "scheduler enqueued due interval runs"
+            skipped_invalid = report.skipped_invalid,
+            "scheduler enqueued due interval/cron runs"
         );
         Ok(report)
     }

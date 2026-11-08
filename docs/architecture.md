@@ -1,8 +1,8 @@
 # Architecture
 
-> Current as of the Rust rewrite. The scheduler supports manual and interval
-> triggers; cron, an in-process plugin runtime, and a CLI are not built yet —
-> see [Not built yet](#not-built-yet).
+> Current as of the Rust rewrite. The scheduler supports manual, interval, and
+> UTC five-field cron triggers; an in-process plugin runtime and a CLI are not
+> built yet — see [Not built yet](#not-built-yet).
 
 Conductor is a single-machine job execution platform: operators upload signed
 service packages, the host validates and stores them as immutable artifacts,
@@ -207,23 +207,36 @@ is not atomic with `exec`, so a same-uid writer inside the 0700 staging
 directory can still race the final path resolution. HTTP exposure must not
 weaken these invariants.
 
-### Scheduler slice 2 (`control_plane::scheduler`)
+### Scheduler slice 3 (`control_plane::scheduler`)
 
 Durable job definitions live in `jobs`; `job_runs.state` is the durable queue.
-Scheduler slice 2 supports manual triggers and interval triggers. A job pins
-`(module_id, version, function)` and a bounded JSON payload. `interval_secs` is
-bounded to `1..=31_536_000` (one year); cron is rejected.
+Scheduler slice 3 supports manual triggers, interval triggers, and UTC
+five-field cron triggers. A job pins `(module_id, version, function)` and a
+bounded JSON payload. `interval_secs` is bounded to `1..=31_536_000` (one year).
+Cron uses a closed grammar: minute `0-59`, hour `0-23`, day-of-month `1-31`,
+month `1-12`, day-of-week `0-7` (0 and 7 are Sunday), with `*`, numbers, ranges
+`a-b`, lists `a,b`, `*/n`, and `a-b/n`. Names, macros, seconds/6-field or
+7-field expressions, and `?`/`L`/`W`/`#` are rejected before the parser crate
+runs. When day-of-month and day-of-week are both restricted, a time matches if
+either matches (POSIX OR). Evaluation is UTC only. The `croner` parser sits
+behind a private `cron.rs` wrapper, and neither its types nor `chrono` types
+escape that module.
 
-Each loop iteration first enqueues due interval runs in one immediate
-transaction. For every enabled interval job with `next_run_at <= now` it
-inserts one `queued` run with `trigger_kind='interval'` and
+Each loop iteration first enqueues due interval and cron runs in one immediate
+transaction. For every enabled interval or cron job with `next_run_at <= now`
+it inserts one `queued` run with the row's `trigger_kind` and
 `scheduled_for=next_run_at`, then advances `next_run_at` to the first boundary
-strictly after `now`. Advancing `next_run_at` prevents repeated ticks for the
-same boundary; the partial `idx_job_runs_tick` index is the backstop if a
-boundary is seen twice. When the global queued-run bound is full, the due
-boundary is left unchanged so a later tick retries it. Restart catch-up
-therefore enqueues at most one missed run per job, not a burst. The loop then
-claims queued runs with an immediate SQLite transaction, records
+strictly after `now` (interval math, or the first matching UTC cron
+occurrence). Advancing `next_run_at` prevents repeated ticks for the same
+boundary; the partial `idx_job_runs_tick` index is the backstop if a boundary
+is seen twice. When the global queued-run bound is full, the due boundary is
+left unchanged so a later tick retries it. Restart catch-up therefore enqueues
+at most one missed run per job, not a burst. A persisted cron expression that
+no longer parses is skipped and counted, not enqueued, and reads of that job
+fail closed. A syntactically valid but impossible expression is also skipped
+and counted, but the row still reads back; the job does not run until the
+expression is repaired. The loop then claims queued runs
+with an immediate SQLite transaction, records
 `started_at`/`claimed_by`/`lease_expires_at`, and hands the run to a narrow
 `ExecutionDispatcher`. That wrapper exposes only `ExecutionService::execute`
 with a mandatory pinned version and the host deadline; it has no activation,
@@ -233,16 +246,17 @@ above.
 
 Terminal run states are `succeeded`, `failed`, `refused`, and `interrupted`,
 with a closed failure-code vocabulary. Disabling a job clears `next_run_at` and
-terminalizes its queued runs; enabling an interval job recomputes
-`next_run_at = now + interval_secs`. A manual trigger on an interval job stays
-allowed and does not move `next_run_at`. Startup marks previously running rows
-`interrupted` and refuses queued rows for disabled jobs; slice 2 is
-at-most-once and does not replay a worker. The loop owns scheduler readiness
-and emits job wait/queue/active metrics; due enqueue moves the queue gauge.
-A loop panic or tick failure flips readiness false; in-flight run rows remain
-`running` until restart recovery marks them `interrupted`. Cron triggers,
-retries, cancellation, multi-process ownership, and retention are later
-slices.
+terminalizes its queued runs; enabling a job recomputes
+`next_run_at = now + interval_secs` for an interval job or the first matching
+UTC occurrence after `now` for a cron job. A manual trigger on an interval or
+cron job stays allowed and does not move `next_run_at`. Startup marks
+previously running rows `interrupted` and refuses queued rows for disabled
+jobs; slice 3 is at-most-once and does not replay a worker. The loop owns
+scheduler readiness and emits job wait/queue/active metrics; due enqueue moves
+the queue gauge and logs bounded counts. A loop panic or tick failure flips
+readiness false; in-flight run rows remain `running` until restart recovery
+marks them `interrupted`. Cron timezone/DST selection, retries, cancellation,
+multi-process ownership, and retention are later slices.
 
 ### Execution history (`executions::history`)
 
@@ -340,11 +354,13 @@ cannot false-503 under probe flood. Readiness is not a write/disk-full proof.
 
 ## Not built yet
 
-Interval triggering is implemented in slice 2. Cron triggering, retries,
-cancellation, distributed scheduling, CLI, artifact GC, and
-execution-history retention/GC remain. Scheduler slice 2 provides durable
-manual and interval jobs, interval due enqueue, a single-process dispatcher,
-readiness, and job metrics. Startup reconciliation is classify-only: it sets
+Interval and UTC five-field cron triggering are implemented in slice 3.
+Retries, cancellation, distributed scheduling, CLI, artifact GC, and
+execution-history retention/GC remain. Scheduler slice 3 provides durable
+manual, interval, and cron jobs, due enqueue for both scheduled kinds, a
+single-process dispatcher, readiness, and job metrics. Cron is UTC only; there
+is no timezone/DST selection, seconds/7-field syntax, macros, names, or
+`?`/`L`/`W`/`#` extensions. Startup reconciliation is classify-only: it sets
 `ok`/`missing`/`mismatch` but does not repair artifacts or detect orphans,
 and it does not yet record `reconciliation_runs`.
 `control_plane/lifecycle.rs` is currently a placeholder for
