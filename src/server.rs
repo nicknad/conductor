@@ -269,7 +269,9 @@ impl Host {
         )
         .await;
         readiness_watcher.abort();
-        scheduler.stop().await;
+        // HTTP graceful shutdown is bounded at 30 s and the scheduler drain at
+        // `drain_timeout` (30 s default); a worst-case shutdown is their sum.
+        scheduler.drain().await;
         // Flush on both success and failure. Run shutdown off the async worker:
         // the periodic reader's docs warn that current-thread runtimes can
         // deadlock if shutdown blocks the runtime thread.

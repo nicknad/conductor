@@ -16,7 +16,7 @@ use conductor::control_plane::activate_module::ActivationPolicy;
 use conductor::control_plane::execute_module::ExecutionService;
 use conductor::control_plane::scheduler::{
     JobFailureCode, JobRun, JobRunState, NewJob, SchedulerConfig, SchedulerError, SchedulerService,
-    Trigger, TriggerKind,
+    SchedulerState, Trigger, TriggerKind,
 };
 use conductor::executions::executor::ExecutionLimits;
 use conductor::executions::history::ExecutionHistoryStore;
@@ -193,6 +193,8 @@ const RETRY_MODULE_ID: &str = "retry-worker";
 const RETRY_VERSION: &str = "1.0.0";
 const RETRY_BACKOFF: Duration = Duration::from_secs(30);
 const TRANSIENT_FAILURE_SCRIPT: &str = "#!/bin/sh\nread -r line\nprintf '{\"protocol_version\":1,\"status\":\"failed\",\"message\":\"transient\"}\\n'\n";
+const DRAIN_MODULE_ID: &str = "drain-worker";
+const DRAIN_VERSION: &str = "1.0.0";
 
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256DigestProvider
@@ -289,6 +291,53 @@ fn build_retry_scheduler(
         TRANSIENT_FAILURE_SCRIPT,
     );
     (scheduler, scratch)
+}
+
+fn slow_success_script(sleep_secs: &str) -> String {
+    format!(
+        "#!/bin/sh\nread -r line\nsleep {sleep_secs}\nprintf '{{\"protocol_version\":1,\"status\":\"ok\",\"result\":null}}\\n'\n"
+    )
+}
+
+fn build_drain_scheduler(
+    metrics: Arc<Metrics>,
+    readiness: Arc<Readiness>,
+    tag: &str,
+    max_concurrent_runs: usize,
+    drain_timeout: Duration,
+    sleep_secs: &str,
+) -> (Arc<SchedulerService>, Scratch) {
+    let config = SchedulerConfig {
+        max_concurrent_runs,
+        drain_timeout,
+        ..SchedulerConfig::default()
+    };
+    let (scheduler, scratch, registry, artifact_dir) =
+        build_scheduler_with_config(metrics, readiness, tag, config);
+    let script = slow_success_script(sleep_secs);
+    install_package(
+        &registry,
+        &artifact_dir,
+        DRAIN_MODULE_ID,
+        DRAIN_VERSION,
+        &script,
+    );
+    (scheduler, scratch)
+}
+
+async fn wait_for_run_state(
+    scheduler: &SchedulerService,
+    job_id: &str,
+    state: JobRunState,
+) -> JobRun {
+    for _ in 0..200 {
+        let runs = scheduler.list_runs(job_id, 10, 0).await.expect("runs");
+        if let Some(run) = runs.into_iter().find(|run| run.state == state) {
+            return run;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("run for {job_id} never reached {state:?}");
 }
 
 fn run_with_attempt(runs: &[JobRun], attempt_no: u32) -> &JobRun {
@@ -1084,4 +1133,208 @@ async fn disabling_a_job_cancels_a_queued_retry() {
     );
     let data = exported(&metrics, &exporter);
     assert_eq!(i64_sum(&data, conductor::metrics::JOB_QUEUE_DEPTH), 0);
+}
+
+#[tokio::test]
+async fn drain_finishes_an_in_flight_run_and_leaves_queued_work() {
+    let (metrics, _exporter) = capture(MetricsOptions::default());
+    let readiness = Arc::new(Readiness::new(true));
+    let (scheduler, _scratch) = build_drain_scheduler(
+        Arc::clone(&metrics),
+        Arc::clone(&readiness),
+        "drain-in-flight",
+        1,
+        Duration::from_secs(5),
+        "0.5",
+    );
+    scheduler
+        .create_job(manual_job("job-drain", DRAIN_MODULE_ID))
+        .await
+        .expect("create job");
+    scheduler
+        .enqueue_manual("job-drain")
+        .await
+        .expect("first enqueue");
+    scheduler
+        .enqueue_manual("job-drain")
+        .await
+        .expect("second enqueue");
+    scheduler.start().await.expect("start");
+
+    let claimed = wait_for_run_state(&scheduler, "job-drain", JobRunState::Running).await;
+    scheduler.drain().await;
+
+    let runs = scheduler.list_runs("job-drain", 10, 0).await.expect("runs");
+    assert_eq!(runs.len(), 2);
+    assert_eq!(
+        runs.iter()
+            .find(|run| run.run_id == claimed.run_id)
+            .expect("the claimed run")
+            .state,
+        JobRunState::Succeeded,
+        "drain must let an in-flight run write its terminal completion"
+    );
+    assert_eq!(
+        runs.iter()
+            .filter(|run| run.state == JobRunState::Queued)
+            .count(),
+        1,
+        "the unclaimed run must survive drain as queued"
+    );
+    assert_eq!(scheduler.state(), SchedulerState::Stopping);
+    assert!(!readiness.is_ready(), "drain must clear readiness");
+}
+
+#[tokio::test]
+async fn drain_stops_claiming_new_runs() {
+    let (metrics, _exporter) = capture(MetricsOptions::default());
+    let readiness = Arc::new(Readiness::new(true));
+    let (scheduler, _scratch) = build_drain_scheduler(
+        Arc::clone(&metrics),
+        Arc::clone(&readiness),
+        "drain-no-claim",
+        1,
+        Duration::from_secs(5),
+        "0.5",
+    );
+    scheduler
+        .create_job(manual_job("job-drain", DRAIN_MODULE_ID))
+        .await
+        .expect("create job");
+    for _ in 0..2 {
+        scheduler
+            .enqueue_manual("job-drain")
+            .await
+            .expect("enqueue");
+    }
+    scheduler.start().await.expect("start");
+
+    let claimed = wait_for_run_state(&scheduler, "job-drain", JobRunState::Running).await;
+    scheduler.drain().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let runs = scheduler.list_runs("job-drain", 10, 0).await.expect("runs");
+    assert_eq!(runs.len(), 2);
+    assert_eq!(
+        runs.iter()
+            .filter(|run| run.state == JobRunState::Queued)
+            .count(),
+        1,
+        "drain must not claim the next queued run"
+    );
+    assert!(
+        runs.iter()
+            .any(|run| run.run_id == claimed.run_id && run.state == JobRunState::Succeeded),
+        "the run claimed before drain must finish"
+    );
+}
+
+#[tokio::test]
+async fn drain_aborts_a_run_that_outlives_the_window() {
+    let (metrics, _exporter) = capture(MetricsOptions::default());
+    let readiness = Arc::new(Readiness::new(true));
+    let drain_timeout = Duration::from_millis(50);
+    let (scheduler, _scratch) = build_drain_scheduler(
+        Arc::clone(&metrics),
+        Arc::clone(&readiness),
+        "drain-timeout",
+        1,
+        drain_timeout,
+        "0.2",
+    );
+    scheduler
+        .create_job(manual_job("job-drain", DRAIN_MODULE_ID))
+        .await
+        .expect("create job");
+    scheduler
+        .enqueue_manual("job-drain")
+        .await
+        .expect("enqueue");
+    scheduler.start().await.expect("start");
+
+    let claimed = wait_for_run_state(&scheduler, "job-drain", JobRunState::Running).await;
+    let started = tokio::time::Instant::now();
+    scheduler.drain().await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed >= drain_timeout,
+        "drain must use the full window before aborting, took {elapsed:?}"
+    );
+    assert!(
+        elapsed < drain_timeout + Duration::from_secs(1),
+        "drain must return within its bound, took {elapsed:?}"
+    );
+    let runs = scheduler.list_runs("job-drain", 10, 0).await.expect("runs");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].run_id, claimed.run_id);
+    assert_eq!(
+        runs[0].state,
+        JobRunState::Running,
+        "an aborted run stays running until startup recovery marks it interrupted"
+    );
+    assert!(!readiness.is_ready());
+}
+
+#[tokio::test]
+async fn stop_still_aborts_the_in_flight_worker_immediately() {
+    let (metrics, _exporter) = capture(MetricsOptions::default());
+    let readiness = Arc::new(Readiness::new(true));
+    let (scheduler, _scratch) = build_drain_scheduler(
+        Arc::clone(&metrics),
+        Arc::clone(&readiness),
+        "stop-abort",
+        1,
+        Duration::from_secs(5),
+        "0.5",
+    );
+    scheduler
+        .create_job(manual_job("job-drain", DRAIN_MODULE_ID))
+        .await
+        .expect("create job");
+    scheduler
+        .enqueue_manual("job-drain")
+        .await
+        .expect("enqueue");
+    scheduler.start().await.expect("start");
+
+    wait_for_run_state(&scheduler, "job-drain", JobRunState::Running).await;
+    let started = tokio::time::Instant::now();
+    scheduler.stop().await;
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "stop must not wait for the drain window"
+    );
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let runs = scheduler.list_runs("job-drain", 10, 0).await.expect("runs");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].state,
+        JobRunState::Running,
+        "an aborted worker is not allowed to finish"
+    );
+    assert!(!readiness.is_ready());
+}
+
+#[tokio::test]
+async fn drain_is_a_noop_before_start_and_safe_to_repeat() {
+    let (metrics, _exporter) = capture(MetricsOptions::default());
+    let readiness = Arc::new(Readiness::new(true));
+    let (scheduler, _scratch) =
+        build_scheduler(Arc::clone(&metrics), Arc::clone(&readiness), "drain-noop");
+
+    scheduler.drain().await;
+    scheduler.drain().await;
+    assert_eq!(scheduler.state(), SchedulerState::NotStarted);
+    assert!(
+        readiness.is_ready(),
+        "a not-started drain must not change readiness"
+    );
+
+    scheduler.start().await.expect("start");
+    scheduler.drain().await;
+    scheduler.drain().await;
+    assert_eq!(scheduler.state(), SchedulerState::Stopping);
+    assert!(!readiness.is_ready());
 }

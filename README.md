@@ -6,8 +6,9 @@
 > **Development is not finished:** this is an in-progress implementation, not a
 > complete job scheduler. Package ingestion, host startup wiring, the
 > worker execution library, the activation/execution HTTP endpoints,
-> durable execution history, and Scheduler slice 4 (durable manual, interval,
-> and UTC five-field cron jobs with bounded retries) exist, but lifecycle
+> durable execution history, and Scheduler slice 5 (durable manual, interval,
+> and UTC five-field cron jobs with bounded retries and a bounded graceful
+> drain on host shutdown) exist, but lifecycle
 > transitions and the operator CLI are still outstanding. Do not treat it as a
 > finished or production-ready product.
 
@@ -228,11 +229,26 @@ or queue bound returns `503 server_busy`. Startup recovery marks previously
 running rows `interrupted` and refuses queued rows for disabled jobs. The
 scheduler is single-process and at-most-once: a crash after claim does not
 replay the worker, and queued retries survive a restart and dispatch when due.
-A loop panic or tick failure flips `/readyz` to `503`; in-flight run rows remain
-`running` until restart recovery marks them `interrupted`. There is no job/run
-retention yet, so terminal rows and job payloads grow until a later retention
-slice. Cancellation, distributed scheduling, timezone/DST selection, and
-retention are later slices.
+A loop panic or tick failure flips `/readyz` to `503`.
+
+On host shutdown the scheduler drains instead of aborting immediately. Drain
+clears scheduler readiness before the finish window starts, stops claiming new
+runs, and gives already-claimed runs up to `SchedulerConfig::drain_timeout`
+(30 s default) to finish and write their normal terminal row. A claim already
+in flight when drain starts can still commit and is included in that wait;
+other queued rows are not claimed and remain `queued` for the next start. When
+the window expires, remaining dispatch tasks are aborted; their rows stay
+`running` until startup recovery marks them `interrupted`.
+HTTP serving stops before drain begins, and HTTP graceful shutdown is bounded
+at 30 s, so a worst-case host shutdown can take the sum of the two windows.
+Drain reuses `SchedulerState::Stopping` and adds no metric, route, state, or
+schema.
+Per-run cancellation (no cancel route, failure code, or worker cancellation
+channel) and replay of interrupted runs are still not implemented. In-flight
+run rows remain `running` after a crash until restart recovery marks them
+`interrupted`. There is no job/run retention yet, so terminal rows and job
+payloads grow until a later retention slice. Distributed scheduling,
+timezone/DST selection, and retention are later slices.
 
 ## Host configuration
 
@@ -415,8 +431,9 @@ included), output bounds, and staged-file tamper detection at resolve time.
   startup assembly (configuration, trust store, storage layout, shared
   database, durable rejection sink), the worker execution library,
   activation/execution HTTP endpoints, and durable execution history are
-  implemented. Manual, interval, and UTC five-field cron scheduler triggers are
-  implemented; retries and the operator CLI are not built yet — see
+  implemented. Manual, interval, and UTC five-field cron scheduler triggers,
+  bounded retries, and the bounded shutdown drain are implemented; per-run
+  cancellation and the operator CLI are not built yet — see
   [Not built yet](docs/architecture.md#not-built-yet).
 - Specification: [`docs/architecture.md`](docs/architecture.md) describes the
   Rust system as built. `docs/storage-reconciliation.md` and

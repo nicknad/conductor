@@ -450,7 +450,7 @@ Deferred: repair after restore or replacement (`Missing --> Ok`,
 `Mismatch --> Ok`), orphan scanning, artifact GC, and one
 `reconciliation_runs` row per pass.
 
-## 11. Scheduler / triggering (**manual, interval, UTC cron, and bounded retries implemented; cancellation planned**)
+## 11. Scheduler / triggering (**manual, interval, UTC cron, bounded retries, and bounded drain implemented; cancellation planned**)
 
 Source: `src/control_plane/scheduler/`, `src/readiness.rs`,
 `src/metrics.rs` (`conductor.job.wait.duration`, queue/active gauges).
@@ -503,9 +503,55 @@ stateDiagram-v2
     note right of Ready
         The scheduler owns the scheduler_ready flag:
         true only after the loop-ready handshake, false
-        on stop/panic/tick failure.
+        on stop/drain/panic/tick failure. Drain clears it
+        before waiting, so /readyz is 503 first.
     end note
 ```
+
+### Scheduler lifecycle and shutdown
+
+Source: `src/control_plane/scheduler/service.rs`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> NotStarted
+    NotStarted --> Running: start() recovers and the loop is ready
+    Running --> Failed: loop panic or tick failure
+    Running --> Stopping: drain() on host shutdown
+    Running --> Stopping: stop() (administrative/test abort)
+    Stopping --> Drained: already-claimed runs finish within drain_timeout
+    Stopping --> TimedOut: drain_timeout expires, remaining tasks aborted
+    Stopping --> Aborted: stop() aborts the loop task
+    Drained --> [*]
+    TimedOut --> [*]: rows stay running for startup recovery
+    Aborted --> [*]: rows stay running for startup recovery
+    Failed --> [*]
+
+    note right of Stopping
+        SchedulerState::Stopping is the only shutdown
+        state. Drained, TimedOut, and Aborted describe
+        the loop outcome, not enum variants; there is
+        no Draining variant.
+    end note
+    note right of Drained
+        The loop re-checks Running before each claim.
+        A claim already in flight may still commit and
+        is waited on; other queued rows stay queued for
+        the next start.
+    end note
+    note right of TimedOut
+        Per-run cancellation is still absent; drain
+        bounds host shutdown, it does not cancel an
+        individual run.
+    end note
+```
+
+The drain window is separate from the 30 s HTTP graceful-shutdown bound, so a
+worst-case host shutdown is their sum. A run that finishes inside the window
+writes its normal terminal row. A run still executing when the deadline expires
+is aborted and its row stays `running` until startup recovery marks it
+`interrupted`; interrupted runs are not replayed. Drain adds no metric, route,
+state, or schema.
 
 ## 12. Rejection audit (`audit`)
 
@@ -542,7 +588,7 @@ guarantee beyond the dependencies noted.
 
 | Priority | Work item | Current evidence | Blocks |
 | --- | --- | --- | --- |
-| 1 | **Scheduler / triggering**: durable job definitions, cron/interval triggers, queueing, dispatch, retry/attempt semantics, cancellation, scheduler readiness hook, job-wait histogram | Slice 4 implements durable manual, interval, and UTC five-field cron jobs, bounded retries with deterministic backoff, due enqueue for both scheduled kinds, queue/dispatch, recovery, readiness, and job wait/queue/active metrics. Cancellation, timezone/DST cron, and multi-process ownership remain | Produces the jobs the platform exists to run |
+| 1 | **Scheduler / triggering**: durable job definitions, cron/interval triggers, queueing, dispatch, retry/attempt semantics, cancellation, scheduler readiness hook, job-wait histogram | Slice 4 implements durable manual, interval, and UTC five-field cron jobs, bounded retries with deterministic backoff, due enqueue for both scheduled kinds, queue/dispatch, recovery, readiness, and job wait/queue/active metrics. Slice 5 adds a bounded graceful drain on host shutdown. Cancellation, interrupted-run replay, timezone/DST cron, and multi-process ownership remain | Produces the jobs the platform exists to run |
 | 2 | **Operator CLI**: upload, validate, activate, execute, history, lifecycle, reconcile commands | `tests/cli.rs` only drives startup failures; no CLI module | Operator usability; today everything is raw HTTP |
 | 3 | **Module lifecycle transitions**: deactivate, remove, rollback, drain running work, reference counting | `src/control_plane/lifecycle.rs` is a placeholder; `clear_active` / `remove_version` are registry primitives with no caller | Artifact GC and safe upgrades |
 | 4 | **Startup reconciliation**: scan registry vs artifact store, populate `Missing`/`Mismatch`, repair or quarantine, record `reconciliation_runs` | Classifier and startup wiring implemented in `Host::assemble`; repair, orphan detection, and `reconciliation_runs` deferred; design says PR4 | Trustworthy restart state |

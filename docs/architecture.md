@@ -77,7 +77,8 @@ state behind:
    slots, request timeout) and starts the scheduler. Scheduler recovery and
    the loop-ready handshake run before TLS bind; a scheduler start failure
    aborts startup with no listener. The host then serves TLS-only on the
-   configured bind.
+   configured bind. On shutdown, the listener stops first, then the scheduler
+   drains already-claimed runs for up to `drain_timeout`, then metrics flush.
 
 Failures at any step abort startup without binding a listener.
 
@@ -280,6 +281,38 @@ readiness false; in-flight run rows remain `running` until restart recovery
 marks them `interrupted`. Cron timezone/DST selection, cancellation,
 multi-process ownership, and retention are later slices.
 
+### Scheduler slice 5 (`control_plane::scheduler` shutdown drain)
+
+Host shutdown drains the scheduler instead of aborting it. `Host::serve_with_handle`
+stops accepting HTTP first, waits for the HTTP graceful-shutdown bound (30 s),
+then calls `SchedulerService::drain()` before flushing metrics. `drain()` uses
+the same shutdown preamble as `stop()`: it moves `SchedulerState` to
+`Stopping`, clears scheduler readiness (so `/readyz` is `503` before the finish
+window starts), wakes the loop, and takes the loop handle. Unlike `stop()`,
+which aborts the loop task immediately, `drain()` awaits the handle with a
+safety bound of `drain_timeout + 5 s` so a loop bug cannot hang shutdown.
+
+`SchedulerConfig::drain_timeout` defaults to 30 s. The loop observes
+`Stopping` before every new claim, including each iteration inside `fill_slots`.
+A claim transaction already in flight when drain begins can still commit; that
+run joins the in-flight set and is waited on like any other. Already-claimed
+dispatch tasks stay in the loop's `JoinSet`; `run_loop` waits on `join_next()`
+until the drain deadline, counting tasks that finish and reporting the
+remainder, then always calls `join_set.shutdown().await`. A run that finishes
+inside the window writes its normal terminal row, including any retry insert. A
+run still executing at the deadline is aborted and its row stays `running`
+until startup recovery marks it `interrupted`; a terminal store write already
+in flight when the task is aborted can still commit. Queued rows, including
+queued retries, are not refused and dispatch on the next start. Stop and drain
+share `SchedulerState::Stopping`; the slice adds no new scheduler state, route,
+metric, schema, or dependency.
+
+The drain bound is separate from HTTP graceful shutdown, so a worst-case host
+shutdown is the sum of the two windows. Per-run cancellation is still absent: no
+cancel route, cancellation failure code/state, or worker cancellation channel.
+Interrupted runs are still not replayed on startup, and a `SIGKILL` still
+leaves `running` rows for recovery.
+
 ### Execution history (`executions::history`)
 
 Every completed worker execution — including `failed`, `timed_out`,
@@ -339,7 +372,9 @@ Readiness (`/readyz`) is unauthenticated and reads a per-host cached state:
 database flag from `Database::check_ready` after migration; a background
 watcher re-probes every few seconds through a one-permit semaphore on the
 blocking pool, so a hung check cannot accumulate tasks. The scheduler flag
-defaults to true (future hook). The route itself does no database work and
+defaults to true for fixtures; the serving host clears it before start, sets it
+true only after the loop-ready handshake, and clears it on stop, drain, panic,
+or a failed tick. The route itself does no database work and
 cannot false-503 under probe flood. Readiness is not a write/disk-full proof.
 
 ## Invariants
@@ -376,14 +411,18 @@ cannot false-503 under probe flood. Readiness is not a write/disk-full proof.
 
 ## Not built yet
 
-Manual, interval, and UTC five-field cron triggering plus bounded retries are
-implemented in slice 4. Cancellation, distributed scheduling, CLI, artifact GC,
-and execution-history retention/GC remain. Scheduler slice 4 provides durable
+Manual, interval, and UTC five-field cron triggering plus bounded retries and
+the bounded shutdown drain are implemented in slices 4 and 5. Per-run
+cancellation, replay of interrupted runs, distributed scheduling, CLI, artifact
+GC, and execution-history retention/GC remain. Scheduler slice 4 provides durable
 manual, interval, and cron jobs, retries with deterministic backoff, due
 enqueue for both scheduled kinds, a single-process dispatcher, readiness, and
-job metrics. The retry policy is global, not per job, and has no API or CLI
-surface. Cron is UTC only; there is no timezone/DST selection, seconds/7-field
-syntax, macros, names, or `?`/`L`/`W`/`#` extensions. Startup reconciliation is classify-only: it sets
+job metrics. Slice 5 bounds host shutdown: already-claimed runs finish up to
+`drain_timeout` (30 s default), then remaining dispatch tasks are aborted and
+their rows stay `running` for startup recovery. The retry policy is global, not
+per job, and has no API or CLI surface. Cron is UTC only; there is no
+timezone/DST selection, seconds/7-field syntax, macros, names, or
+`?`/`L`/`W`/`#` extensions. Startup reconciliation is classify-only: it sets
 `ok`/`missing`/`mismatch` but does not repair artifacts or detect orphans,
 and it does not yet record `reconciliation_runs`.
 `control_plane/lifecycle.rs` is currently a placeholder for

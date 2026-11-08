@@ -25,6 +25,10 @@ use super::job::{
 };
 use super::store::{DueEnqueueReport, EnableResult, JobStore, JobStoreError, JobStoreLimits};
 
+/// Extra time `drain` waits beyond `drain_timeout` so a stuck loop cannot hold
+/// host shutdown forever.
+const DRAIN_SAFETY_MARGIN: Duration = Duration::from_secs(5);
+
 /// Scheduler tuning.
 #[derive(Clone, Debug)]
 pub struct SchedulerConfig {
@@ -34,6 +38,7 @@ pub struct SchedulerConfig {
     pub max_attempts: u32,
     pub retry_base_backoff: Duration,
     pub retry_max_backoff: Duration,
+    pub drain_timeout: Duration,
 }
 
 impl Default for SchedulerConfig {
@@ -45,6 +50,7 @@ impl Default for SchedulerConfig {
             max_attempts: 3,
             retry_base_backoff: Duration::from_secs(5),
             retry_max_backoff: Duration::from_secs(300),
+            drain_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -270,26 +276,57 @@ impl SchedulerService {
         }
     }
 
-    /// Stops the loop and clears readiness. In-flight dispatch tasks are
-    /// aborted; startup recovery will mark their rows interrupted.
+    /// Stops the loop immediately and clears readiness. In-flight dispatch
+    /// tasks are aborted; startup recovery will mark their rows interrupted.
     pub async fn stop(&self) {
         if self.state() == SchedulerState::NotStarted {
             return;
         }
-        self.state
-            .store(SchedulerState::Stopping as u8, Ordering::Release);
-        self.readiness.set_scheduler_ready(false);
-        self.notify.notify_waiters();
-        let handle = self
-            .loop_handle
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        if let Some(handle) = handle {
+        if let Some(handle) = self.begin_shutdown() {
             handle.abort();
             let _ = handle.await;
         }
         tracing::info!("scheduler loop stopped");
+    }
+
+    /// Stops claiming and waits up to `drain_timeout` for already-claimed
+    /// runs to finish. Remaining dispatch tasks are aborted; startup recovery
+    /// will mark their rows interrupted.
+    pub async fn drain(&self) {
+        if self.state() == SchedulerState::NotStarted {
+            return;
+        }
+        let Some(handle) = self.begin_shutdown() else {
+            return;
+        };
+        let bound = self
+            .config
+            .drain_timeout
+            .saturating_add(DRAIN_SAFETY_MARGIN);
+        match tokio::time::timeout(bound, handle).await {
+            Ok(Ok(())) => tracing::info!(
+                drain_timeout = ?self.config.drain_timeout,
+                "scheduler drained"
+            ),
+            Ok(Err(error)) => tracing::warn!(error = %error, "scheduler drain join failed"),
+            Err(_) => tracing::warn!(
+                drain_timeout = ?self.config.drain_timeout,
+                "scheduler drain exceeded its bound; continuing shutdown"
+            ),
+        }
+    }
+
+    /// Flips the scheduler into `Stopping`, clears readiness, wakes the loop,
+    /// and returns the loop handle so the caller decides how to end it.
+    fn begin_shutdown(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.state
+            .store(SchedulerState::Stopping as u8, Ordering::Release);
+        self.readiness.set_scheduler_ready(false);
+        self.notify.notify_waiters();
+        self.loop_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     /// Deterministic one-shot tick used by tests. It enqueues due interval
@@ -592,6 +629,9 @@ impl SchedulerService {
     ) -> Result<(), SchedulerError> {
         self.enqueue_due(SystemTime::now()).await?;
         while self.active.load(Ordering::Relaxed) < self.config.max_concurrent_runs {
+            if self.state() != SchedulerState::Running {
+                break;
+            }
             let now = SystemTime::now();
             let Some(claimed) = self.claim_next(now).await? else {
                 break;
@@ -633,8 +673,38 @@ impl SchedulerService {
                 self.fail(error);
                 break;
             }
+            if self.state() != SchedulerState::Running {
+                break;
+            }
         }
+        if self.state() == SchedulerState::Stopping {
+            self.finish_drain(&mut join_set).await;
+        } else {
+            join_set.shutdown().await;
+        }
+    }
+
+    /// Waits for already-claimed dispatch tasks up to `drain_timeout`, then
+    /// aborts whatever remains.
+    async fn finish_drain(&self, join_set: &mut JoinSet<()>) {
+        let deadline = tokio::time::Instant::now() + self.config.drain_timeout;
+        let mut completed = 0usize;
+        loop {
+            match tokio::time::timeout_at(deadline, join_set.join_next()).await {
+                Ok(Some(Ok(()))) => completed += 1,
+                Ok(Some(Err(error))) => {
+                    if error.is_panic() {
+                        self.fail(SchedulerError::Task(error.to_string()));
+                    }
+                    completed += 1;
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        let remaining = join_set.len();
         join_set.shutdown().await;
+        tracing::info!(completed, remaining, "scheduler drain window finished");
     }
 
     fn fail(&self, error: SchedulerError) {

@@ -112,6 +112,16 @@ job, or a duplicate tick. Each successful retry enqueue logs one info event with
 metric; the `attempt` field on run rows and `GET /v1/jobs/{job_id}/runs` is the
 per-attempt observable.
 
+Scheduler slice 5 adds no metric or route. On host shutdown, `drain()` clears
+scheduler readiness and waits up to `drain_timeout` (30 s default) for
+already-claimed runs. The loop logs one info event with `completed` and
+`remaining` dispatch counts when the window closes, then `drain()` logs
+`scheduler drained` after the loop handle joins. A run that finishes inside the
+window writes its normal terminal row; a run still executing at the deadline is
+aborted and its row stays `running` until startup recovery marks it
+`interrupted`. Queued rows stay `queued` for the next start. This is
+host-lifecycle behavior only: there is no per-run cancellation metric or route.
+
 After your backend normalizes OTLP names, useful queries are conceptually:
 
 ```promql
@@ -150,8 +160,8 @@ never probes SQLite on the request path. A bounded background watcher
 re-probes the shared database every five seconds through a one-permit
 semaphore. The scheduler flag is set by the scheduler lifecycle: false before
 start, true only after the loop-ready handshake, and false again on stop,
-panic, or a failed tick. Job triggers return `503 scheduler_unavailable` while
-the scheduler is not running.
+drain, panic, or a failed tick. Job triggers return `503 scheduler_unavailable`
+while the scheduler is not running.
 
 Readiness is not proof that writes succeed, that the disk has room, or that
 every registered module is runnable. In particular, an all-`missing` registry
@@ -298,6 +308,7 @@ Do **not** use `/readyz` as proof that reconciliation found healthy artifacts.
 | Bounded metric labels | Module/version/execution diagnosis is via logs/SQL, not metrics |
 | No retention/GC for rejections, history, or job runs | All three grow without bound; queue/job counts are capped but terminal `job_runs` are not |
 | No cron, retry, or due-enqueue scheduler metrics | Slice 4 emits job wait/queue/active signals and debug counts for due enqueue (enqueued, deduped, skipped-full, skipped-invalid) and retry skips, but no counter for cron lag, retries, or skipped rows |
+| No scheduler drain metric | Slice 5 logs bounded `completed`/`remaining` dispatch counts and reuses readiness; there is no drain histogram/counter, and there is still no per-run cancellation |
 | `Readiness::new` defaults the scheduler flag true for fixtures | A direct `Host::into_state()` embedder that never starts the scheduler can report `/readyz` 200; triggers still return `scheduler_unavailable` |
 | Metrics are ephemeral | No durable metrics store; SQLite is the durable authority |
 
