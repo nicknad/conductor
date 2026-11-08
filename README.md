@@ -287,6 +287,9 @@ flood. Readiness is not proof that the disk has free space or that writes
 succeed; it covers database/migration availability plus the future scheduler
 hook.
 
+See [docs/observability.md](docs/observability.md) for metric semantics, proof
+recipes, and the agent validation protocol.
+
 ## Worker execution (unstable)
 
 Job functions never run in-process. One execution is one worker child process,
